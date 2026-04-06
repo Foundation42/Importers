@@ -555,6 +555,30 @@ pub const Q3Bsp = struct {
         return map;
     }
 
+    /// Build a face→ALL clusters mapping. Faces at cluster boundaries appear in multiple clusters.
+    /// Returns a slice of ArrayLists (one per face). Caller owns the returned slice and lists.
+    pub fn buildFaceAllClustersMap(self: *const Q3Bsp, allocator: std.mem.Allocator) ![]std.ArrayList(i32) {
+        const map = try allocator.alloc(std.ArrayList(i32), self.faces.len);
+        for (map) |*entry| entry.* = std.ArrayList(i32).init(allocator);
+
+        for (self.leafs) |leaf| {
+            if (leaf.cluster < 0) continue;
+            const first: usize = @intCast(leaf.first_leaf_face);
+            const count: usize = @intCast(leaf.num_leaf_faces);
+            for (self.leaf_faces[first..][0..count]) |face_idx| {
+                const fi: usize = @intCast(face_idx);
+                if (fi >= map.len) continue;
+                // Only add if not already present
+                var found = false;
+                for (map[fi].items) |c| {
+                    if (c == leaf.cluster) { found = true; break; }
+                }
+                if (!found) try map[fi].append(leaf.cluster);
+            }
+        }
+        return map;
+    }
+
     /// Get faces for a given model (model 0 = world geometry).
     pub fn getModelFaces(self: *const Q3Bsp, model_index: usize) []const Face {
         const m = &self.models[model_index];
@@ -1150,15 +1174,16 @@ pub const ExtractedMesh = struct {
 
     /// Split the mesh by (cluster, shader) for PVS-based culling.
     /// Each ClusterSubMesh belongs to exactly one BSP cluster.
+    /// Faces at cluster boundaries are duplicated into each cluster they belong to.
     /// Requires face_indices to be populated (from extractGeometry).
     pub fn splitByClusterAndShader(
         self: *const ExtractedMesh,
-        face_cluster_map: []const i32,
+        face_all_clusters: []const std.ArrayList(i32),
         allocator: std.mem.Allocator,
     ) ![]ClusterSubMesh {
         const fi = self.face_indices orelse return error.NoFaceIndices;
 
-        // Group triangles by (cluster, shader)
+        // Group triangles by (cluster, shader). Boundary faces go into EACH cluster.
         const Key = packed struct { cluster: i32, shader: i32 };
         var group_map = std.AutoArrayHashMap(u64, std.ArrayList(u32)).init(allocator);
         defer {
@@ -1169,14 +1194,23 @@ pub const ExtractedMesh = struct {
         const tri_count = self.indices.len / 3;
         for (0..tri_count) |tri| {
             const bsp_face: usize = @intCast(fi[tri]);
-            const cluster = if (bsp_face < face_cluster_map.len) face_cluster_map[bsp_face] else @as(i32, -1);
             const shader = self.shader_indices[tri];
-            const key: u64 = @bitCast(Key{ .cluster = cluster, .shader = shader });
-            const entry = try group_map.getOrPut(key);
-            if (!entry.found_existing) {
-                entry.value_ptr.* = std.ArrayList(u32).init(allocator);
+
+            // Get all clusters this face belongs to
+            const clusters = if (bsp_face < face_all_clusters.len and face_all_clusters[bsp_face].items.len > 0)
+                face_all_clusters[bsp_face].items
+            else
+                &[_]i32{-1}; // no cluster = always visible
+
+            // Add triangle to EACH cluster group (duplication for boundary faces)
+            for (clusters) |cluster| {
+                const key: u64 = @bitCast(Key{ .cluster = cluster, .shader = shader });
+                const entry = try group_map.getOrPut(key);
+                if (!entry.found_existing) {
+                    entry.value_ptr.* = std.ArrayList(u32).init(allocator);
+                }
+                try entry.value_ptr.append(@intCast(tri));
             }
-            try entry.value_ptr.append(@intCast(tri));
         }
 
         // Build a ClusterSubMesh for each group
