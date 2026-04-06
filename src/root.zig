@@ -62,6 +62,10 @@ pub const WorldNode = model.WorldNode;
 pub const lz4 = @import("lz4.zig");
 pub const meshopt = @import("meshopt.zig");
 
+// Image decoders
+pub const tga = @import("tga.zig");
+pub const TgaImage = tga.TgaImage;
+
 // Quake 3 BSP
 pub const q3bsp = @import("q3bsp.zig");
 pub const Q3Bsp = q3bsp.Q3Bsp;

@@ -85,4 +85,23 @@ pub fn build(b: *std.Build) void {
 
     const q3bsp_step = b.step("q3bsp", "Run the Q3 BSP loader example");
     q3bsp_step.dependOn(&run_q3bsp.step);
+
+    // Example: test_tga
+    const tga_example = b.addExecutable(.{
+        .name = "test-tga",
+        .root_source_file = b.path("examples/test_tga.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    tga_example.root_module.addImport("valve-resource-format", vrf_mod);
+    b.installArtifact(tga_example);
+
+    const run_tga = b.addRunArtifact(tga_example);
+    run_tga.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        run_tga.addArgs(args);
+    }
+
+    const tga_step = b.step("test-tga", "Test TGA decoder against PK3 textures");
+    tga_step.dependOn(&run_tga.step);
 }

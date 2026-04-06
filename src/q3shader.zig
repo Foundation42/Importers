@@ -88,16 +88,60 @@ pub const Shader = struct {
         self.surface_parms.deinit();
     }
 
-    /// Get the first non-lightmap texture path, if any.
+    /// Get the primary diffuse texture path.
+    /// Searches stages in priority order: first non-lightmap, non-special map.
+    /// For animMap shaders, returns the first frame.
     pub fn getDiffuseMap(self: *const Shader) ?[]const u8 {
+        // First pass: look for a stage with a real texture map
         for (self.stages) |s| {
-            if (!s.is_lightmap and s.map.len > 0 and
-                !std.mem.eql(u8, s.map, "$whiteimage"))
-            {
-                return s.map;
-            }
+            if (s.is_lightmap) continue;
+            if (s.map.len == 0) continue;
+            if (isSpecialMap(s.map)) continue;
+            return s.map;
         }
         return null;
+    }
+
+    /// Get all unique texture paths referenced by this shader (all stages).
+    /// Includes animMap frames. Excludes $lightmap and $whiteimage.
+    /// Returned slices point into the Shader's owned memory — do not free.
+    pub fn getAllTextures(self: *const Shader, buf: [][]const u8) u32 {
+        var count: u32 = 0;
+        for (self.stages) |s| {
+            if (s.map.len > 0 and !isSpecialMap(s.map)) {
+                if (count < buf.len) {
+                    // Avoid duplicates
+                    var dupe = false;
+                    for (buf[0..count]) |existing| {
+                        if (std.mem.eql(u8, existing, s.map)) {
+                            dupe = true;
+                            break;
+                        }
+                    }
+                    if (!dupe) {
+                        buf[count] = s.map;
+                        count += 1;
+                    }
+                }
+            }
+            // Also include animMap frames
+            for (s.anim_frames) |frame| {
+                if (frame.len > 0 and !isSpecialMap(frame) and count < buf.len) {
+                    var dupe = false;
+                    for (buf[0..count]) |existing| {
+                        if (std.mem.eql(u8, existing, frame)) {
+                            dupe = true;
+                            break;
+                        }
+                    }
+                    if (!dupe) {
+                        buf[count] = frame;
+                        count += 1;
+                    }
+                }
+            }
+        }
+        return count;
     }
 
     /// Check if this shader has a lightmap stage.
@@ -112,7 +156,23 @@ pub const Shader = struct {
     pub fn hasSurfaceParm(self: *const Shader, parm: []const u8) bool {
         return self.surface_parms.contains(parm);
     }
+
+    /// Whether this shader should be skipped for rendering (tool textures, sky, etc).
+    pub fn isNonDrawable(self: *const Shader) bool {
+        if (self.sky_parms) return true;
+        if (self.hasSurfaceParm("nodraw")) return true;
+        if (self.hasSurfaceParm("skip")) return true;
+        if (self.stages.len == 0 and !self.sky_parms) return true;
+        return false;
+    }
 };
+
+fn isSpecialMap(map: []const u8) bool {
+    return std.mem.eql(u8, map, "$lightmap") or
+        std.mem.eql(u8, map, "$whiteimage") or
+        std.mem.eql(u8, map, "*white") or
+        std.mem.eql(u8, map, "$blackimage");
+}
 
 // ============================================================================
 // Shader database
