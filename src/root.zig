@@ -36,6 +36,13 @@ pub const KVFlag = kv3.KVFlag;
 pub const binary_kv3 = @import("binary_kv3.zig");
 pub const KV3Document = binary_kv3.KV3Document;
 
+// Texture parsing and decoding
+pub const texture = @import("texture.zig");
+pub const Texture = texture.Texture;
+pub const VTexFormat = texture.VTexFormat;
+pub const VTexFlags = texture.VTexFlags;
+pub const texture_decode = @import("texture_decode.zig");
+
 // Re-export constants
 pub const known_header_version = @import("resource.zig").known_header_version;
 pub const vpk_magic = @import("resource.zig").vpk_magic;
