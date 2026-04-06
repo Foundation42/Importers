@@ -22,6 +22,11 @@ pub const SpecialDependency = block.SpecialDependency;
 pub const ArgumentDependency = block.ArgumentDependency;
 pub const AdditionalRelatedFile = block.AdditionalRelatedFile;
 
+// VPK archive reader
+pub const vpk = @import("vpk.zig");
+pub const Package = vpk.Package;
+pub const PackageEntry = vpk.PackageEntry;
+
 // Re-export constants
 pub const known_header_version = @import("resource.zig").known_header_version;
 pub const vpk_magic = @import("resource.zig").vpk_magic;
