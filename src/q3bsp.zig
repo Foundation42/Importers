@@ -1171,23 +1171,46 @@ pub fn remapLightmapUVs(mesh: *ExtractedMesh, atlas: *const LightmapAtlas) void 
 
     const scale = atlas.getLightmapScale();
 
-    // Build a per-vertex lightmap index by finding which triangle each vertex belongs to.
-    // Since vertices may be shared across triangles with different lightmap indices,
-    // we use the first triangle that references each vertex.
-    // However, in Q3 BSP extracted meshes, vertices are typically not shared across
-    // faces (each face copies its own vertices), so this is straightforward.
+    // Bitset to track which vertices have already been remapped,
+    // since vertices are shared across triangles within a face.
+    const bitset_len = (mesh.vertices.len + 63) / 64;
+    var visited_buf: [256]u64 = undefined;
 
-    // For each triangle, remap its vertices' lightmap UVs
+    // Use stack buffer for small meshes, otherwise just mark inline
+    const visited: ?[]u64 = if (bitset_len <= visited_buf.len) blk: {
+        const slice = visited_buf[0..bitset_len];
+        @memset(slice, 0);
+        break :blk slice;
+    } else null;
+
+    // If mesh is too large for stack bitset, allocate from the mesh's allocator
+    const visited_heap: ?[]u64 = if (visited == null) blk: {
+        const slice = mesh.allocator.alloc(u64, bitset_len) catch null;
+        if (slice) |s| @memset(s, 0);
+        break :blk slice;
+    } else null;
+    defer if (visited_heap) |h| mesh.allocator.free(h);
+
+    const bitset = visited orelse visited_heap;
+
     const tri_count = mesh.indices.len / 3;
     for (0..tri_count) |tri| {
         const lm_idx = mesh.lightmap_indices[tri];
-        if (lm_idx < 0) continue; // no lightmap for this face
+        if (lm_idx < 0) continue;
 
         const offset = atlas.getLightmapOffset(lm_idx);
 
         for (0..3) |k| {
             const vi = mesh.indices[tri * 3 + k];
-            // Remap: atlas_uv = offset + original_uv * scale
+
+            // Skip if already remapped
+            if (bitset) |bs| {
+                const word = vi / 64;
+                const bit: u6 = @intCast(vi % 64);
+                if (bs[word] & (@as(u64, 1) << bit) != 0) continue;
+                bs[word] |= @as(u64, 1) << bit;
+            }
+
             mesh.vertices[vi].lightmap_coord = .{
                 offset[0] + mesh.vertices[vi].lightmap_coord[0] * scale[0],
                 offset[1] + mesh.vertices[vi].lightmap_coord[1] * scale[1],
