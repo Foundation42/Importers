@@ -50,4 +50,20 @@ pub fn build(b: *std.Build) void {
 
     const run_step = b.step("run", "Run the VRF tool");
     run_step.dependOn(&run_cmd.step);
+
+    // Example: extract_mesh
+    const example = b.addExecutable(.{
+        .name = "extract-mesh",
+        .root_source_file = b.path("examples/extract_mesh.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    example.root_module.addImport("valve-resource-format", vrf_mod);
+    b.installArtifact(example);
+
+    const run_example = b.addRunArtifact(example);
+    run_example.step.dependOn(b.getInstallStep());
+
+    const example_step = b.step("example", "Run the mesh extraction example");
+    example_step.dependOn(&run_example.step);
 }

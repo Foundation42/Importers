@@ -345,7 +345,7 @@ fn decodeBC7Block(block: *const [16]u8, pixels: *[16][4]u8) void {
         }
     } else {
         for (0..num_endpoints) |ep| {
-            endpoints[ep][3] = ((@as(u16, 1) << info.color_bits) - 1);
+            endpoints[ep][3] = ((@as(u16, 1) << @intCast(info.color_bits)) - 1);
         }
     }
 
