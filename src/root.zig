@@ -62,6 +62,24 @@ pub const WorldNode = model.WorldNode;
 pub const lz4 = @import("lz4.zig");
 pub const meshopt = @import("meshopt.zig");
 
+// Quake 3 BSP
+pub const q3bsp = @import("q3bsp.zig");
+pub const Q3Bsp = q3bsp.Q3Bsp;
+pub const ExtractedMesh = q3bsp.ExtractedMesh;
+pub const ExtractOptions = q3bsp.ExtractOptions;
+pub const LightmapAtlas = q3bsp.LightmapAtlas;
+pub const buildLightmapAtlas = q3bsp.buildLightmapAtlas;
+pub const remapLightmapUVs = q3bsp.remapLightmapUVs;
+pub const Frustum = q3bsp.Frustum;
+pub const VisibleSet = q3bsp.VisibleSet;
+
+// Quake 3 PK3 archives and shader scripts
+pub const pk3 = @import("pk3.zig");
+pub const Pk3 = pk3.Pk3;
+pub const q3shader = @import("q3shader.zig");
+pub const ShaderDb = q3shader.ShaderDb;
+pub const Q3Shader = q3shader.Shader;
+
 // Re-export constants
 pub const known_header_version = @import("resource.zig").known_header_version;
 pub const vpk_magic = @import("resource.zig").vpk_magic;

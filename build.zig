@@ -66,4 +66,23 @@ pub fn build(b: *std.Build) void {
 
     const example_step = b.step("example", "Run the mesh extraction example");
     example_step.dependOn(&run_example.step);
+
+    // Example: load_q3bsp
+    const q3bsp_example = b.addExecutable(.{
+        .name = "load-q3bsp",
+        .root_source_file = b.path("examples/load_q3bsp.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    q3bsp_example.root_module.addImport("valve-resource-format", vrf_mod);
+    b.installArtifact(q3bsp_example);
+
+    const run_q3bsp = b.addRunArtifact(q3bsp_example);
+    run_q3bsp.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        run_q3bsp.addArgs(args);
+    }
+
+    const q3bsp_step = b.step("q3bsp", "Run the Q3 BSP loader example");
+    q3bsp_step.dependOn(&run_q3bsp.step);
 }
