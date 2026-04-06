@@ -1,0 +1,10 @@
+.{
+    .name = "valve-resource-format",
+    .version = "0.1.0",
+    .minimum_zig_version = "0.14.0-dev.2987+183bb8b08",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
