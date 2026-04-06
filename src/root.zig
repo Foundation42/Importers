@@ -43,6 +43,21 @@ pub const VTexFormat = texture.VTexFormat;
 pub const VTexFlags = texture.VTexFlags;
 pub const texture_decode = @import("texture_decode.zig");
 
+// Resource type handlers
+pub const material = @import("material.zig");
+pub const Material = material.Material;
+pub const mesh_mod = @import("mesh.zig");
+pub const VBIB = mesh_mod.VBIB;
+pub const Mesh = mesh_mod.Mesh;
+pub const DrawCall = mesh_mod.DrawCall;
+pub const SceneObject = mesh_mod.SceneObject;
+pub const DxgiFormat = mesh_mod.DxgiFormat;
+pub const RenderInputLayoutField = mesh_mod.RenderInputLayoutField;
+pub const model = @import("model.zig");
+pub const Model = model.Model;
+pub const World = model.World;
+pub const WorldNode = model.WorldNode;
+
 // Re-export constants
 pub const known_header_version = @import("resource.zig").known_header_version;
 pub const vpk_magic = @import("resource.zig").vpk_magic;
