@@ -9,15 +9,14 @@ const std = @import("std");
 
 const vrf = @import("valve-resource-format");
 
-// Re-export the sub-modules we need
 const vpk_mod = vrf.vpk;
 const binary_kv3 = vrf.binary_kv3;
 const material_mod = vrf.material;
 const texture_mod = vrf.texture;
 const model_mod = vrf.model;
 const mesh_mod = vrf.mesh_mod;
+const meshopt = vrf.meshopt;
 
-// Direct type aliases
 const Resource = vrf.Resource;
 const BinaryReader = vrf.BinaryReader;
 const BlockType = vrf.BlockType;
@@ -85,23 +84,25 @@ fn parseVBIBBlock(allocator: std.mem.Allocator, block_data: []const u8, block_of
     var vertex_buffers = try allocator.alloc(VBIBBufferData, vertex_buffer_count);
     r.setPosition(vertex_buffer_offset);
     for (0..vertex_buffer_count) |i| {
-        vertex_buffers[i] = try readOnDiskBuffer(&r, allocator);
+        vertex_buffers[i] = try readOnDiskBuffer(&r, allocator, true);
     }
 
     // Parse index buffers
     var index_buffers = try allocator.alloc(VBIBBufferData, index_buffer_count);
     r.setPosition(8 + index_buffer_offset); // +8 for the vertex offset/count fields
     for (0..index_buffer_count) |i| {
-        index_buffers[i] = try readOnDiskBuffer(&r, allocator);
+        index_buffers[i] = try readOnDiskBuffer(&r, allocator, false);
     }
 
     return .{ .vertex_buffers = vertex_buffers, .index_buffers = index_buffers };
 }
 
-fn readOnDiskBuffer(r: *BinaryReader, allocator: std.mem.Allocator) !VBIBBufferData {
+fn readOnDiskBuffer(r: *BinaryReader, allocator: std.mem.Allocator, is_vertex: bool) !VBIBBufferData {
     const element_count = try r.readU32();
     const size_raw = try r.readI32();
     const element_size: u32 = @intCast(size_raw & 0x3FFFFFF);
+    const is_compressed = size_raw < 0 or (size_raw & 0x8000000) != 0;
+    _ = is_compressed;
 
     // Attribute offset/count (relative to refA)
     const ref_a = r.position();
@@ -143,8 +144,26 @@ fn readOnDiskBuffer(r: *BinaryReader, allocator: std.mem.Allocator) !VBIBBufferD
 
     // Read raw vertex/index data
     r.setPosition(ref_b + data_offset);
-    const total_bytes = element_count * element_size;
-    const data = try r.readBytesAlloc(total_bytes);
+    const decompressed_size = element_count * element_size;
+    const total_size_raw = try r.readI32();
+    _ = total_size_raw;
+    // Re-read: we already read total_size above, go back
+    r.setPosition(ref_b + data_offset);
+
+    // Read the compressed (or raw) buffer
+    const on_disk_bytes = try r.readBytesAlloc(decompressed_size);
+
+    // Try meshopt decompression if the data looks compressed
+    var data: []const u8 = undefined;
+    if (on_disk_bytes.len > 0 and (on_disk_bytes[0] & 0xF0) == 0xa0 and is_vertex) {
+        // Meshopt vertex compressed
+        data = meshopt.decodeVertexBuffer(allocator, element_count, element_size, on_disk_bytes) catch on_disk_bytes;
+    } else if (on_disk_bytes.len > 0 and (on_disk_bytes[0] & 0xF0) == 0xe0 and !is_vertex) {
+        // Meshopt index compressed
+        data = meshopt.decodeIndexBuffer(allocator, element_count, element_size, on_disk_bytes) catch on_disk_bytes;
+    } else {
+        data = on_disk_bytes;
+    }
 
     return .{
         .element_count = element_count,
@@ -203,13 +222,17 @@ fn extractVertices(allocator: std.mem.Allocator, vb: *const VBIBBufferData) ![]E
             }
         }
 
-        // Normal (R32G32B32_FLOAT or compressed R32_UINT / R8G8B8A8_UNORM)
+        // Normal (R32G32B32_FLOAT, R32_UINT compressed, or R8G8B8A8_UNORM)
         if (normal_offset) |off| {
             const o = base + off;
             if (normal_format == .r32g32b32_float and o + 12 <= vb.data.len) {
                 vert.normal[0] = @bitCast(std.mem.readInt(u32, vb.data[o..][0..4], .little));
                 vert.normal[1] = @bitCast(std.mem.readInt(u32, vb.data[o + 4 ..][0..4], .little));
                 vert.normal[2] = @bitCast(std.mem.readInt(u32, vb.data[o + 8 ..][0..4], .little));
+            } else if (normal_format == .r32_uint and o + 4 <= vb.data.len) {
+                // CS2 compressed normal+tangent packed into a single u32
+                const normal_raw = std.mem.readInt(u32, vb.data[o..][0..4], .little);
+                vert.normal = meshopt.decompressNormal(normal_raw);
             } else if (normal_format == .r8g8b8a8_unorm and o + 4 <= vb.data.len) {
                 // Unpack unsigned byte normal: [0,255] -> [-1,1]
                 vert.normal[0] = @as(f32, @floatFromInt(vb.data[o])) / 127.5 - 1.0;
