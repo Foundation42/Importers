@@ -58,6 +58,9 @@ pub const Model = model.Model;
 pub const World = model.World;
 pub const WorldNode = model.WorldNode;
 
+// Compression
+pub const lz4 = @import("lz4.zig");
+
 // Re-export constants
 pub const known_header_version = @import("resource.zig").known_header_version;
 pub const vpk_magic = @import("resource.zig").vpk_magic;
