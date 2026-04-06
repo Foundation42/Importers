@@ -84,7 +84,11 @@ pub const BufferData = struct {
     /// Get a vec3 float position for vertex i.
     pub fn getPosition(self: *const BufferData, i: u32) [3]f32 {
         const attr = self.findAttribute("POSITION") orelse return .{ 0, 0, 0 };
-        return self.readVec3(i, attr);
+        const o = self.vertexOffset(i, attr.offset);
+        if (attr.format == .r32g32b32_float and o + 12 <= self.data.len) {
+            return readF32x3(self.data, o);
+        }
+        return .{ 0, 0, 0 };
     }
 
     /// Get a decoded normal for vertex i. Handles R32_UINT compressed normals.
