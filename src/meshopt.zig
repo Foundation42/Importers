@@ -207,36 +207,31 @@ fn decodeBytesGroup(data: []const u8, dest: *[ByteGroupSize]u8, bits: u8) []cons
             @memcpy(dest, data[0..ByteGroupSize]);
             return data[ByteGroupSize..];
         },
-        2 => {
-            var consumed: usize = 4; // 4 header bytes for 2-bit mode
-            for (0..4) |byte_idx| {
-                var b = data[byte_idx];
-                for (0..4) |_| {
-                    const enc: u8 = b >> 6;
-                    b <<= 2;
-                    if (enc == 3) {
-                        dest[byte_idx * 4 + (3 - @as(usize, 0))] = data[consumed];
-                        consumed += 1;
-                    }
-                    // This simplified version doesn't perfectly match the C# bit manipulation
-                    // but handles the common cases
+        else => {
+            // For 1, 2, 4 bit modes the C# code reads from high-to-low bits
+            // within each byte. The encoding packs (8/bits) values per byte,
+            // MSB first. If value == (1<<bits)-1, read a literal from overflow.
+            const vals_per_byte: usize = 8 / @as(usize, bits);
+            const header_bytes: usize = (ByteGroupSize + vals_per_byte - 1) / vals_per_byte;
+            var consumed: usize = header_bytes;
+            const sentinel: u8 = (@as(u8, 1) << @intCast(bits)) - 1;
+
+            for (0..ByteGroupSize) |di| {
+                const header_byte_idx = di / vals_per_byte;
+                const val_idx_in_byte = di % vals_per_byte;
+                // Values are packed MSB-first: first value is in highest bits
+                const shift: u3 = @intCast(8 - @as(u8, bits) * @as(u8, @intCast(val_idx_in_byte + 1)));
+                const val: u8 = (data[header_byte_idx] >> shift) & sentinel;
+
+                if (val == sentinel) {
+                    dest[di] = data[consumed];
+                    consumed += 1;
+                } else {
+                    dest[di] = val;
                 }
             }
-            // Fallback: just copy raw bytes for correctness
-            @memcpy(dest, data[0..ByteGroupSize]);
-            return data[ByteGroupSize..];
-        },
-        4 => {
-            @memcpy(dest, data[0..ByteGroupSize]);
-            return data[ByteGroupSize..];
-        },
-        1 => {
-            @memcpy(dest, data[0..ByteGroupSize]);
-            return data[ByteGroupSize..];
-        },
-        else => {
-            @memcpy(dest, data[0..ByteGroupSize]);
-            return data[ByteGroupSize..];
+
+            return data[consumed..];
         },
     }
 }

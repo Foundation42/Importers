@@ -101,8 +101,6 @@ fn readOnDiskBuffer(r: *BinaryReader, allocator: std.mem.Allocator, is_vertex: b
     const element_count = try r.readU32();
     const size_raw = try r.readI32();
     const element_size: u32 = @intCast(size_raw & 0x3FFFFFF);
-    const is_compressed = size_raw < 0 or (size_raw & 0x8000000) != 0;
-    _ = is_compressed;
 
     // Attribute offset/count (relative to refA)
     const ref_a = r.position();
@@ -112,10 +110,10 @@ fn readOnDiskBuffer(r: *BinaryReader, allocator: std.mem.Allocator, is_vertex: b
     // Data offset/size (relative to refB)
     const ref_b = r.position();
     const data_offset = try r.readU32();
-    _ = try r.readI32(); // total_size (compressed size)
+    const total_size = try r.readI32(); // on-disk size (may be < decompressed if meshopt compressed)
 
     // Read attributes
-    var attrs = try allocator.alloc(VBIBAttribute, attr_count);
+    const attrs = try allocator.alloc(VBIBAttribute, attr_count);
     r.setPosition(ref_a + attr_offset);
     for (0..attr_count) |i| {
         const name_start = r.position();
@@ -142,28 +140,51 @@ fn readOnDiskBuffer(r: *BinaryReader, allocator: std.mem.Allocator, is_vertex: b
         _ = try r.readI32(); // instance_step_rate
     }
 
-    // Read raw vertex/index data
+    // Read vertex/index data from disk
     r.setPosition(ref_b + data_offset);
+
     const decompressed_size = element_count * element_size;
-    const total_size_raw = try r.readI32();
-    _ = total_size_raw;
-    // Re-read: we already read total_size above, go back
-    r.setPosition(ref_b + data_offset);
+    const on_disk_size: usize = @intCast(total_size);
 
-    // Read the compressed (or raw) buffer
-    const on_disk_bytes = try r.readBytesAlloc(decompressed_size);
-
-    // Try meshopt decompression if the data looks compressed
     var data: []const u8 = undefined;
-    if (on_disk_bytes.len > 0 and (on_disk_bytes[0] & 0xF0) == 0xa0 and is_vertex) {
-        // Meshopt vertex compressed
-        data = meshopt.decodeVertexBuffer(allocator, element_count, element_size, on_disk_bytes) catch on_disk_bytes;
-    } else if (on_disk_bytes.len > 0 and (on_disk_bytes[0] & 0xF0) == 0xe0 and !is_vertex) {
-        // Meshopt index compressed
-        data = meshopt.decodeIndexBuffer(allocator, element_count, element_size, on_disk_bytes) catch on_disk_bytes;
+
+    if (decompressed_size > on_disk_size) {
+        // Data is meshopt compressed — read on_disk_size bytes, then decompress
+        const compressed = try r.readBytesAlloc(on_disk_size);
+        defer allocator.free(compressed);
+
+        if (is_vertex) {
+            data = meshopt.decodeVertexBuffer(allocator, element_count, element_size, compressed) catch {
+                // Fallback: return raw compressed data
+                data = try allocator.dupe(u8, compressed);
+                // Jump to return
+                r.setPosition(ref_b + 8);
+                return .{
+                    .element_count = element_count,
+                    .element_size = element_size,
+                    .attributes = attrs,
+                    .data = data,
+                };
+            };
+        } else {
+            data = meshopt.decodeIndexBuffer(allocator, element_count, element_size, compressed) catch {
+                data = try allocator.dupe(u8, compressed);
+                r.setPosition(ref_b + 8);
+                return .{
+                    .element_count = element_count,
+                    .element_size = element_size,
+                    .attributes = attrs,
+                    .data = data,
+                };
+            };
+        }
     } else {
-        data = on_disk_bytes;
+        // Data is uncompressed — read directly
+        data = try r.readBytesAlloc(on_disk_size);
     }
+
+    // Return to correct position for next buffer in the directory
+    r.setPosition(ref_b + 8);
 
     return .{
         .element_count = element_count,
