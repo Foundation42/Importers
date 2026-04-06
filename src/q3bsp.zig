@@ -515,6 +515,46 @@ pub const Q3Bsp = struct {
         return &self.leafs[leaf_index];
     }
 
+    /// Extract lightweight BSP navigation data for runtime PVS queries.
+    /// The returned struct owns copies of the needed lumps — safe to use after Q3Bsp is freed.
+    pub fn extractNavData(self: *const Q3Bsp, allocator: std.mem.Allocator) !*Q3BspNavData {
+        const nav = try allocator.create(Q3BspNavData);
+        errdefer allocator.destroy(nav);
+
+        nav.* = .{
+            .nodes = try allocator.dupe(Node, self.nodes),
+            .planes = try allocator.dupe(Plane, self.planes),
+            .leafs = try allocator.dupe(Leaf, self.leafs),
+            .leaf_faces = try allocator.dupe(i32, self.leaf_faces),
+            .vis_num_clusters = self.vis_data.num_clusters,
+            .vis_bytes_per_cluster = self.vis_data.bytes_per_cluster,
+            .vis_data_copy = try allocator.dupe(u8, self.vis_data.data),
+            .allocator = allocator,
+        };
+        return nav;
+    }
+
+    /// Build a face→cluster mapping for world geometry.
+    /// Each face gets the cluster of the first leaf that references it.
+    /// Returns allocator-owned slice indexed by BSP face index.
+    pub fn buildFaceClusterMap(self: *const Q3Bsp, allocator: std.mem.Allocator) ![]i32 {
+        const map = try allocator.alloc(i32, self.faces.len);
+        @memset(map, -1);
+
+        for (self.leafs) |leaf| {
+            if (leaf.cluster < 0) continue;
+            const first: usize = @intCast(leaf.first_leaf_face);
+            const count: usize = @intCast(leaf.num_leaf_faces);
+            for (self.leaf_faces[first..][0..count]) |face_idx| {
+                const fi: usize = @intCast(face_idx);
+                if (fi < map.len and map[fi] < 0) {
+                    map[fi] = leaf.cluster;
+                }
+            }
+        }
+        return map;
+    }
+
     /// Get faces for a given model (model 0 = world geometry).
     pub fn getModelFaces(self: *const Q3Bsp, model_index: usize) []const Face {
         const m = &self.models[model_index];
@@ -675,12 +715,14 @@ pub const Q3Bsp = struct {
         errdefer allocator.free(shader_indices);
         var lightmap_indices = try allocator.alloc(i32, total_indices / 3);
         errdefer allocator.free(lightmap_indices);
+        var face_indices = try allocator.alloc(i32, total_indices / 3);
+        errdefer allocator.free(face_indices);
 
         // Second pass: fill buffers
         var vi: u32 = 0; // vertex write cursor
         var ii: u32 = 0; // index write cursor
 
-        for (self.faces) |face| {
+        for (self.faces, 0..) |face, face_idx| {
             if (!self.shouldIncludeFace(&face, opts)) continue;
 
             switch (face.getSurfaceType()) {
@@ -710,12 +752,13 @@ pub const Q3Bsp = struct {
                     for (tri_start..tri_end) |t| {
                         shader_indices[t] = face.shader_index;
                         lightmap_indices[t] = face.lightmap_index;
+                        face_indices[t] = @intCast(face_idx);
                     }
                 },
                 .patch => {
                     if (!opts.include_patches) continue;
                     if (face.patch_width < 3 or face.patch_height < 3) continue;
-                    self.tessellatePatch(&face, opts.patch_lod, vertices, indices, shader_indices, lightmap_indices, &vi, &ii);
+                    self.tessellatePatch(&face, opts.patch_lod, vertices, indices, shader_indices, lightmap_indices, face_indices, @intCast(face_idx), &vi, &ii);
                 },
                 .billboard => {},
                 _ => {},
@@ -727,6 +770,7 @@ pub const Q3Bsp = struct {
             .indices = indices,
             .shader_indices = shader_indices,
             .lightmap_indices = lightmap_indices,
+            .face_indices = face_indices,
             .allocator = allocator,
         };
     }
@@ -750,6 +794,8 @@ pub const Q3Bsp = struct {
         indices: []u32,
         shader_indices: []i32,
         lightmap_indices: []i32,
+        face_indices_buf: []i32,
+        bsp_face_idx: i32,
         vi: *u32,
         ii: *u32,
     ) void {
@@ -813,9 +859,64 @@ pub const Q3Bsp = struct {
                 for (tri_start..tri_end) |t| {
                     shader_indices[t] = face.shader_index;
                     lightmap_indices[t] = face.lightmap_index;
+                    face_indices_buf[t] = bsp_face_idx;
                 }
             }
         }
+    }
+};
+
+// ============================================================================
+// BSP navigation data — lightweight runtime struct for PVS queries
+// ============================================================================
+
+/// Standalone BSP navigation data for runtime visibility queries.
+/// Owns copies of the needed lumps — safe to use after the full Q3Bsp is freed.
+pub const Q3BspNavData = struct {
+    nodes: []Node,
+    planes: []Plane,
+    leafs: []Leaf,
+    leaf_faces: []i32,
+    vis_num_clusters: i32,
+    vis_bytes_per_cluster: i32,
+    vis_data_copy: []u8,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *Q3BspNavData) void {
+        self.allocator.free(self.nodes);
+        self.allocator.free(self.planes);
+        self.allocator.free(self.leafs);
+        self.allocator.free(self.leaf_faces);
+        self.allocator.free(self.vis_data_copy);
+    }
+
+    /// Walk the BSP tree to find the leaf containing a point (in Q3 coordinates).
+    pub fn findLeaf(self: *const Q3BspNavData, point: [3]f32) *const Leaf {
+        var index: i32 = 0;
+        while (index >= 0) {
+            const node = &self.nodes[@intCast(index)];
+            const plane = &self.planes[@intCast(node.plane_index)];
+            const dist = plane.normal[0] * point[0] +
+                plane.normal[1] * point[1] +
+                plane.normal[2] * point[2] - plane.dist;
+            if (dist >= 0) {
+                index = node.children[0];
+            } else {
+                index = node.children[1];
+            }
+        }
+        const leaf_index: usize = @intCast(-(index + 1));
+        return &self.leafs[leaf_index];
+    }
+
+    /// Test whether cluster `from` can see cluster `to` using PVS data.
+    pub fn isClusterVisible(self: *const Q3BspNavData, from: i32, to: i32) bool {
+        if (from < 0 or to < 0) return true;
+        if (self.vis_data_copy.len == 0) return true;
+        const byte_idx: usize = @intCast(@as(i64, from) * @as(i64, self.vis_bytes_per_cluster) + @as(i64, @divFloor(to, 8)));
+        if (byte_idx >= self.vis_data_copy.len) return true;
+        const bit: u3 = @intCast(@mod(@as(u32, @intCast(to)), 8));
+        return (self.vis_data_copy[byte_idx] & (@as(u8, 1) << bit)) != 0;
     }
 };
 
@@ -949,6 +1050,8 @@ pub const ExtractedMesh = struct {
     shader_indices: []i32,
     /// Per-triangle lightmap index (one per 3 indices).
     lightmap_indices: []i32,
+    /// Per-triangle BSP face index (for cluster mapping). Null if not tracked.
+    face_indices: ?[]i32 = null,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *ExtractedMesh) void {
@@ -956,6 +1059,7 @@ pub const ExtractedMesh = struct {
         self.allocator.free(self.indices);
         self.allocator.free(self.shader_indices);
         self.allocator.free(self.lightmap_indices);
+        if (self.face_indices) |fi| self.allocator.free(fi);
     }
 
     pub fn triangleCount(self: *const ExtractedMesh) u32 {
@@ -1042,6 +1146,112 @@ pub const ExtractedMesh = struct {
         }
 
         return result;
+    }
+
+    /// Split the mesh by (cluster, shader) for PVS-based culling.
+    /// Each ClusterSubMesh belongs to exactly one BSP cluster.
+    /// Requires face_indices to be populated (from extractGeometry).
+    pub fn splitByClusterAndShader(
+        self: *const ExtractedMesh,
+        face_cluster_map: []const i32,
+        allocator: std.mem.Allocator,
+    ) ![]ClusterSubMesh {
+        const fi = self.face_indices orelse return error.NoFaceIndices;
+
+        // Group triangles by (cluster, shader)
+        const Key = packed struct { cluster: i32, shader: i32 };
+        var group_map = std.AutoArrayHashMap(u64, std.ArrayList(u32)).init(allocator);
+        defer {
+            for (group_map.values()) |*list| list.deinit();
+            group_map.deinit();
+        }
+
+        const tri_count = self.indices.len / 3;
+        for (0..tri_count) |tri| {
+            const bsp_face: usize = @intCast(fi[tri]);
+            const cluster = if (bsp_face < face_cluster_map.len) face_cluster_map[bsp_face] else @as(i32, -1);
+            const shader = self.shader_indices[tri];
+            const key: u64 = @bitCast(Key{ .cluster = cluster, .shader = shader });
+            const entry = try group_map.getOrPut(key);
+            if (!entry.found_existing) {
+                entry.value_ptr.* = std.ArrayList(u32).init(allocator);
+            }
+            try entry.value_ptr.append(@intCast(tri));
+        }
+
+        // Build a ClusterSubMesh for each group
+        var result = try allocator.alloc(ClusterSubMesh, group_map.count());
+        errdefer allocator.free(result);
+        var out_idx: usize = 0;
+
+        for (group_map.keys(), group_map.values()) |packed_key, *tri_list| {
+            const key: Key = @bitCast(packed_key);
+            const tris = tri_list.items;
+
+            // Vertex remap
+            var vert_remap = std.AutoHashMap(u32, u32).init(allocator);
+            defer vert_remap.deinit();
+
+            var new_vert_count: u32 = 0;
+            for (tris) |tri| {
+                for (0..3) |k| {
+                    const vi = self.indices[tri * 3 + k];
+                    const entry = try vert_remap.getOrPut(vi);
+                    if (!entry.found_existing) {
+                        entry.value_ptr.* = new_vert_count;
+                        new_vert_count += 1;
+                    }
+                }
+            }
+
+            const new_verts = try allocator.alloc(Vertex, new_vert_count);
+            const new_indices = try allocator.alloc(u32, tris.len * 3);
+
+            var remap_it = vert_remap.iterator();
+            while (remap_it.next()) |entry| {
+                new_verts[entry.value_ptr.*] = self.vertices[entry.key_ptr.*];
+            }
+
+            for (tris, 0..) |tri, i| {
+                for (0..3) |k| {
+                    const vi = self.indices[tri * 3 + k];
+                    new_indices[i * 3 + k] = vert_remap.get(vi).?;
+                }
+            }
+
+            const lm_idx = if (tris.len > 0) self.lightmap_indices[tris[0]] else -1;
+
+            result[out_idx] = ClusterSubMesh{
+                .cluster = key.cluster,
+                .shader_index = key.shader,
+                .lightmap_index = lm_idx,
+                .vertices = new_verts,
+                .indices = new_indices,
+                .allocator = allocator,
+            };
+            out_idx += 1;
+        }
+
+        return result;
+    }
+};
+
+/// A sub-mesh for a single (cluster, shader) pair — supports PVS culling.
+pub const ClusterSubMesh = struct {
+    cluster: i32,
+    shader_index: i32,
+    lightmap_index: i32,
+    vertices: []Vertex,
+    indices: []u32,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *ClusterSubMesh) void {
+        self.allocator.free(self.vertices);
+        self.allocator.free(self.indices);
+    }
+
+    pub fn triangleCount(self: *const ClusterSubMesh) u32 {
+        return @intCast(self.indices.len / 3);
     }
 };
 

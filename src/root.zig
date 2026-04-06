@@ -69,8 +69,10 @@ pub const TgaImage = tga.TgaImage;
 // Quake 3 BSP
 pub const q3bsp = @import("q3bsp.zig");
 pub const Q3Bsp = q3bsp.Q3Bsp;
+pub const Q3BspNavData = q3bsp.Q3BspNavData;
 pub const ExtractedMesh = q3bsp.ExtractedMesh;
 pub const SubMesh = q3bsp.SubMesh;
+pub const ClusterSubMesh = q3bsp.ClusterSubMesh;
 pub const ExtractOptions = q3bsp.ExtractOptions;
 pub const LightmapAtlas = q3bsp.LightmapAtlas;
 pub const buildLightmapAtlas = q3bsp.buildLightmapAtlas;
@@ -84,6 +86,10 @@ pub const Pk3 = pk3.Pk3;
 pub const q3shader = @import("q3shader.zig");
 pub const ShaderDb = q3shader.ShaderDb;
 pub const Q3Shader = q3shader.Shader;
+
+// Q3 shader → Forge shader graph converter
+pub const q3_material = @import("q3_material.zig");
+pub const Q3ConvertResult = q3_material.ConvertResult;
 
 // Re-export constants
 pub const known_header_version = @import("resource.zig").known_header_version;
