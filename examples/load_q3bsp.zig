@@ -135,6 +135,27 @@ pub fn main() !void {
     }
     std.debug.print("  Unique shaders used: {d}\n", .{shader_set.count()});
 
+    // Split by shader for per-material rendering
+    std.debug.print("\n--- Sub-meshes (per shader) ---\n", .{});
+    const sub_meshes = try mesh.splitByShader(allocator);
+    defer {
+        for (sub_meshes) |*sm| {
+            var s = sm.*;
+            s.deinit();
+        }
+        allocator.free(sub_meshes);
+    }
+    std.debug.print("  Sub-mesh count: {d}\n", .{sub_meshes.len});
+    for (sub_meshes[0..@min(10, sub_meshes.len)], 0..) |sm, i| {
+        const shader_name = if (sm.shader_index >= 0 and @as(usize, @intCast(sm.shader_index)) < bsp.shaders.len)
+            bsp.shaders[@intCast(sm.shader_index)].getName()
+        else
+            "(none)";
+        std.debug.print("  [{d}] shader={s} verts={d} tris={d} lm={d}\n", .{
+            i, shader_name, sm.vertices.len, sm.triangleCount(), sm.lightmap_index,
+        });
+    }
+
     // Build lightmap atlas
     std.debug.print("\n--- Lightmap atlas ---\n", .{});
     var atlas = try vrf.buildLightmapAtlas(&bsp, allocator);

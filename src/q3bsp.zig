@@ -961,6 +961,106 @@ pub const ExtractedMesh = struct {
     pub fn triangleCount(self: *const ExtractedMesh) u32 {
         return @intCast(self.indices.len / 3);
     }
+
+    /// Split the mesh into per-shader sub-meshes for multi-material rendering.
+    /// Each SubMesh has its own vertex and index buffers with indices starting at 0.
+    /// Caller owns the returned slice and each SubMesh within it.
+    pub fn splitByShader(self: *const ExtractedMesh, allocator: std.mem.Allocator) ![]SubMesh {
+        // Collect unique shader indices
+        var shader_map = std.AutoArrayHashMap(i32, std.ArrayList(u32)).init(allocator);
+        defer {
+            for (shader_map.values()) |*list| list.deinit();
+            shader_map.deinit();
+        }
+
+        const tri_count = self.indices.len / 3;
+        for (0..tri_count) |tri| {
+            const si = self.shader_indices[tri];
+            const entry = try shader_map.getOrPut(si);
+            if (!entry.found_existing) {
+                entry.value_ptr.* = std.ArrayList(u32).init(allocator);
+            }
+            try entry.value_ptr.append(@intCast(tri));
+        }
+
+        // Build a SubMesh for each shader
+        var result = try allocator.alloc(SubMesh, shader_map.count());
+        errdefer allocator.free(result);
+        var out_idx: usize = 0;
+
+        for (shader_map.keys(), shader_map.values()) |shader_idx, *tri_list| {
+            const tris = tri_list.items;
+
+            // Build vertex remap: old vertex index -> new vertex index
+            var vert_remap = std.AutoHashMap(u32, u32).init(allocator);
+            defer vert_remap.deinit();
+
+            // Count unique vertices and build remap
+            var new_vert_count: u32 = 0;
+            for (tris) |tri| {
+                for (0..3) |k| {
+                    const vi = self.indices[tri * 3 + k];
+                    const entry = try vert_remap.getOrPut(vi);
+                    if (!entry.found_existing) {
+                        entry.value_ptr.* = new_vert_count;
+                        new_vert_count += 1;
+                    }
+                }
+            }
+
+            // Build new vertex and index arrays
+            const new_verts = try allocator.alloc(Vertex, new_vert_count);
+            errdefer allocator.free(new_verts);
+            const new_indices = try allocator.alloc(u32, tris.len * 3);
+            errdefer allocator.free(new_indices);
+
+            // Fill vertices via remap
+            var remap_it = vert_remap.iterator();
+            while (remap_it.next()) |entry| {
+                new_verts[entry.value_ptr.*] = self.vertices[entry.key_ptr.*];
+            }
+
+            // Fill indices
+            for (tris, 0..) |tri, i| {
+                for (0..3) |k| {
+                    const vi = self.indices[tri * 3 + k];
+                    new_indices[i * 3 + k] = vert_remap.get(vi).?;
+                }
+            }
+
+            // Lightmap index — use the first triangle's (all tris in a face share the same)
+            const lm_idx = if (tris.len > 0) self.lightmap_indices[tris[0]] else -1;
+
+            result[out_idx] = SubMesh{
+                .shader_index = shader_idx,
+                .lightmap_index = lm_idx,
+                .vertices = new_verts,
+                .indices = new_indices,
+                .allocator = allocator,
+            };
+            out_idx += 1;
+        }
+
+        return result;
+    }
+};
+
+/// A sub-mesh for a single shader/material — ready for one draw call.
+pub const SubMesh = struct {
+    shader_index: i32,
+    lightmap_index: i32,
+    vertices: []Vertex,
+    indices: []u32,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *SubMesh) void {
+        self.allocator.free(self.vertices);
+        self.allocator.free(self.indices);
+    }
+
+    pub fn triangleCount(self: *const SubMesh) u32 {
+        return @intCast(self.indices.len / 3);
+    }
 };
 
 /// Options for geometry extraction.

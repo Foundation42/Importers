@@ -66,6 +66,7 @@ pub const meshopt = @import("meshopt.zig");
 pub const q3bsp = @import("q3bsp.zig");
 pub const Q3Bsp = q3bsp.Q3Bsp;
 pub const ExtractedMesh = q3bsp.ExtractedMesh;
+pub const SubMesh = q3bsp.SubMesh;
 pub const ExtractOptions = q3bsp.ExtractOptions;
 pub const LightmapAtlas = q3bsp.LightmapAtlas;
 pub const buildLightmapAtlas = q3bsp.buildLightmapAtlas;
