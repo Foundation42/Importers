@@ -229,7 +229,9 @@ pub fn decodeBC5(input: []const u8, width: u32, height: u32, output: []u8) void 
                     const pixel_offset = (y * width + x) * 4;
                     output[pixel_offset + 0] = red[py * 4 + px];
                     output[pixel_offset + 1] = green[py * 4 + px];
-                    output[pixel_offset + 2] = 0;
+                    // BC5 is commonly used for Source 2 hemi-octahedron normal maps.
+                    // B channel = default roughness (0.5). Shader handles normal decode.
+                    output[pixel_offset + 2] = 128;
                     output[pixel_offset + 3] = 255;
                 }
             }
