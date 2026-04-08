@@ -303,7 +303,122 @@ pub const VBIB = struct {
 
         return buffers;
     }
+
+    /// Build VBIB from CTRL embedded mesh KV3 data.
+    /// `embedded_mesh` is one entry from the `embedded_meshes` array in CTRL.
+    /// `resource` is used to look up MVTX/MIDX blocks by index.
+    pub fn readFromEmbeddedMesh(allocator: std.mem.Allocator, embedded_mesh: *const KVObject, resource: anytype) !VBIB {
+        var vbib = VBIB.init(allocator);
+        errdefer vbib.deinit();
+
+        // Parse vertex buffers
+        if (embedded_mesh.getArray("m_vertexBuffers")) |vb_arr| {
+            vbib.vertex_buffers = try allocator.alloc(BufferData, vb_arr.count());
+            for (vb_arr.items.items, 0..) |*vb_val, i| {
+                const vb_obj = vb_val.asObject() orelse continue;
+                vbib.vertex_buffers[i] = try embeddedBufferFromKV3(allocator, vb_obj, resource, true);
+            }
+        }
+
+        // Parse index buffers
+        if (embedded_mesh.getArray("m_indexBuffers")) |ib_arr| {
+            vbib.index_buffers = try allocator.alloc(BufferData, ib_arr.count());
+            for (ib_arr.items.items, 0..) |*ib_val, i| {
+                const ib_obj = ib_val.asObject() orelse continue;
+                vbib.index_buffers[i] = try embeddedBufferFromKV3(allocator, ib_obj, resource, false);
+            }
+        }
+
+        return vbib;
+    }
 };
+
+/// Parse a single vertex or index buffer from CTRL KV3 + raw block data.
+fn embeddedBufferFromKV3(allocator: std.mem.Allocator, data: *const KVObject, resource: anytype, is_vertex: bool) !BufferData {
+    const element_count = data.getU32Property("m_nElementCount") orelse 0;
+    const element_size = data.getU32Property("m_nElementSizeInBytes") orelse 0;
+
+    // Parse input layout fields (vertex attributes)
+    var layout: []RenderInputLayoutField = &.{};
+    if (is_vertex) {
+        if (data.getArray("m_inputLayoutFields")) |layout_arr| {
+            layout = try allocator.alloc(RenderInputLayoutField, layout_arr.count());
+            for (layout_arr.items.items, 0..) |*field_val, fi| {
+                const field_obj = field_val.asObject() orelse continue;
+                // Semantic name can be string or binary blob
+                const raw_name = field_obj.getStringProperty("m_pSemanticName") orelse "";
+                var upper_buf = try allocator.alloc(u8, raw_name.len);
+                for (raw_name, 0..) |c, ci| {
+                    upper_buf[ci] = std.ascii.toUpper(c);
+                }
+                layout[fi] = .{
+                    .semantic_name = upper_buf,
+                    .semantic_index = if (field_obj.get("m_nSemanticIndex")) |v| v.asI32() orelse 0 else 0,
+                    .format = @enumFromInt(field_obj.getU32Property("m_Format") orelse 0),
+                    .offset = field_obj.getU32Property("m_nOffset") orelse 0,
+                    .slot = if (field_obj.get("m_nSlot")) |v| v.asI32() orelse 0 else 0,
+                };
+            }
+        }
+    }
+
+    // Get raw data from the referenced block
+    const block_index = data.getU32Property("m_nBlockIndex") orelse return BufferData{
+        .element_count = element_count,
+        .element_size_in_bytes = element_size,
+        .input_layout = layout,
+    };
+    const is_meshopt = if (data.get("m_bMeshoptCompressed")) |v| blk: {
+        break :blk v.asBool() orelse (if (v.asI32()) |i| i != 0 else false);
+    } else false;
+
+    const block = resource.getBlockByIndex(@intCast(block_index)) orelse return error.InvalidBlockIndex;
+    const raw_data = switch (block.data) {
+        .data_block => |db| db.raw_data orelse return error.NoBlockData,
+        else => return error.UnexpectedBlockType,
+    };
+
+    const decompressed_size: usize = @as(usize, element_count) * @as(usize, element_size);
+
+    var buf_data: []const u8 = undefined;
+
+    if (is_meshopt and raw_data.len < decompressed_size and raw_data.len > 0) {
+        // Meshopt compressed
+        if (is_vertex) {
+            buf_data = meshopt.decodeVertexBuffer(allocator, element_count, element_size, raw_data) catch {
+                buf_data = try allocator.dupe(u8, raw_data);
+                return .{
+                    .element_count = element_count,
+                    .element_size_in_bytes = element_size,
+                    .input_layout = layout,
+                    .data = buf_data,
+                };
+            };
+        } else {
+            buf_data = meshopt.decodeIndexBuffer(allocator, element_count, element_size, raw_data) catch {
+                buf_data = try allocator.dupe(u8, raw_data);
+                return .{
+                    .element_count = element_count,
+                    .element_size_in_bytes = element_size,
+                    .input_layout = layout,
+                    .data = buf_data,
+                };
+            };
+        }
+    } else if (raw_data.len > 0) {
+        // Uncompressed
+        buf_data = try allocator.dupe(u8, raw_data);
+    } else {
+        buf_data = &.{};
+    }
+
+    return .{
+        .element_count = element_count,
+        .element_size_in_bytes = element_size,
+        .input_layout = layout,
+        .data = buf_data,
+    };
+}
 
 // ============================================================
 // Binary VBIB on-disk buffer reader

@@ -104,4 +104,43 @@ pub fn build(b: *std.Build) void {
 
     const tga_step = b.step("test-tga", "Test TGA decoder against PK3 textures");
     tga_step.dependOn(&run_tga.step);
+
+    // Tool: list-vpk
+    const list_vpk = b.addExecutable(.{
+        .name = "list-vpk",
+        .root_source_file = b.path("src/list_vpk.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    list_vpk.root_module.addImport("valve-resource-format", vrf_mod);
+    b.installArtifact(list_vpk);
+
+    const run_list_vpk = b.addRunArtifact(list_vpk);
+    run_list_vpk.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        run_list_vpk.addArgs(args);
+    }
+
+    const list_vpk_step = b.step("list-vpk", "List contents of a VPK archive");
+    list_vpk_step.dependOn(&run_list_vpk.step);
+
+    // Tool: verify-vpk
+    const verify_vpk = b.addExecutable(.{
+        .name = "verify-vpk",
+        .root_source_file = b.path("src/verify_vpk.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    verify_vpk.root_module.addImport("valve-resource-format", vrf_mod);
+    b.installArtifact(verify_vpk);
+
+    // Tool: dump-world
+    const dump_world = b.addExecutable(.{
+        .name = "dump-world",
+        .root_source_file = b.path("src/dump_world.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    dump_world.root_module.addImport("valve-resource-format", vrf_mod);
+    b.installArtifact(dump_world);
 }

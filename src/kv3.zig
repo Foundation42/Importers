@@ -87,6 +87,8 @@ pub const KVValue = union(enum) {
         return switch (self.*) {
             .uint32 => |v| v,
             .uint64 => |v| if (v <= std.math.maxInt(u32)) @intCast(v) else null,
+            .int32 => |v| if (v >= 0) @intCast(v) else null,
+            .int64 => |v| if (v >= 0 and v <= std.math.maxInt(u32)) @intCast(v) else null,
             else => null,
         };
     }

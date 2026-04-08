@@ -102,9 +102,10 @@ pub const Resource = struct {
         // Advance past block_offset - 8 (the two u32s we just read)
         reader.skip(@as(i64, @intCast(block_offset)) - 8);
 
-        try self.blocks.ensureTotalCapacity(block_count);
+        // Pre-allocate block slots to preserve directory order (needed for m_nBlockIndex lookups)
+        try self.blocks.resize(block_count);
 
-        // First pass: read block directory and parse metadata blocks
+        // First pass: read block directory entries
         var block_entries = try self.allocator.alloc(BlockDirEntry, block_count);
         defer self.allocator.free(block_entries);
 
@@ -125,32 +126,29 @@ pub const Resource = struct {
                 .directory_end_pos = reader.position(),
             };
 
+            // Initialize slot with placeholder
+            self.blocks.items[i] = .{
+                .block_type = block_type,
+                .offset = absolute_offset,
+                .size = size,
+                .data = .raw,
+            };
+
             if (size == 0) continue;
 
             // Parse NTRO, REDI, RED2 eagerly (needed to determine ResourceType for DATA)
             switch (block_type) {
                 .ntro => {
-                    // Read raw NTRO data for now
                     const saved_pos = reader.position();
                     reader.setPosition(absolute_offset);
                     const raw = try reader.readBytesAlloc(size);
                     reader.setPosition(saved_pos);
 
-                    try self.blocks.append(.{
-                        .block_type = block_type,
-                        .offset = absolute_offset,
-                        .size = size,
-                        .data = .{ .ntro = .{ .raw_data = raw } },
-                    });
+                    self.blocks.items[i].data = .{ .ntro = .{ .raw_data = raw } };
                 },
                 .redi => {
                     const redi_data = try block_mod.RediData.read(reader, absolute_offset);
-                    try self.blocks.append(.{
-                        .block_type = block_type,
-                        .offset = absolute_offset,
-                        .size = size,
-                        .data = .{ .redi = redi_data },
-                    });
+                    self.blocks.items[i].data = .{ .redi = redi_data };
 
                     // Determine resource type from special dependencies
                     if (self.resource_type == .unknown) {
@@ -169,28 +167,21 @@ pub const Resource = struct {
                     }
                 },
                 .red2 => {
-                    // RED2 is KV3 format — store raw for now, will be parsed when KV3 decoder exists
                     const saved_pos = reader.position();
                     reader.setPosition(absolute_offset);
                     const raw = try reader.readBytesAlloc(size);
                     reader.setPosition(saved_pos);
 
-                    try self.blocks.append(.{
-                        .block_type = block_type,
-                        .offset = absolute_offset,
-                        .size = size,
-                        .data = .{ .kv3_block = .{ .block_type = .red2, .raw_data = raw } },
-                    });
+                    self.blocks.items[i].data = .{ .kv3_block = .{ .block_type = .red2, .raw_data = raw } };
                 },
                 else => {},
             }
 
-            // Restore reader position to end of this directory entry
             reader.setPosition(block_entries[i].directory_end_pos);
         }
 
-        // Second pass: read remaining blocks
-        for (block_entries) |entry| {
+        // Second pass: parse remaining blocks (preserving directory order)
+        for (block_entries, 0..) |entry, i| {
             if (entry.size == 0) continue;
 
             // Skip already-parsed blocks
@@ -199,8 +190,7 @@ pub const Resource = struct {
                 else => {},
             }
 
-            const blk = try self.parseBlock(reader, entry);
-            try self.blocks.append(blk);
+            self.blocks.items[i] = try self.parseBlock(reader, entry);
         }
     }
 
@@ -248,6 +238,20 @@ pub const Resource = struct {
                 } },
             },
 
+            // MVTX, MIDX, MDAT — store raw bytes (needed for embedded mesh decoding)
+            .mvtx, .midx, .mdat => Block{
+                .block_type = entry.block_type,
+                .offset = entry.offset,
+                .size = entry.size,
+                .data = .{ .data_block = .{
+                    .resource_type = self.resource_type,
+                    .raw_data = blk: {
+                        reader.setPosition(entry.offset);
+                        break :blk try reader.readBytesAlloc(entry.size);
+                    },
+                } },
+            },
+
             // Everything else — store as raw for now
             else => Block{
                 .block_type = entry.block_type,
@@ -265,6 +269,12 @@ pub const Resource = struct {
         for (self.blocks.items) |*blk| {
             if (blk.block_type == block_type) return blk;
         }
+        return null;
+    }
+
+    /// Get a block by its index in the block list (matches C# Resource.GetBlockByIndex).
+    pub fn getBlockByIndex(self: *const Resource, index: usize) ?*const Block {
+        if (index < self.blocks.items.len) return &self.blocks.items[index];
         return null;
     }
 

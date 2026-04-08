@@ -106,9 +106,8 @@ fn decodeVertexBlock(
                 // Zero
                 @memset(buf[j * vertex_count ..][0..vertex_count], 0);
             } else {
-                // Byte group decode
-                const bits: u8 = if (version == 0) BitsV0[ctrl] else BitsV1_0[ctrl];
-                data = try decodeBytes(data, buf[j * vertex_count ..][0..vertex_count_aligned], bits);
+                // Byte group decode — pass ctrl as offset into bits table
+                data = try decodeBytesV(data, buf[j * vertex_count ..][0..vertex_count_aligned], version, ctrl);
             }
         }
 
@@ -171,7 +170,10 @@ fn rotate32(v: u32, r: u5) u32 {
     return (v << r) | (v >> ((@as(u5, 31) -% r) +% 1));
 }
 
-fn decodeBytes(data_in: []const u8, destination: []u8, bits: u8) ![]const u8 {
+/// Decode bytes with version-aware bits table.
+/// For V0: bits table is [0, 2, 4, 8], bitsk indexes directly.
+/// For V1: bits table is [0, 1, 2, 4, 8], sliced starting at ctrl_offset, then bitsk indexes into that.
+fn decodeBytesV(data_in: []const u8, destination: []u8, version: u8, ctrl_offset: u2) ![]const u8 {
     if (destination.len % ByteGroupSize != 0) return error.InvalidAlignment;
     var data = data_in;
 
@@ -179,17 +181,20 @@ fn decodeBytes(data_in: []const u8, destination: []u8, bits: u8) ![]const u8 {
     const header = data[0..header_size];
     data = data[header_size..];
 
+    const BitsV1 = [5]u8{ 0, 1, 2, 4, 8 };
+
     var i: usize = 0;
     while (i < destination.len) : (i += ByteGroupSize) {
         if (data.len < ByteGroupDecodeLimit) return error.BufferTooShort;
 
         const header_offset = i / ByteGroupSize;
-        const bitsk = (header[header_offset / 4] >> @intCast((header_offset % 4) * 2)) & 3;
+        const bitsk: usize = (header[header_offset / 4] >> @intCast((header_offset % 4) * 2)) & 3;
 
-        const actual_bits = if (bits == 0) BitsV0[bitsk] else blk: {
-            const table = [5]u8{ 0, 1, 2, 4, 8 };
-            break :blk table[@min(bitsk, 4)];
-        };
+        const actual_bits: u8 = if (version == 0)
+            BitsV0[bitsk]
+        else
+            // C# does BitsV1.AsSpan(ctrl)[bitsk] = BitsV1[ctrl + bitsk]
+            BitsV1[@min(@as(usize, ctrl_offset) + bitsk, 4)];
 
         data = decodeBytesGroup(data, destination[i..][0..ByteGroupSize], actual_bits);
     }
@@ -203,36 +208,75 @@ fn decodeBytesGroup(data: []const u8, dest: *[ByteGroupSize]u8, bits: u8) []cons
             @memset(dest, 0);
             return data;
         },
+        1 => {
+            // 1-bit: 2 header bytes (8 values each), overflow starts at index 2.
+            // C# reverses bit order within each byte, then reads MSB-first.
+            // Equivalent: read LSB-first from unreversed byte.
+            var overflow: usize = 2;
+            for (0..2) |byte_idx| {
+                var b = data[byte_idx];
+                for (0..8) |j| {
+                    const enc = b & 1;
+                    b >>= 1;
+                    if (enc == 1) {
+                        dest[byte_idx * 8 + j] = data[overflow];
+                        overflow += 1;
+                    } else {
+                        dest[byte_idx * 8 + j] = 0;
+                    }
+                }
+            }
+            return data[overflow..];
+        },
+        2 => {
+            // 2-bit: 4 header bytes (4 values each), overflow starts at index 4.
+            // C# reads MSB-first: shift = 8-2-2*idx → 6,4,2,0
+            var overflow: usize = 4;
+            for (0..4) |byte_idx| {
+                const b = data[byte_idx];
+                for (0..4) |j| {
+                    const shift: u3 = @intCast(6 - 2 * j);
+                    const enc: u8 = (b >> shift) & 3;
+                    if (enc == 3) {
+                        dest[byte_idx * 4 + j] = data[overflow];
+                        overflow += 1;
+                    } else {
+                        dest[byte_idx * 4 + j] = enc;
+                    }
+                }
+            }
+            return data[overflow..];
+        },
+        4 => {
+            // 4-bit: 8 header bytes (2 values each), overflow starts at index 8.
+            // C# reads MSB-first: high nibble first, then low nibble.
+            var overflow: usize = 8;
+            for (0..8) |byte_idx| {
+                const b = data[byte_idx];
+                // High nibble first
+                const hi: u8 = (b >> 4) & 0xF;
+                if (hi == 0xF) {
+                    dest[byte_idx * 2] = data[overflow];
+                    overflow += 1;
+                } else {
+                    dest[byte_idx * 2] = hi;
+                }
+                // Low nibble second
+                const lo: u8 = b & 0xF;
+                if (lo == 0xF) {
+                    dest[byte_idx * 2 + 1] = data[overflow];
+                    overflow += 1;
+                } else {
+                    dest[byte_idx * 2 + 1] = lo;
+                }
+            }
+            return data[overflow..];
+        },
         8 => {
             @memcpy(dest, data[0..ByteGroupSize]);
             return data[ByteGroupSize..];
         },
-        else => {
-            // For 1, 2, 4 bit modes the C# code reads from high-to-low bits
-            // within each byte. The encoding packs (8/bits) values per byte,
-            // MSB first. If value == (1<<bits)-1, read a literal from overflow.
-            const vals_per_byte: usize = 8 / @as(usize, bits);
-            const header_bytes: usize = (ByteGroupSize + vals_per_byte - 1) / vals_per_byte;
-            var consumed: usize = header_bytes;
-            const sentinel: u8 = (@as(u8, 1) << @intCast(bits)) - 1;
-
-            for (0..ByteGroupSize) |di| {
-                const header_byte_idx = di / vals_per_byte;
-                const val_idx_in_byte = di % vals_per_byte;
-                // Values are packed MSB-first: first value is in highest bits
-                const shift: u3 = @intCast(8 - @as(u8, bits) * @as(u8, @intCast(val_idx_in_byte + 1)));
-                const val: u8 = (data[header_byte_idx] >> shift) & sentinel;
-
-                if (val == sentinel) {
-                    dest[di] = data[consumed];
-                    consumed += 1;
-                } else {
-                    dest[di] = val;
-                }
-            }
-
-            return data[consumed..];
-        },
+        else => unreachable,
     }
 }
 
@@ -290,7 +334,9 @@ pub fn decodeIndexBuffer(allocator: std.mem.Allocator, index_count: usize, index
                 pushVertexFifo(&vertex_fifo, &vertex_fifo_offset, c, fec == 0);
             } else {
                 if (fec != 15) {
-                    c = last +% @as(u32, @intCast(@as(i32, @intCast(fec)) - @as(i32, @intCast(fec ^ 3))));
+                    // fec delta: this is a small signed offset, compute with wrapping
+                    const delta = @as(i32, @intCast(fec)) - @as(i32, @intCast(fec ^ 3));
+                    c = @bitCast(@as(i32, @bitCast(last)) +% delta);
                     last = c;
                 } else {
                     c = decodeIndex(data, last, &data_pos);
