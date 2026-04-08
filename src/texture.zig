@@ -199,7 +199,7 @@ pub const Texture = struct {
                     },
                     .compressed_mip_size => {
                         r.setPosition(@as(u64, extra_offset) + saved_pos - 8);
-                        _ = try r.readI32(); // int1 flag
+                        const compression_flag = try r.readI32();
                         _ = try r.readI32(); // mipsOffset
                         const mip_count_raw = try r.readI32();
                         const mip_count: usize = @intCast(mip_count_raw);
@@ -210,7 +210,7 @@ pub const Texture = struct {
                                 mips[i] = @intCast(try r.readI32());
                             }
                             self.compressed_mips = mips;
-                            self.is_compressed_mips = true;
+                            self.is_compressed_mips = (compression_flag == 1);
                         }
                     },
                     else => {},
@@ -254,18 +254,43 @@ pub const Texture = struct {
     }
 
     /// Get the raw bytes for a specific mip level (level 0 = highest resolution).
+    /// For compressed mips, returns the LZ4-compressed data; use getDecompressedMipData() instead.
+    /// Get the raw bytes for a specific mip level (level 0 = highest resolution).
+    /// Mips are stored smallest-first on disk: skip from (num_mip_levels-1) down to target.
     pub fn getMipData(self: *const Texture, mip_level: u32) ?[]const u8 {
         const tex_data = self.data orelse return null;
 
-        // Skip from highest mip (0) down to requested level
+        // Skip mips stored before the target (smallest mips come first on disk)
         var offset: usize = 0;
-        for (0..mip_level) |mip| {
-            offset += self.calculateMipSize(@intCast(mip));
+        if (self.num_mip_levels > 1) {
+            var j: u32 = self.num_mip_levels - 1;
+            while (j > mip_level) : (j -= 1) {
+                if (self.compressed_mips) |mips| {
+                    if (j < mips.len) {
+                        const compressed_size = mips[j];
+                        const calc_size = self.calculateMipSize(j);
+                        offset += if (calc_size > compressed_size) compressed_size else calc_size;
+                    } else {
+                        offset += self.calculateMipSize(j);
+                    }
+                } else {
+                    offset += self.calculateMipSize(j);
+                }
+                if (j == 0) break;
+            }
         }
 
-        const size = self.calculateMipSize(mip_level);
-        if (offset + size > tex_data.len) return null;
+        // Size of the target mip on disk
+        const size = if (self.compressed_mips) |mips| blk: {
+            if (mip_level < mips.len) {
+                const compressed_size = mips[mip_level];
+                const calc_size = self.calculateMipSize(mip_level);
+                break :blk if (calc_size > compressed_size) compressed_size else calc_size;
+            }
+            break :blk self.calculateMipSize(mip_level);
+        } else self.calculateMipSize(mip_level);
 
+        if (offset + size > tex_data.len) return null;
         return tex_data[offset..][0..size];
     }
 
@@ -277,9 +302,22 @@ pub const Texture = struct {
 
     /// Decode a specific mip level to RGBA8888.
     pub fn decodeMipRGBA(self: *const Texture, mip_level: u32) ![]u8 {
-        const mip_data = self.getMipData(mip_level) orelse return error.NoTextureData;
+        const raw_mip = self.getMipData(mip_level) orelse return error.NoTextureData;
         const mip_w = @max(1, @as(u32, self.width) >> @intCast(mip_level));
         const mip_h = @max(1, @as(u32, self.height) >> @intCast(mip_level));
+
+        // LZ4 decompress if needed
+        const expected_size = self.calculateMipSize(mip_level);
+        const mip_data = if (self.is_compressed_mips and raw_mip.len < expected_size and raw_mip.len > 0) blk: {
+            const lz4 = @import("lz4.zig");
+            const buf = self.allocator.alloc(u8, expected_size) catch return error.NoTextureData;
+            _ = lz4.decompress(raw_mip, buf) catch {
+                self.allocator.free(buf);
+                return error.NoTextureData;
+            };
+            break :blk buf;
+        } else raw_mip;
+        defer if (self.is_compressed_mips and mip_data.ptr != raw_mip.ptr) self.allocator.free(mip_data);
 
         const output_size = @as(usize, mip_w) * @as(usize, mip_h) * 4;
         const output = try self.allocator.alloc(u8, output_size);
