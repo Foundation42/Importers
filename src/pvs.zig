@@ -416,6 +416,51 @@ pub const TransportGraph = struct {
         }
         return count;
     }
+
+    /// Count of dead edges (many casts, zero hits).
+    pub fn deadEdges(self: *const TransportGraph, min_casts: u32) u64 {
+        var count: u64 = 0;
+        for (self.edges) |*e| {
+            if (e.casts.load(.monotonic) >= min_casts and e.hits.load(.monotonic) == 0) count += 1;
+        }
+        return count;
+    }
+
+    /// Check if a cell pair is confirmed dead (many casts, zero hits).
+    pub fn isDead(self: *const TransportGraph, cell_a: u32, cell_b: u32, min_casts: u32) bool {
+        if (cell_a == cell_b) return false;
+        const edge = self.getEdge(cell_a, cell_b);
+        return edge.casts.load(.monotonic) >= min_casts and edge.hits.load(.monotonic) == 0;
+    }
+
+    /// Seed this graph from a coarser graph using a cell mapping.
+    /// `fine_to_coarse[i]` maps fine cell i → coarse cell index.
+    /// Edges where the coarse pair is dead get pre-seeded with high
+    /// cast count and zero hits (blacklisted).
+    pub fn seedFromCoarse(
+        self: *TransportGraph,
+        coarse: *const TransportGraph,
+        fine_to_coarse: []const u32,
+        dead_threshold: u32,
+    ) void {
+        for (0..self.cell_count) |i| {
+            for (i + 1..self.cell_count) |j| {
+                const ci = fine_to_coarse[i];
+                const cj = fine_to_coarse[j];
+                if (ci == cj) continue; // same coarse cell — no prior
+
+                const coarse_edge = coarse.getEdge(ci, cj);
+                const coarse_casts = coarse_edge.casts.load(.monotonic);
+
+                if (coarse_casts >= dead_threshold and coarse_edge.hits.load(.monotonic) == 0) {
+                    // Blacklist: seed with high casts, zero hits
+                    const idx = self.edgeIndex(@intCast(i), @intCast(j));
+                    self.edges[idx].casts = Atomic(u32).init(dead_threshold);
+                    self.edges[idx].hits = Atomic(u32).init(0);
+                }
+            }
+        }
+    }
 };
 
 // ── PVS Solver ──────────────────────────────────────────────────────────
@@ -664,6 +709,9 @@ pub const PvsSolver = struct {
 
             if (cell_a == cell_b) continue;
 
+            // Skip dead edges (seeded from coarser epoch or confirmed dead here)
+            if (self.transport.isDead(cell_a, cell_b, 50)) continue;
+
             // 3. Pick random triangles within those cells
             const range_a = self.cell_ranges[cell_a];
             const range_b = self.cell_ranges[cell_b];
@@ -683,21 +731,21 @@ pub const PvsSolver = struct {
         return added;
     }
 
-    /// Pick a target cell for exploration — prefer under-sampled pairs.
+    /// Pick a target cell for exploration — prefer under-sampled, non-dead pairs.
     fn pickExploreTarget(self: *PvsSolver, rng: std.Random, source: u32, n: u32) u32 {
-        // Try a few random candidates, pick the one with fewest casts
         var best: u32 = rng.intRangeLessThan(u32, 0, n);
         var best_casts: u32 = std.math.maxInt(u32);
 
-        for (0..8) |_| {
+        for (0..12) |_| {
             const candidate = rng.intRangeLessThan(u32, 0, n);
             if (candidate == source) continue;
+            if (self.transport.isDead(source, candidate, 50)) continue;
             const edge = self.transport.getEdge(source, candidate);
             const casts = edge.casts.load(.monotonic);
             if (casts < best_casts) {
                 best = candidate;
                 best_casts = casts;
-                if (casts == 0) break; // totally unexplored — great
+                if (casts == 0) break;
             }
         }
         return best;

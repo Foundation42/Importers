@@ -138,136 +138,37 @@ pub fn main() !void {
     try stdout.print("  BIVH depth:  {d}\n", .{world_bivh.tree_depth});
     try stdout.print("  Build time:  {d}ms\n", .{@divTrunc(t_bivh1 - t_bivh0, 1_000_000)});
 
-    // ── Phase 3: Build cluster BIVH (view cells) ─────────────────
+    // ── Epoch definitions ─────────────────────────────────────────────
     //
-    // Group BIVH-sorted triangles into clusters of 2^cluster_shift.
-    // The BIVH reorders indices spatially, so consecutive triangles
-    // are nearby — clusters are naturally spatially coherent.
-    // Build a second BIVH over cluster AABBs for view cell lookup.
+    // Each epoch runs at a different resolution.  The transport graph
+    // from epoch N seeds epoch N+1 — dead edges (many casts, zero hits)
+    // get blacklisted so the finer epoch doesn't waste rays on them.
 
-    const cluster_shift: u5 = 8; // clusters of 256 triangles (~17K clusters for Dust II)
-    const cluster_size: u32 = @as(u32, 1) << cluster_shift;
-    const cluster_count = (tri_count + cluster_size - 1) / cluster_size;
+    const EpochDef = struct {
+        cluster_shift: u5,
+        exploration_rate: f32,
+        time_seconds: u32,
+        samples_per_pass: u32,
+    };
 
-    try stdout.print("\n  Building cluster BIVH ({d} clusters of {d})...\n", .{ cluster_count, cluster_size });
-    const t_clust0 = std.time.nanoTimestamp();
-
-    // Compute cluster AABBs from the BIVH-reordered index buffer
-    var cluster_positions = try allocator.alloc([3]f32, cluster_count * 3);
-    defer allocator.free(cluster_positions);
-    var cluster_indices = try allocator.alloc(u32, cluster_count * 3);
-    defer allocator.free(cluster_indices);
-
-    for (0..cluster_count) |ci| {
-        const start_tri = @as(u32, @intCast(ci)) * cluster_size;
-        const end_tri = @min(start_tri + cluster_size, tri_count);
-
-        // Compute AABB of all triangles in this cluster
-        var cmin = [3]f32{ std.math.floatMax(f32), std.math.floatMax(f32), std.math.floatMax(f32) };
-        var cmax = [3]f32{ -std.math.floatMax(f32), -std.math.floatMax(f32), -std.math.floatMax(f32) };
-
-        for (start_tri..end_tri) |ti| {
-            const base = ti * 3;
-            for (0..3) |vi| {
-                const pos = all_positions.items[mesh_set.indices[base + vi]];
-                for (0..3) |a| {
-                    cmin[a] = @min(cmin[a], pos[a]);
-                    cmax[a] = @max(cmax[a], pos[a]);
-                }
-            }
-        }
-
-        // Create a degenerate triangle representing the cluster AABB
-        // (two corners + midpoint — gives the BIVH correct bounds)
-        const idx: u32 = @intCast(ci * 3);
-        cluster_positions[idx] = cmin;
-        cluster_positions[idx + 1] = cmax;
-        cluster_positions[idx + 2] = .{
-            (cmin[0] + cmax[0]) * 0.5,
-            (cmin[1] + cmax[1]) * 0.5,
-            (cmin[2] + cmax[2]) * 0.5,
-        };
-        cluster_indices[idx] = idx;
-        cluster_indices[idx + 1] = idx + 1;
-        cluster_indices[idx + 2] = idx + 2;
-    }
-
-    var cluster_mesh = bivh_mod.TriangleMeshSet.fromArrays(cluster_positions, cluster_indices);
-    var cluster_bivh = bivh_mod.Bivh.init(allocator);
-    defer cluster_bivh.deinit();
-    try cluster_bivh.build(&cluster_mesh);
-
-    const t_clust1 = std.time.nanoTimestamp();
-
-    try stdout.print("  Cluster BIVH nodes:  {d}\n", .{cluster_bivh.node_count});
-    try stdout.print("  Cluster BIVH leaves: {d}\n", .{cluster_bivh.leafCount()});
-    try stdout.print("  Build time:          {d}ms\n", .{@divTrunc(t_clust1 - t_clust0, 1_000_000)});
-
-    // Memory estimate
-    const bitmap_bytes = (@as(u64, cluster_count) + 63) / 64 * 8;
-    const total_mem = bitmap_bytes * cluster_bivh.leafCount();
-    try stdout.print("  Bitmap/cell:         {d} KB\n", .{bitmap_bytes / 1024});
-    try stdout.print("  Est. total memory:   {d} MB\n", .{total_mem / (1024 * 1024)});
-
-    // ── Phase 4: Build cell ranges + prepare view cells ─────────────
-    //
-    // Each cell in the cluster BIVH leaf corresponds to a range of
-    // triangles.  Since the world BIVH reorders triangles spatially and
-    // we chunk them into clusters of cluster_size, each cluster maps to
-    // a contiguous triangle range: [ci * cluster_size, min((ci+1)*cluster_size, tri_count)).
-    //
-    // The cluster BIVH's leaves hold clusters (not individual tris), so
-    // each leaf covers one or more clusters.  We build a CellRange per
-    // cluster BIVH leaf that spans all its constituent clusters' triangles.
-
-    var cell_node_indices = std.ArrayList(u32).init(allocator);
-    defer cell_node_indices.deinit();
-    var cell_ranges = std.ArrayList(pvs_mod.CellRange).init(allocator);
-    defer cell_ranges.deinit();
-
-    for (0..cluster_bivh.node_count) |i| {
-        const node = cluster_bivh.nodes[i];
-        if (!node.isLeaf()) continue;
-
-        // This leaf covers clusters [start_prim..end_prim] in the cluster BIVH.
-        // Map back to triangle ranges.
-        const first_cluster = @as(u32, @intCast(node.startPrim()));
-        const last_cluster = @as(u32, @intCast(node.end_prim));
-
-        const start_tri = first_cluster * cluster_size;
-        const end_tri = @min((last_cluster + 1) * cluster_size, tri_count);
-
-        try cell_node_indices.append(@intCast(i));
-        try cell_ranges.append(.{ .start_tri = start_tri, .end_tri = end_tri });
-    }
-
-    const num_cells: u32 = @intCast(cell_ranges.items.len);
-    try stdout.print("  View cells:   {d}\n", .{num_cells});
-
-    // Transport graph memory: N*(N-1)/2 edges, 8 bytes each
-    const edge_count = @as(u64, num_cells) * (@as(u64, num_cells) - 1) / 2;
-    const transport_mem = edge_count * 8;
-    try stdout.print("  Transport:    {d} edges ({d} MB)\n", .{ edge_count, transport_mem / (1024 * 1024) });
-
-    // ── Phase 5: Run PVS solver ──────────────────────────────────────
+    const epochs = [_]EpochDef{
+        .{ .cluster_shift = 12, .exploration_rate = 0.5, .time_seconds = 30, .samples_per_pass = 10_000 },
+        .{ .cluster_shift = 10, .exploration_rate = 0.2, .time_seconds = 60, .samples_per_pass = 10_000 },
+        .{ .cluster_shift = 8, .exploration_rate = 0.05, .time_seconds = 120, .samples_per_pass = 10_000 },
+    };
 
     const thread_count = @as(u32, @intCast(std.Thread.getCpuCount() catch 4));
-    try stdout.print("\n  ═══ PVS Solve ═══\n", .{});
-    try stdout.print("  Threads:      {d}\n", .{thread_count});
-    try stdout.print("  Clusters:     {d}\n", .{cluster_count});
-    try stdout.print("  Cells:        {d}\n", .{num_cells});
+    const root = world_bivh.nodes[0];
+    const world_min = root.min;
+    const world_max = root.max;
+    const base_name = std.fs.path.stem(map_vpk_path);
 
-    // World BIVH for ray tracing, cluster BIVH for cell lookup
     var trace_ctx = TraceContext{
         .bivh = &world_bivh,
         .mesh_set = &mesh_set,
     };
 
-    var cell_ctx = CellContext{
-        .bivh = &cluster_bivh,
-    };
-
-    // Quick ray trace benchmark
+    // Ray trace benchmark (once)
     {
         const bench_count: u32 = 1000;
         const tb0 = std.time.nanoTimestamp();
@@ -279,116 +180,232 @@ pub fn main() !void {
             if (r.hit) hits += 1;
         }
         const tb1 = std.time.nanoTimestamp();
-        const us_per_ray = @divTrunc(tb1 - tb0, bench_count * 1000);
-        try stdout.print("\n  Ray bench: {d} rays, {d} hits, {d} µs/ray\n", .{ bench_count, hits, us_per_ray });
+        try stdout.print("\n  Ray bench: {d} rays, {d} hits, {d} µs/ray\n", .{ bench_count, hits, @divTrunc(tb1 - tb0, bench_count * 1000) });
     }
 
-    var solver = try pvs_mod.PvsSolver.init(
-        allocator,
-        all_positions.items,
-        all_indices.items,
-        cluster_bivh.node_count,
-        cell_node_indices.items,
-        cell_ranges.items,
-        &traceWorld,
-        @ptrCast(&trace_ctx),
-        &findClusterCell,
-        @ptrCast(&cell_ctx),
-        .{
-            .thread_count = thread_count,
-            .max_ray_distance = 2000.0,
-            .convergence_threshold = 120,
-            .samples_per_pass = 10_000,
-            .max_passes = 10_000,
-            .progress_fn = &progressCallback,
-            .cluster_shift = cluster_shift,
-            .exploration_rate = 0.3,
-            .max_time_seconds = 300,
-        },
-    );
-    defer solver.deinit();
+    // Track previous epoch's state for seeding
+    var prev_cluster_bivh: ?bivh_mod.Bivh = null;
+    var prev_transport: ?pvs_mod.TransportGraph = null;
+    var prev_cell_node_indices: ?[]u32 = null;
 
-    const t_solve0 = std.time.nanoTimestamp();
-    try solver.solve();
-    const t_solve1 = std.time.nanoTimestamp();
+    defer if (prev_transport) |*pt| pt.deinit();
+    // Note: prev_cluster_bivh and prev_cell_node_indices are freed at end of each iteration
 
-    const solve_stats = solver.stats();
-    try stdout.print("\n  ═══ Results ═══\n", .{});
-    try stdout.print("  Passes:           {d}\n", .{solve_stats.passes});
-    try stdout.print("  Active cells:     {d}\n", .{solve_stats.active_cells});
-    try stdout.print("  Total visible:    {d} clusters\n", .{solve_stats.total_visible});
-    try stdout.print("  Avg per cell:     {d}\n", .{solve_stats.avg_visible});
-    try stdout.print("  Min per cell:     {d}\n", .{solve_stats.min_visible});
-    try stdout.print("  Max per cell:     {d}\n", .{solve_stats.max_visible});
-    try stdout.print("  Transport casts:  {d}\n", .{solve_stats.transport_casts});
-    try stdout.print("  Transport edges:  {d} connected\n", .{solve_stats.transport_edges});
-    try stdout.print("  Solve time:       {d}ms\n", .{@divTrunc(t_solve1 - t_solve0, 1_000_000)});
+    for (epochs, 0..) |epoch, epoch_idx| {
+        try stdout.print("\n  ╔═══════════════════════════════════╗\n", .{});
+        try stdout.print("  ║  Epoch {d}/{d}  (shift={d}, explore={d:.0}%)  ║\n", .{
+            epoch_idx + 1, epochs.len, epoch.cluster_shift, epoch.exploration_rate * 100,
+        });
+        try stdout.print("  ╚═══════════════════════════════════╝\n", .{});
+
+        const cluster_size: u32 = @as(u32, 1) << epoch.cluster_shift;
+        const cluster_count = (tri_count + cluster_size - 1) / cluster_size;
+
+        // Build cluster BIVH for this epoch
+        try stdout.print("  Clusters: {d} (size {d})\n", .{ cluster_count, cluster_size });
+        const t_clust0 = std.time.nanoTimestamp();
+
+        const cluster_positions = try allocator.alloc([3]f32, cluster_count * 3);
+        defer allocator.free(cluster_positions);
+        const cluster_indices_buf = try allocator.alloc(u32, cluster_count * 3);
+        defer allocator.free(cluster_indices_buf);
+
+        for (0..cluster_count) |ci| {
+            const start_t = @as(u32, @intCast(ci)) * cluster_size;
+            const end_t = @min(start_t + cluster_size, tri_count);
+            var cmin = [3]f32{ std.math.floatMax(f32), std.math.floatMax(f32), std.math.floatMax(f32) };
+            var cmax = [3]f32{ -std.math.floatMax(f32), -std.math.floatMax(f32), -std.math.floatMax(f32) };
+            for (start_t..end_t) |ti| {
+                const base = ti * 3;
+                for (0..3) |vi| {
+                    const pos = all_positions.items[mesh_set.indices[base + vi]];
+                    for (0..3) |a| {
+                        cmin[a] = @min(cmin[a], pos[a]);
+                        cmax[a] = @max(cmax[a], pos[a]);
+                    }
+                }
+            }
+            const idx: u32 = @intCast(ci * 3);
+            cluster_positions[idx] = cmin;
+            cluster_positions[idx + 1] = cmax;
+            cluster_positions[idx + 2] = .{
+                (cmin[0] + cmax[0]) * 0.5,
+                (cmin[1] + cmax[1]) * 0.5,
+                (cmin[2] + cmax[2]) * 0.5,
+            };
+            cluster_indices_buf[idx] = idx;
+            cluster_indices_buf[idx + 1] = idx + 1;
+            cluster_indices_buf[idx + 2] = idx + 2;
+        }
+
+        var cluster_mesh = bivh_mod.TriangleMeshSet.fromArrays(cluster_positions, cluster_indices_buf);
+        var cluster_bivh = bivh_mod.Bivh.init(allocator);
+        defer cluster_bivh.deinit();
+        try cluster_bivh.build(&cluster_mesh);
+
+        const t_clust1 = std.time.nanoTimestamp();
+        try stdout.print("  BIVH: {d} nodes, {d} leaves ({d}ms)\n", .{
+            cluster_bivh.node_count, cluster_bivh.leafCount(), @divTrunc(t_clust1 - t_clust0, 1_000_000),
+        });
+
+        // Build cell ranges
+        var cell_node_indices = std.ArrayList(u32).init(allocator);
+        defer cell_node_indices.deinit();
+        var cell_ranges = std.ArrayList(pvs_mod.CellRange).init(allocator);
+        defer cell_ranges.deinit();
+
+        for (0..cluster_bivh.node_count) |i| {
+            const node = cluster_bivh.nodes[i];
+            if (!node.isLeaf()) continue;
+            const first_cluster = @as(u32, @intCast(node.startPrim()));
+            const last_cluster = @as(u32, @intCast(node.end_prim));
+            const start_t = first_cluster * cluster_size;
+            const end_t = @min((last_cluster + 1) * cluster_size, tri_count);
+            try cell_node_indices.append(@intCast(i));
+            try cell_ranges.append(.{ .start_tri = start_t, .end_tri = end_t });
+        }
+
+        const num_cells: u32 = @intCast(cell_ranges.items.len);
+        try stdout.print("  Cells: {d}\n", .{num_cells});
+
+        // Set up cell lookup
+        var cell_ctx = CellContext{ .bivh = &cluster_bivh };
+
+        // Create solver
+        var solver = try pvs_mod.PvsSolver.init(
+            allocator,
+            all_positions.items,
+            all_indices.items,
+            cluster_bivh.node_count,
+            cell_node_indices.items,
+            cell_ranges.items,
+            &traceWorld,
+            @ptrCast(&trace_ctx),
+            &findClusterCell,
+            @ptrCast(&cell_ctx),
+            .{
+                .thread_count = thread_count,
+                .max_ray_distance = 2000.0,
+                .convergence_threshold = 120,
+                .samples_per_pass = epoch.samples_per_pass,
+                .max_passes = 100_000,
+                .progress_fn = &progressCallback,
+                .cluster_shift = epoch.cluster_shift,
+                .exploration_rate = epoch.exploration_rate,
+                .max_time_seconds = epoch.time_seconds,
+            },
+        );
+        defer solver.deinit();
+
+        // Seed from previous epoch's transport graph
+        if (prev_transport) |*pt| {
+            if (prev_cluster_bivh) |*pcb| {
+                try stdout.writeAll("  Seeding from previous epoch...\n");
+
+                // Map each fine cell centroid → coarse cell index
+                const fine_to_coarse = try allocator.alloc(u32, num_cells);
+                defer allocator.free(fine_to_coarse);
+
+                for (cell_node_indices.items, 0..) |node_idx, ci| {
+                    const node = cluster_bivh.nodes[node_idx];
+                    const centroid = Vec3{
+                        (node.min[0] + node.max[0]) * 0.5,
+                        (node.min[1] + node.max[1]) * 0.5,
+                        (node.min[2] + node.max[2]) * 0.5,
+                    };
+
+                    // Find which coarse cell contains this centroid
+                    if (pcb.findLeaf(centroid, null)) |coarse_node| {
+                        // Map coarse BIVH node → coarse cell index
+                        var coarse_idx: u32 = 0;
+                        for (prev_cell_node_indices.?) |pcni| {
+                            if (pcni == coarse_node) break;
+                            coarse_idx += 1;
+                        }
+                        fine_to_coarse[ci] = @min(coarse_idx, pt.cell_count - 1);
+                    } else {
+                        fine_to_coarse[ci] = 0;
+                    }
+                }
+
+                solver.transport.seedFromCoarse(pt, fine_to_coarse, 50);
+
+                const dead = solver.transport.deadEdges(50);
+                const total_edges = @as(u64, num_cells) * (@as(u64, num_cells) - 1) / 2;
+                try stdout.print("  Blacklisted: {d}/{d} edges ({d}%)\n", .{
+                    dead, total_edges, if (total_edges > 0) dead * 100 / total_edges else 0,
+                });
+            }
+        }
+
+        // Run solve
+        const t_solve0 = std.time.nanoTimestamp();
+        try solver.solve();
+        const t_solve1 = std.time.nanoTimestamp();
+
+        const s = solver.stats();
+        try stdout.print("  ── Results ──\n", .{});
+        try stdout.print("  Passes: {d}, Visible: {d}, Avg: {d}, Min: {d}, Max: {d}\n", .{
+            s.passes, s.total_visible, s.avg_visible, s.min_visible, s.max_visible,
+        });
+        try stdout.print("  Transport: {d} casts, {d} connected, {d} dead\n", .{
+            s.transport_casts, s.transport_edges, solver.transport.deadEdges(50),
+        });
+        try stdout.print("  Time: {d}ms\n", .{@divTrunc(t_solve1 - t_solve0, 1_000_000)});
+
+        // Visualization for this epoch
+        const cell_centroids = try allocator.alloc(Vec3, num_cells);
+        defer allocator.free(cell_centroids);
+        for (cell_node_indices.items, 0..) |node_idx, ci| {
+            const node = cluster_bivh.nodes[node_idx];
+            cell_centroids[ci] = .{
+                (node.min[0] + node.max[0]) * 0.5,
+                (node.min[1] + node.max[1]) * 0.5,
+                (node.min[2] + node.max[2]) * 0.5,
+            };
+        }
+
+        {
+            const heatmap_path = try std.fmt.allocPrint(allocator, "{s}_e{d}_transport.ppm", .{ base_name, epoch_idx + 1 });
+            defer allocator.free(heatmap_path);
+            try writeTransportHeatmap(allocator, &solver.transport, cell_centroids, num_cells, world_min, world_max, heatmap_path);
+            try stdout.print("  → {s}\n", .{heatmap_path});
+        }
+        {
+            const density_path = try std.fmt.allocPrint(allocator, "{s}_e{d}_density.ppm", .{ base_name, epoch_idx + 1 });
+            defer allocator.free(density_path);
+            try writeVisibilityDensity(allocator, &solver, &cluster_bivh, cell_node_indices.items, cluster_count, world_min, world_max, density_path);
+            try stdout.print("  → {s}\n", .{density_path});
+        }
+
+        // Final epoch: serialize PVS
+        if (epoch_idx == epochs.len - 1) {
+            const out_path = try deriveOutputPath(allocator, map_vpk_path);
+            defer allocator.free(out_path);
+            try serializePvs(allocator, &solver, &cluster_bivh, out_path);
+            try stdout.print("  → {s}\n", .{out_path});
+        }
+
+        // Save transport for next epoch's seeding
+        if (prev_transport) |*pt| pt.deinit();
+        prev_transport = solver.transport;
+        // Prevent solver.deinit() from freeing the transport we just saved
+        solver.transport = try pvs_mod.TransportGraph.init(allocator, 1);
+
+        if (prev_cluster_bivh) |*pcb| pcb.deinit();
+        prev_cluster_bivh = cluster_bivh;
+        // Prevent defer from freeing the BIVH we're keeping
+        cluster_bivh = bivh_mod.Bivh.init(allocator);
+
+        if (prev_cell_node_indices) |pcni| allocator.free(pcni);
+        prev_cell_node_indices = try allocator.dupe(u32, cell_node_indices.items);
+    }
+
+    if (prev_cell_node_indices) |pcni| allocator.free(pcni);
+    if (prev_cluster_bivh) |*pcb| pcb.deinit();
 
     const t_total = std.time.nanoTimestamp();
-    try stdout.print("\n  Total time:     {d}ms\n", .{@divTrunc(t_total - t0, 1_000_000)});
-
-    // ── Phase 6: Serialize PVS data ──────────────────────────────────
-
-    // Derive output path from input VPK
-    const out_path = try deriveOutputPath(allocator, map_vpk_path);
-    defer allocator.free(out_path);
-
-    try serializePvs(allocator, &solver, &cluster_bivh, out_path);
-    try stdout.print("  PVS written to: {s}\n", .{out_path});
-
-    // ── Phase 7: Visualization ───────────────────────────────────────
-
-    const base_name = std.fs.path.stem(map_vpk_path);
-
-    // Compute cell centroids from cluster BIVH leaf bounds
-    const cell_centroids = try allocator.alloc(Vec3, num_cells);
-    defer allocator.free(cell_centroids);
-    for (cell_node_indices.items, 0..) |node_idx, ci| {
-        const node = cluster_bivh.nodes[node_idx];
-        cell_centroids[ci] = .{
-            (node.min[0] + node.max[0]) * 0.5,
-            (node.min[1] + node.max[1]) * 0.5,
-            (node.min[2] + node.max[2]) * 0.5,
-        };
-    }
-
-    // Get world bounds from the world BIVH root
-    const root = world_bivh.nodes[0];
-    const world_min = root.min;
-    const world_max = root.max;
-
-    // 1. Transport heatmap — top-down XZ view, lines colored by P(visible)
-    {
-        const heatmap_path = try std.fmt.allocPrint(allocator, "{s}_transport.ppm", .{base_name});
-        defer allocator.free(heatmap_path);
-        try writeTransportHeatmap(
-            allocator,
-            &solver.transport,
-            cell_centroids,
-            num_cells,
-            world_min,
-            world_max,
-            heatmap_path,
-        );
-        try stdout.print("  Transport heatmap: {s}\n", .{heatmap_path});
-    }
-
-    // 2. Visibility density — each cell colored by visible cluster count
-    {
-        const density_path = try std.fmt.allocPrint(allocator, "{s}_density.ppm", .{base_name});
-        defer allocator.free(density_path);
-        try writeVisibilityDensity(
-            allocator,
-            &solver,
-            &cluster_bivh,
-            cell_node_indices.items,
-            cluster_count,
-            world_min,
-            world_max,
-            density_path,
-        );
-        try stdout.print("  Density map:       {s}\n", .{density_path});
-    }
+    try stdout.print("\n  ═══ Total time: {d}ms ═══\n", .{@divTrunc(t_total - t0, 1_000_000)});
 }
 
 // ── BIVH adapter for PVS function pointers ──────────────────────────
