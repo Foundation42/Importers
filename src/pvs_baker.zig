@@ -13,6 +13,8 @@ const Resource = vrf.Resource;
 const binary_kv3 = vrf.binary_kv3;
 const bivh_mod = @import("bivh");
 const pvs_mod = @import("pvs");
+const pvs_viz = @import("pvs_viz");
+const pvs_neural = @import("pvs_neural");
 
 const Vec3 = [3]f32;
 
@@ -50,6 +52,18 @@ pub fn main() !void {
     var all_indices = std.ArrayList(u32).init(allocator);
     defer all_indices.deinit();
 
+    // Track model triangle ranges for cluster→model mapping
+    const ModelRange = struct {
+        tri_start: u32,
+        tri_end: u32,
+        name: []const u8,
+    };
+    var model_ranges = std.ArrayList(ModelRange).init(allocator);
+    defer {
+        for (model_ranges.items) |mr| allocator.free(mr.name);
+        model_ranges.deinit();
+    }
+
     var model_count: u32 = 0;
     var failed_count: u32 = 0;
 
@@ -84,8 +98,20 @@ pub fn main() !void {
         const entry_data = map_pkg.readEntry(entry) catch continue;
         defer allocator.free(entry_data);
 
+        const tri_start = @as(u32, @intCast(all_indices.items.len / 3));
         extractModelGeometry(allocator, entry_data, &all_positions, &all_indices) catch {
             failed_count += 1;
+            continue;
+        };
+        const tri_end = @as(u32, @intCast(all_indices.items.len / 3));
+
+        const name = allocator.dupe(u8, entry.file_name) catch continue;
+        model_ranges.append(.{
+            .tri_start = tri_start,
+            .tri_end = tri_end,
+            .name = name,
+        }) catch {
+            allocator.free(name);
             continue;
         };
         model_count += 1;
@@ -99,8 +125,21 @@ pub fn main() !void {
             if (!std.mem.eql(u8, entry.type_name, "vmdl_c")) continue;
             const entry_data = cpkg.readEntry(entry) catch continue;
             defer allocator.free(entry_data);
+
+            const tri_start = @as(u32, @intCast(all_indices.items.len / 3));
             extractModelGeometry(allocator, entry_data, &all_positions, &all_indices) catch {
                 failed_count += 1;
+                continue;
+            };
+            const tri_end = @as(u32, @intCast(all_indices.items.len / 3));
+
+            const name = allocator.dupe(u8, entry.file_name) catch continue;
+            model_ranges.append(.{
+                .tri_start = tri_start,
+                .tri_end = tri_end,
+                .name = name,
+            }) catch {
+                allocator.free(name);
                 continue;
             };
             model_count += 1;
@@ -126,7 +165,8 @@ pub fn main() !void {
     try stdout.writeAll("\n  Building world BIVH...\n");
     const t_bivh0 = std.time.nanoTimestamp();
 
-    var mesh_set = bivh_mod.TriangleMeshSet.fromArrays(all_positions.items, all_indices.items);
+    var mesh_set = try bivh_mod.TriangleMeshSet.fromArraysWithPerm(all_positions.items, all_indices.items, allocator);
+    defer mesh_set.deinitPerm();
     var world_bivh = bivh_mod.Bivh.init(allocator);
     defer world_bivh.deinit();
     try world_bivh.build(&mesh_set);
@@ -211,7 +251,8 @@ pub fn main() !void {
         cluster_indices_buf[idx + 2] = idx + 2;
     }
 
-    var cluster_mesh = bivh_mod.TriangleMeshSet.fromArrays(cluster_positions, cluster_indices_buf);
+    var cluster_mesh = try bivh_mod.TriangleMeshSet.fromArraysWithPerm(cluster_positions, cluster_indices_buf, allocator);
+    defer cluster_mesh.deinitPerm();
     var cluster_bivh = bivh_mod.Bivh.init(allocator);
     defer cluster_bivh.deinit();
     try cluster_bivh.build(&cluster_mesh);
@@ -221,7 +262,9 @@ pub fn main() !void {
         cluster_bivh.node_count, cluster_bivh.leafCount(), @divTrunc(t_clust1 - t_clust0, 1_000_000),
     });
 
-    // Build cell info
+    // Build cell info — use cluster BIVH perm to get original cluster IDs
+    const cluster_perm = cluster_mesh.perm orelse return error.NoPerm;
+
     var cell_node_indices = std.ArrayList(u32).init(allocator);
     defer cell_node_indices.deinit();
     var cell_ranges_list = std.ArrayList(pvs_mod.CellRange).init(allocator);
@@ -232,16 +275,35 @@ pub fn main() !void {
     defer cell_mins_list.deinit();
     var cell_maxs_list = std.ArrayList([3]f32).init(allocator);
     defer cell_maxs_list.deinit();
+    // Per-cell: list of original cluster IDs (for model mapping)
+    var cell_cluster_ids = std.ArrayList([]u32).init(allocator);
+    defer {
+        for (cell_cluster_ids.items) |ids| allocator.free(ids);
+        cell_cluster_ids.deinit();
+    }
 
     for (0..cluster_bivh.node_count) |i| {
         const node = cluster_bivh.nodes[i];
         if (!node.isLeaf()) continue;
-        const first_cluster = @as(u32, @intCast(node.startPrim()));
-        const last_cluster = @as(u32, @intCast(node.end_prim));
+        const first_sorted = @as(u32, @intCast(node.startPrim()));
+        const last_sorted = @as(u32, @intCast(node.end_prim));
+
+        // Translate sorted positions to original cluster IDs via perm
+        const count = last_sorted - first_sorted + 1;
+        const orig_ids = try allocator.alloc(u32, count);
+        var min_orig_tri: u32 = std.math.maxInt(u32);
+        var max_orig_tri: u32 = 0;
+        for (0..count) |k| {
+            const orig_cluster = cluster_perm[first_sorted + k];
+            orig_ids[k] = orig_cluster;
+            min_orig_tri = @min(min_orig_tri, orig_cluster * cluster_size);
+            max_orig_tri = @max(max_orig_tri, @min((orig_cluster + 1) * cluster_size, tri_count));
+        }
+
         try cell_node_indices.append(@intCast(i));
         try cell_ranges_list.append(.{
-            .start_tri = first_cluster * cluster_size,
-            .end_tri = @min((last_cluster + 1) * cluster_size, tri_count),
+            .start_tri = min_orig_tri,
+            .end_tri = max_orig_tri,
         });
         try cell_centroids_list.append(.{
             (node.min[0] + node.max[0]) * 0.5,
@@ -250,6 +312,7 @@ pub fn main() !void {
         });
         try cell_mins_list.append(node.min);
         try cell_maxs_list.append(node.max);
+        try cell_cluster_ids.append(orig_ids);
     }
 
     const num_cells: u32 = @intCast(cell_ranges_list.items.len);
@@ -299,7 +362,7 @@ pub fn main() !void {
     {
         const heatmap_path = try std.fmt.allocPrint(allocator, "{s}_transport.ppm", .{base_name});
         defer allocator.free(heatmap_path);
-        try writeTransportHeatmap(allocator, &walker.transport, cell_centroids_list.items, num_cells, world_min, world_max, heatmap_path);
+        try pvs_viz.writeTransportHeatmap(allocator, &walker.transport, cell_centroids_list.items, num_cells, world_min, world_max, heatmap_path);
         try stdout.print("  → {s}\n", .{heatmap_path});
     }
 
@@ -416,7 +479,7 @@ pub fn main() !void {
         {
             const island_path = try std.fmt.allocPrint(allocator, "{s}_islands.ppm", .{base_name});
             defer allocator.free(island_path);
-            try writeIslandMap(allocator, &islands, probes, pcb, final_cell_indices, final_centroids, final_num_cells, world_min, world_max, island_path);
+            try pvs_viz.writeIslandMap(allocator, &islands, probes, pcb, final_cell_indices, final_centroids, final_num_cells, world_min, world_max, island_path);
             try stdout.print("  → {s}\n", .{island_path});
         }
 
@@ -536,7 +599,7 @@ pub fn main() !void {
         {
             const assign_path = try std.fmt.allocPrint(allocator, "{s}_probe_assign.ppm", .{base_name});
             defer allocator.free(assign_path);
-            try writeProbeAssignment(allocator, &assignment, cluster_centroids, final_cluster_count, probes, world_min, world_max, assign_path);
+            try pvs_viz.writeProbeAssignment(allocator, &assignment, cluster_centroids, final_cluster_count, probes, world_min, world_max, assign_path);
             try stdout.print("  → {s}\n", .{assign_path});
         }
 
@@ -636,8 +699,235 @@ pub fn main() !void {
         {
             const light_path = try std.fmt.allocPrint(allocator, "{s}_lighting.ppm", .{base_name});
             defer allocator.free(light_path);
-            try writeLightingMap(allocator, cluster_light, cluster_centroids, final_cluster_count, probe_sh, probes, max_light, world_min, world_max, light_path);
+            try pvs_viz.writeLightingMap(allocator, cluster_light, cluster_centroids, final_cluster_count, probe_sh, probes, world_min, world_max, light_path);
             try stdout.print("  → {s}\n", .{light_path});
+        }
+
+        // ── Per-Cell Model Sets (direct, no cluster intermediary) ────
+        try stdout.print("\n  ╔═══════════════════════════╗\n", .{});
+        try stdout.print("  ║  Cell → Model Mapping     ║\n", .{});
+        try stdout.print("  ╚═══════════════════════════╝\n", .{});
+        const t_map0 = std.time.nanoTimestamp();
+
+        const num_models: u32 = @intCast(model_ranges.items.len);
+        const bitset_stride = (num_models + 7) / 8; // bytes per model bitset
+
+        // Build reverse mapping: original_tri_idx → model_id
+        const tri_to_model = try allocator.alloc(u32, tri_count);
+        defer allocator.free(tri_to_model);
+        @memset(tri_to_model, std.math.maxInt(u32));
+        for (model_ranges.items, 0..) |mr, model_id| {
+            for (mr.tri_start..mr.tri_end) |ti| {
+                tri_to_model[ti] = @intCast(model_id);
+            }
+        }
+
+        // For each cell, find which models have triangles in it
+        const world_perm = mesh_set.perm orelse return error.NoPerm;
+        const cell_model_bitsets = try allocator.alloc([]u8, final_num_cells);
+        defer {
+            for (cell_model_bitsets) |bs| allocator.free(bs);
+            allocator.free(cell_model_bitsets);
+        }
+
+        for (0..final_num_cells) |ci| {
+            const bs = try allocator.alloc(u8, bitset_stride);
+            @memset(bs, 0);
+
+            // Iterate original cluster IDs for this cell
+            for (cell_cluster_ids.items[ci]) |orig_cluster| {
+                const start_t = orig_cluster * cluster_size;
+                const end_t = @min(start_t + cluster_size, tri_count);
+                for (start_t..end_t) |sorted_idx| {
+                    const original_idx = world_perm[sorted_idx];
+                    const model_id = tri_to_model[original_idx];
+                    if (model_id != std.math.maxInt(u32)) {
+                        bs[model_id / 8] |= @as(u8, 1) << @intCast(model_id % 8);
+                    }
+                }
+            }
+            cell_model_bitsets[ci] = bs;
+        }
+
+        // Compute per-cell VISIBLE model bitsets (expand through transport graph)
+        const vis_model_bitsets = try allocator.alloc([]u8, final_num_cells);
+        defer {
+            for (vis_model_bitsets) |bs| allocator.free(bs);
+            allocator.free(vis_model_bitsets);
+        }
+
+        for (0..final_num_cells) |ci| {
+            const bs = try allocator.alloc(u8, bitset_stride);
+            // Start with own models
+            @memcpy(bs, cell_model_bitsets[ci]);
+
+            // OR in models from all connected cells
+            for (0..final_num_cells) |cj| {
+                if (ci == cj) continue;
+                const edge = pt.getEdge(@intCast(ci), @intCast(cj));
+                if (edge.hits.load(.monotonic) > 0) {
+                    for (0..bitset_stride) |bi| {
+                        bs[bi] |= cell_model_bitsets[cj][bi];
+                    }
+                }
+            }
+            vis_model_bitsets[ci] = bs;
+        }
+
+        // Stats
+        {
+            var min_vis: u32 = std.math.maxInt(u32);
+            var max_vis: u32 = 0;
+            var total_vis: u64 = 0;
+            for (0..final_num_cells) |ci| {
+                var count: u32 = 0;
+                for (vis_model_bitsets[ci]) |byte| {
+                    count += @popCount(byte);
+                }
+                min_vis = @min(min_vis, count);
+                max_vis = @max(max_vis, count);
+                total_vis += count;
+            }
+            try stdout.print("  Visible models/cell: min={d}, max={d}, avg={d}\n", .{
+                min_vis, max_vis, @as(u32, @intCast(total_vis / final_num_cells)),
+            });
+        }
+
+        const t_map1 = std.time.nanoTimestamp();
+        try stdout.print("  Mapping time: {d}ms\n", .{@divTrunc(t_map1 - t_map0, 1_000_000)});
+
+        // ── Write _pvs_runtime.bin (single output file) ─────────────
+        {
+            try stdout.print("\n  ╔═══════════════════════════╗\n", .{});
+            try stdout.print("  ║  Writing Runtime Data     ║\n", .{});
+            try stdout.print("  ╚═══════════════════════════╝\n", .{});
+
+            const rt_path = try std.fmt.allocPrint(allocator, "{s}_pvs_runtime.bin", .{base_name});
+            defer allocator.free(rt_path);
+            var rtf = try std.fs.cwd().createFile(rt_path, .{});
+            defer rtf.close();
+            var rtw = std.io.bufferedWriter(rtf.writer());
+            const rw = rtw.writer();
+
+            // Header
+            try rw.writeAll("PVR2");
+            try rw.writeInt(u32, final_num_cells, .little);
+            try rw.writeInt(u32, num_models, .little);
+            try rw.writeInt(u32, @intCast(probes.len), .little);
+            try rw.writeInt(u32, bitset_stride, .little);
+
+            // Cell centroids (for nearest-centroid lookup at runtime)
+            for (cell_centroids_list.items) |c| {
+                for (c) |v| try rw.writeInt(u32, @bitCast(v), .little);
+            }
+
+            // Per-cell visible model bitsets
+            for (vis_model_bitsets) |bs| {
+                try rw.writeAll(bs);
+            }
+
+            // Probe data (positions + SH)
+            for (probes, 0..) |probe, pi| {
+                for (probe.position) |v| try rw.writeInt(u32, @bitCast(v), .little);
+                for (probe_sh[pi].r) |v| try rw.writeInt(u32, @bitCast(v), .little);
+                for (probe_sh[pi].g) |v| try rw.writeInt(u32, @bitCast(v), .little);
+                for (probe_sh[pi].b) |v| try rw.writeInt(u32, @bitCast(v), .little);
+            }
+
+            try rtw.flush();
+            try stdout.print("  → {s}\n", .{rt_path});
+        }
+
+        // Write _models.txt (for runtime name matching)
+        {
+            const mn_txt = try std.fmt.allocPrint(allocator, "{s}_models.txt", .{base_name});
+            defer allocator.free(mn_txt);
+            var mnf = try std.fs.cwd().createFile(mn_txt, .{});
+            defer mnf.close();
+            var mnw = std.io.bufferedWriter(mnf.writer());
+            const mw = mnw.writer();
+            try mw.print("# Model list: {d} models\n", .{num_models});
+            try mw.writeAll("# Format: model_id tri_start tri_end name\n");
+            for (model_ranges.items, 0..) |mr, mid| {
+                try mw.print("{d} {d} {d} {s}\n", .{ mid, mr.tri_start, mr.tri_end, mr.name });
+            }
+            try mnw.flush();
+            try stdout.print("  → {s}\n", .{mn_txt});
+        }
+
+        // Write probe_assign.bin (for GI — existing format)
+        {
+            const assign_bin = try std.fmt.allocPrint(allocator, "{s}_probe_assign.bin", .{base_name});
+            defer allocator.free(assign_bin);
+            var af = try std.fs.cwd().createFile(assign_bin, .{});
+            defer af.close();
+            var aw = std.io.bufferedWriter(af.writer());
+            const aw2 = aw.writer();
+            try aw2.writeAll("PASN");
+            try aw2.writeInt(u32, final_cluster_count, .little);
+            try aw2.writeInt(u32, @intCast(probes.len), .little);
+            for (assignment.cluster_to_probe) |pid| {
+                try aw2.writeInt(u32, pid, .little);
+            }
+            try aw.flush();
+            try stdout.print("  → {s}\n", .{assign_bin});
+        }
+
+        // ── Phase: Neural PVS Training ─────────────────────────────────
+        {
+            try stdout.print("\n  ╔═══════════════════════════╗\n", .{});
+            try stdout.print("  ║  Neural PVS Training      ║\n", .{});
+            try stdout.print("  ╚═══════════════════════════╝\n", .{});
+
+            const t_neural0 = std.time.nanoTimestamp();
+
+            // Generate training data via ray bundles
+            var train_data = try pvs_neural.generateTrainingData(
+                allocator,
+                &world_bivh,
+                &mesh_set,
+                world_perm,
+                tri_to_model,
+                num_models,
+                world_min,
+                world_max,
+                .{
+                    .num_samples = 10_000,
+                    .rays_per_sample = 512,
+                    .max_ray_dist = 2000.0,
+                },
+                stdout,
+            );
+            defer train_data.deinit();
+
+            const t_data = std.time.nanoTimestamp();
+            try stdout.print("  Data gen: {d}ms\n", .{@divTrunc(t_data - t_neural0, 1_000_000)});
+
+            // Train MLP
+            var mlp = try pvs_neural.train(
+                allocator,
+                &train_data,
+                world_min,
+                world_max,
+                .{
+                    .epochs = 100,
+                    .learning_rate = 0.001,
+                    .batch_size = 32,
+                    .hidden_size = 256,
+                    .eval_threshold = 0.3,
+                },
+                stdout,
+            );
+            defer mlp.deinit();
+
+            const t_train = std.time.nanoTimestamp();
+            try stdout.print("  Training: {d}ms\n", .{@divTrunc(t_train - t_data, 1_000_000)});
+
+            // Save weights
+            const npvs_path = try std.fmt.allocPrint(allocator, "{s}_npvs.bin", .{base_name});
+            defer allocator.free(npvs_path);
+            try mlp.save(npvs_path);
+            try stdout.print("  → {s}\n", .{npvs_path});
         }
     }
 
@@ -837,557 +1127,4 @@ fn appendVbibGeometry(
     }
 }
 
-// ── Output ──────────────────────────────────────────────────────────
-
-fn deriveOutputPath(allocator: Allocator, vpk_path: []const u8) ![]u8 {
-    // Strip extension and append _pvs.bin
-    const base = std.fs.path.stem(vpk_path);
-    return std.fmt.allocPrint(allocator, "{s}_pvs.bin", .{base});
-}
-
-fn serializePvs(
-    allocator: Allocator,
-    solver: *const pvs_mod.PvsSolver,
-    bivh: *const bivh_mod.Bivh,
-    path: []const u8,
-) !void {
-    var file = try std.fs.cwd().createFile(path, .{});
-    defer file.close();
-    var bw = std.io.bufferedWriter(file.writer());
-    const writer = bw.writer();
-
-    // Header
-    try writer.writeAll("PVS1"); // magic
-    try writer.writeInt(u32, solver.tri_count, .little);
-    try writer.writeInt(u32, solver.cluster_count, .little);
-    try writer.writeInt(u32, bivh.node_count, .little);
-    try writer.writeInt(u32, @intCast(solver.visibility.cells.len), .little);
-
-    // For each active cell: cell_index, visible_count, [visible_cluster_indices...]
-    const buf = try allocator.alloc(u32, solver.cluster_count);
-    defer allocator.free(buf);
-
-    var cells_written: u32 = 0;
-    for (solver.visibility.cells, 0..) |cell, ci| {
-        if (cell) |bm| {
-            const count = bm.getSetBits(buf);
-            if (count == 0) continue;
-            try writer.writeInt(u32, @intCast(ci), .little);
-            try writer.writeInt(u32, count, .little);
-            for (0..count) |i| {
-                try writer.writeInt(u32, buf[i], .little);
-            }
-            cells_written += 1;
-        }
-    }
-
-    try bw.flush();
-    std.debug.print("  Serialized {d} cells to {s}\n", .{ cells_written, path });
-}
-
-// ── Visualization ───────────────────────────────────────────────────
-
-const IMG_SIZE: u32 = 2048;
-
-const Color = struct { r: u8, g: u8, b: u8 };
-
-/// Map world XZ coordinates to pixel coordinates (top-down Y-up view).
-/// X maps to pixel X, Z maps to pixel Y (inverted so +Z is up).
-fn worldToPixel(pos: Vec3, world_min: [3]f32, world_max: [3]f32, size: u32) struct { x: i32, y: i32 } {
-    const margin: f32 = 0.02; // 2% margin
-    const dx = world_max[0] - world_min[0];
-    const dz = world_max[2] - world_min[2];
-    const span = @max(dx, dz); // uniform scale
-    const pad = span * margin;
-
-    const fx = (pos[0] - world_min[0] + pad) / (span + 2 * pad);
-    const fz = (pos[2] - world_min[2] + pad) / (span + 2 * pad);
-
-    return .{
-        .x = @intFromFloat(fx * @as(f32, @floatFromInt(size - 1))),
-        .y = @intFromFloat((1.0 - fz) * @as(f32, @floatFromInt(size - 1))),
-    };
-}
-
-/// Lerp between two colors.
-fn lerpColor(a: Color, b: Color, t: f32) Color {
-    const ct = std.math.clamp(t, 0, 1);
-    return .{
-        .r = @intFromFloat(@as(f32, @floatFromInt(a.r)) * (1 - ct) + @as(f32, @floatFromInt(b.r)) * ct),
-        .g = @intFromFloat(@as(f32, @floatFromInt(a.g)) * (1 - ct) + @as(f32, @floatFromInt(b.g)) * ct),
-        .b = @intFromFloat(@as(f32, @floatFromInt(a.b)) * (1 - ct) + @as(f32, @floatFromInt(b.b)) * ct),
-    };
-}
-
-/// Heat color ramp: blue → cyan → green → yellow → red
-fn heatColor(t: f32) Color {
-    const ct = std.math.clamp(t, 0, 1);
-    if (ct < 0.25) {
-        return lerpColor(.{ .r = 0, .g = 0, .b = 128 }, .{ .r = 0, .g = 200, .b = 200 }, ct * 4.0);
-    } else if (ct < 0.5) {
-        return lerpColor(.{ .r = 0, .g = 200, .b = 200 }, .{ .r = 0, .g = 255, .b = 0 }, (ct - 0.25) * 4.0);
-    } else if (ct < 0.75) {
-        return lerpColor(.{ .r = 0, .g = 255, .b = 0 }, .{ .r = 255, .g = 255, .b = 0 }, (ct - 0.5) * 4.0);
-    } else {
-        return lerpColor(.{ .r = 255, .g = 255, .b = 0 }, .{ .r = 255, .g = 0, .b = 0 }, (ct - 0.75) * 4.0);
-    }
-}
-
-/// Draw a line using Bresenham's algorithm with additive blending.
-fn drawLine(pixels: []Color, size: u32, x0: i32, y0: i32, x1: i32, y1: i32, color: Color, alpha: f32) void {
-    var x = x0;
-    var y = y0;
-    const dx_abs: i32 = if (x1 > x0) x1 - x0 else x0 - x1;
-    const dy_abs: i32 = if (y1 > y0) y1 - y0 else y0 - y1;
-    const sx: i32 = if (x0 < x1) 1 else -1;
-    const sy: i32 = if (y0 < y1) 1 else -1;
-    var err = dx_abs - dy_abs;
-
-    const img_sz: i32 = @intCast(size);
-    const steps = dx_abs + dy_abs + 1;
-
-    for (0..@intCast(steps)) |_| {
-        if (x >= 0 and x < img_sz and y >= 0 and y < img_sz) {
-            const idx: usize = @intCast(y * img_sz + x);
-            const old = pixels[idx];
-            pixels[idx] = .{
-                .r = @intCast(@min(255, @as(u16, old.r) + @as(u16, @intFromFloat(@as(f32, @floatFromInt(color.r)) * alpha)))),
-                .g = @intCast(@min(255, @as(u16, old.g) + @as(u16, @intFromFloat(@as(f32, @floatFromInt(color.g)) * alpha)))),
-                .b = @intCast(@min(255, @as(u16, old.b) + @as(u16, @intFromFloat(@as(f32, @floatFromInt(color.b)) * alpha)))),
-            };
-        }
-        if (x == x1 and y == y1) break;
-        const e2 = err * 2;
-        if (e2 > -dy_abs) {
-            err -= dy_abs;
-            x += sx;
-        }
-        if (e2 < dx_abs) {
-            err += dx_abs;
-            y += sy;
-        }
-    }
-}
-
-/// Fill an axis-aligned rectangle.
-fn fillRect(pixels: []Color, size: u32, x0: i32, y0: i32, x1: i32, y1: i32, color: Color) void {
-    const img_sz: i32 = @intCast(size);
-    const ax = std.math.clamp(x0, 0, img_sz - 1);
-    const ay = std.math.clamp(y0, 0, img_sz - 1);
-    const bx = std.math.clamp(x1, 0, img_sz - 1);
-    const by = std.math.clamp(y1, 0, img_sz - 1);
-
-    var row = ay;
-    while (row <= by) : (row += 1) {
-        var col = ax;
-        while (col <= bx) : (col += 1) {
-            pixels[@intCast(row * img_sz + col)] = color;
-        }
-    }
-}
-
-/// Accumulate line into float RGB buffer (no clamping).
-fn drawLineAccum(accum: []f32, size: u32, x0: i32, y0: i32, x1: i32, y1: i32, color: Color, weight: f32) void {
-    var x = x0;
-    var y = y0;
-    const dx_abs: i32 = if (x1 > x0) x1 - x0 else x0 - x1;
-    const dy_abs: i32 = if (y1 > y0) y1 - y0 else y0 - y1;
-    const sx: i32 = if (x0 < x1) 1 else -1;
-    const sy: i32 = if (y0 < y1) 1 else -1;
-    var err = dx_abs - dy_abs;
-
-    const img_sz: i32 = @intCast(size);
-    const steps = dx_abs + dy_abs + 1;
-
-    const cr = @as(f32, @floatFromInt(color.r)) * weight;
-    const cg = @as(f32, @floatFromInt(color.g)) * weight;
-    const cb = @as(f32, @floatFromInt(color.b)) * weight;
-
-    for (0..@intCast(steps)) |_| {
-        if (x >= 0 and x < img_sz and y >= 0 and y < img_sz) {
-            const base: usize = @intCast(y * img_sz + x);
-            accum[base * 3] += cr;
-            accum[base * 3 + 1] += cg;
-            accum[base * 3 + 2] += cb;
-        }
-        if (x == x1 and y == y1) break;
-        const e2 = err * 2;
-        if (e2 > -dy_abs) {
-            err -= dy_abs;
-            x += sx;
-        }
-        if (e2 < dx_abs) {
-            err += dx_abs;
-            y += sy;
-        }
-    }
-}
-
-/// Reinhard tone mapping: maps [0, inf) → [0, 255]
-fn toneMap(val: f32, max_val: f32) u8 {
-    // Normalize, then Reinhard: L / (1 + L)
-    const normalized = val / max_val * 4.0; // exposure boost
-    const mapped = normalized / (1.0 + normalized);
-    return @intFromFloat(std.math.clamp(mapped * 255.0, 0, 255));
-}
-
-fn writePpm(pixels: []const Color, size: u32, path: []const u8) !void {
-    var file = try std.fs.cwd().createFile(path, .{});
-    defer file.close();
-    var bw = std.io.bufferedWriter(file.writer());
-    const w = bw.writer();
-    try w.print("P6\n{d} {d}\n255\n", .{ size, size });
-    for (pixels) |px| {
-        try w.writeAll(&[_]u8{ px.r, px.g, px.b });
-    }
-    try bw.flush();
-}
-
-fn writeTransportHeatmap(
-    allocator: Allocator,
-    transport: *const pvs_mod.TransportGraph,
-    centroids: []const Vec3,
-    num_cells: u32,
-    world_min: [3]f32,
-    world_max: [3]f32,
-    path: []const u8,
-) !void {
-    const size = IMG_SIZE;
-    const pixels = try allocator.alloc(Color, size * size);
-    defer allocator.free(pixels);
-    @memset(pixels, Color{ .r = 15, .g = 15, .b = 20 }); // dark background
-
-    // Accumulate edge density into a float buffer, then tone-map
-    const accum = try allocator.alloc(f32, size * size * 3);
-    defer allocator.free(accum);
-    @memset(accum, 0);
-
-    for (0..num_cells) |i| {
-        for (i + 1..num_cells) |j| {
-            const edge = transport.getEdge(@intCast(i), @intCast(j));
-            const casts = edge.casts.load(.monotonic);
-            if (casts == 0) continue;
-            const hits = edge.hits.load(.monotonic);
-            if (hits == 0) continue;
-
-            const prob = @as(f32, @floatFromInt(hits)) / @as(f32, @floatFromInt(casts));
-            const color = heatColor(prob);
-            // Weight by confidence (log scale to avoid blowout)
-            const confidence = @min(1.0, std.math.log2(@as(f32, @floatFromInt(@min(casts, 10000))) + 1.0) / 13.0);
-            const weight = prob * confidence;
-
-            const p0 = worldToPixel(centroids[i], world_min, world_max, size);
-            const p1 = worldToPixel(centroids[j], world_min, world_max, size);
-            drawLineAccum(accum, size, p0.x, p0.y, p1.x, p1.y, color, weight);
-        }
-    }
-
-    // Tone-map: find max, then apply Reinhard
-    var max_val: f32 = 0.001;
-    for (accum) |v| max_val = @max(max_val, v);
-
-    for (0..size * size) |px| {
-        const base = px * 3;
-        pixels[px] = .{
-            .r = toneMap(accum[base], max_val),
-            .g = toneMap(accum[base + 1], max_val),
-            .b = toneMap(accum[base + 2], max_val),
-        };
-    }
-
-    // Draw cell centers as bright dots on top
-    for (centroids[0..num_cells]) |c| {
-        const p = worldToPixel(c, world_min, world_max, size);
-        fillRect(pixels, size, p.x - 1, p.y - 1, p.x + 1, p.y + 1, .{ .r = 255, .g = 255, .b = 255 });
-    }
-
-    try writePpm(pixels, size, path);
-}
-
-fn writeVisibilityDensity(
-    allocator: Allocator,
-    solver: *const pvs_mod.PvsSolver,
-    cluster_bivh: *const bivh_mod.Bivh,
-    cell_node_indices: []const u32,
-    cluster_count: u32,
-    world_min: [3]f32,
-    world_max: [3]f32,
-    path: []const u8,
-) !void {
-    const size = IMG_SIZE;
-    const pixels = try allocator.alloc(Color, size * size);
-    defer allocator.free(pixels);
-    @memset(pixels, Color{ .r = 15, .g = 15, .b = 20 });
-
-    // Find max visible count for normalization
-    var max_count: u32 = 1;
-    for (cell_node_indices) |node_idx| {
-        const count = solver.visibility.visibleCount(node_idx);
-        max_count = @max(max_count, count);
-    }
-
-    // Draw each cell as a filled rectangle colored by visibility density
-    for (cell_node_indices) |node_idx| {
-        const node = cluster_bivh.nodes[node_idx];
-        const count = solver.visibility.visibleCount(node_idx);
-        const t = @as(f32, @floatFromInt(count)) / @as(f32, @floatFromInt(max_count));
-
-        const p_min = worldToPixel(node.min, world_min, world_max, size);
-        const p_max = worldToPixel(node.max, world_min, world_max, size);
-
-        // p_min.y > p_max.y because Y is inverted in screen space
-        const color = heatColor(t);
-        fillRect(pixels, size, p_min.x, p_max.y, p_max.x, p_min.y, color);
-    }
-
-    // Overlay: draw outline text showing count / total
-    // (PPM is simple — no text, but the colors tell the story)
-
-    // Draw cell outlines in white for structure
-    for (cell_node_indices) |node_idx| {
-        const node = cluster_bivh.nodes[node_idx];
-        const p_min = worldToPixel(node.min, world_min, world_max, size);
-        const p_max = worldToPixel(node.max, world_min, world_max, size);
-        const outline = Color{ .r = 80, .g = 80, .b = 80 };
-        drawLine(pixels, size, p_min.x, p_max.y, p_max.x, p_max.y, outline, 1.0);
-        drawLine(pixels, size, p_max.x, p_max.y, p_max.x, p_min.y, outline, 1.0);
-        drawLine(pixels, size, p_max.x, p_min.y, p_min.x, p_min.y, outline, 1.0);
-        drawLine(pixels, size, p_min.x, p_min.y, p_min.x, p_max.y, outline, 1.0);
-    }
-
-    // Legend: draw a color bar at the bottom
-    const bar_y: i32 = @intCast(size - 30);
-    const bar_h: i32 = 20;
-    for (0..size) |xi| {
-        const t = @as(f32, @floatFromInt(xi)) / @as(f32, @floatFromInt(size - 1));
-        const color = heatColor(t);
-        fillRect(pixels, size, @intCast(xi), bar_y, @intCast(xi), bar_y + bar_h, color);
-    }
-
-    // Labels: "0" on left, max on right (as pixel text is hard, just mark with white ticks)
-    fillRect(pixels, size, 0, bar_y - 5, 2, bar_y - 1, .{ .r = 255, .g = 255, .b = 255 });
-    fillRect(pixels, size, @intCast(size - 3), bar_y - 5, @intCast(size - 1), bar_y - 1, .{ .r = 255, .g = 255, .b = 255 });
-
-    _ = cluster_count;
-
-    try writePpm(pixels, size, path);
-}
-
-fn writeIslandMap(
-    allocator: Allocator,
-    islands: *const pvs_mod.IslandResult,
-    probes: []const pvs_mod.Probe,
-    cluster_bivh: *const bivh_mod.Bivh,
-    cell_node_indices: []const u32,
-    cell_centroids: []const Vec3,
-    num_cells: u32,
-    world_min: [3]f32,
-    world_max: [3]f32,
-    path: []const u8,
-) !void {
-    const size = IMG_SIZE;
-    const pixels = try allocator.alloc(Color, size * size);
-    defer allocator.free(pixels);
-    @memset(pixels, Color{ .r = 15, .g = 15, .b = 20 });
-
-    // Distinct colors per island (golden ratio hue spread)
-    const island_colors = try allocator.alloc(Color, islands.num_islands);
-    defer allocator.free(island_colors);
-    for (0..islands.num_islands) |i| {
-        const hue = @as(f32, @floatFromInt(i)) * 0.618033988749895;
-        const h = hue - @floor(hue);
-        island_colors[i] = hsvToRgb(h, 0.7, 0.8);
-    }
-
-    // Draw cells colored by island
-    for (cell_node_indices[0..num_cells], 0..) |node_idx, ci| {
-        const node = cluster_bivh.nodes[node_idx];
-        const island = islands.island_ids[ci];
-        const color = island_colors[island];
-
-        const p_min = worldToPixel(node.min, world_min, world_max, size);
-        const p_max = worldToPixel(node.max, world_min, world_max, size);
-        fillRect(pixels, size, p_min.x, p_max.y, p_max.x, p_min.y, color);
-    }
-
-    // Draw cell outlines
-    for (cell_node_indices[0..num_cells]) |node_idx| {
-        const node = cluster_bivh.nodes[node_idx];
-        const p_min = worldToPixel(node.min, world_min, world_max, size);
-        const p_max = worldToPixel(node.max, world_min, world_max, size);
-        const outline = Color{ .r = 40, .g = 40, .b = 40 };
-        drawLine(pixels, size, p_min.x, p_max.y, p_max.x, p_max.y, outline, 1.0);
-        drawLine(pixels, size, p_max.x, p_max.y, p_max.x, p_min.y, outline, 1.0);
-        drawLine(pixels, size, p_max.x, p_min.y, p_min.x, p_min.y, outline, 1.0);
-        drawLine(pixels, size, p_min.x, p_min.y, p_min.x, p_max.y, outline, 1.0);
-    }
-
-    // Draw probes — boundary probes as white diamonds, interior as yellow circles
-    for (probes) |probe| {
-        const p = worldToPixel(probe.position, world_min, world_max, size);
-        if (probe.is_boundary) {
-            // White diamond for boundary probes
-            const s_half: i32 = 4;
-            drawLine(pixels, size, p.x, p.y - s_half, p.x + s_half, p.y, .{ .r = 255, .g = 255, .b = 255 }, 1.0);
-            drawLine(pixels, size, p.x + s_half, p.y, p.x, p.y + s_half, .{ .r = 255, .g = 255, .b = 255 }, 1.0);
-            drawLine(pixels, size, p.x, p.y + s_half, p.x - s_half, p.y, .{ .r = 255, .g = 255, .b = 255 }, 1.0);
-            drawLine(pixels, size, p.x - s_half, p.y, p.x, p.y - s_half, .{ .r = 255, .g = 255, .b = 255 }, 1.0);
-        } else {
-            // Yellow square for interior probes
-            fillRect(pixels, size, p.x - 3, p.y - 3, p.x + 3, p.y + 3, .{ .r = 255, .g = 255, .b = 0 });
-        }
-    }
-
-    // Mark boundary cells with a bright outline
-    for (islands.boundary_cells[0..islands.num_boundary]) |cell| {
-        const p = worldToPixel(cell_centroids[cell], world_min, world_max, size);
-        fillRect(pixels, size, p.x - 1, p.y - 1, p.x + 1, p.y + 1, .{ .r = 255, .g = 100, .b = 100 });
-    }
-
-    try writePpm(pixels, size, path);
-}
-
-fn hsvToRgb(h: f32, s: f32, v: f32) Color {
-    const c = v * s;
-    const hp = h * 6.0;
-    const x = c * (1.0 - @abs(@mod(hp, 2.0) - 1.0));
-    const m = v - c;
-
-    var r: f32 = 0;
-    var g: f32 = 0;
-    var b: f32 = 0;
-
-    if (hp < 1) {
-        r = c; g = x;
-    } else if (hp < 2) {
-        r = x; g = c;
-    } else if (hp < 3) {
-        g = c; b = x;
-    } else if (hp < 4) {
-        g = x; b = c;
-    } else if (hp < 5) {
-        r = x; b = c;
-    } else {
-        r = c; b = x;
-    }
-
-    return .{
-        .r = @intFromFloat((r + m) * 255),
-        .g = @intFromFloat((g + m) * 255),
-        .b = @intFromFloat((b + m) * 255),
-    };
-}
-
-fn writeProbeAssignment(
-    allocator: Allocator,
-    assignment: *const pvs_mod.ProbeAssignment,
-    cluster_centroids: []const Vec3,
-    cluster_count: u32,
-    probes: []const pvs_mod.Probe,
-    world_min: [3]f32,
-    world_max: [3]f32,
-    path: []const u8,
-) !void {
-    const size = IMG_SIZE;
-    const pixels = try allocator.alloc(Color, size * size);
-    defer allocator.free(pixels);
-    @memset(pixels, Color{ .r = 10, .g = 10, .b = 15 });
-
-    // Generate a color per probe using golden ratio hue
-    const probe_colors = try allocator.alloc(Color, probes.len);
-    defer allocator.free(probe_colors);
-    for (0..probes.len) |i| {
-        const hue = @as(f32, @floatFromInt(i)) * 0.618033988749895;
-        const h = hue - @floor(hue);
-        probe_colors[i] = hsvToRgb(h, 0.8, 0.85);
-    }
-
-    // Plot each cluster as a dot colored by its assigned probe
-    for (0..cluster_count) |ci| {
-        const probe_id = assignment.cluster_to_probe[ci];
-        if (probe_id >= probes.len) continue;
-        const color = probe_colors[probe_id];
-        const p = worldToPixel(cluster_centroids[ci], world_min, world_max, size);
-        fillRect(pixels, size, p.x - 1, p.y - 1, p.x + 1, p.y + 1, color);
-    }
-
-    // Draw probe positions — white for boundary, yellow for interior
-    for (probes) |probe| {
-        const p = worldToPixel(probe.position, world_min, world_max, size);
-        if (probe.is_boundary) {
-            // White diamond
-            drawLine(pixels, size, p.x, p.y - 5, p.x + 5, p.y, .{ .r = 255, .g = 255, .b = 255 }, 1.0);
-            drawLine(pixels, size, p.x + 5, p.y, p.x, p.y + 5, .{ .r = 255, .g = 255, .b = 255 }, 1.0);
-            drawLine(pixels, size, p.x, p.y + 5, p.x - 5, p.y, .{ .r = 255, .g = 255, .b = 255 }, 1.0);
-            drawLine(pixels, size, p.x - 5, p.y, p.x, p.y - 5, .{ .r = 255, .g = 255, .b = 255 }, 1.0);
-        } else {
-            // Yellow square
-            fillRect(pixels, size, p.x - 4, p.y - 4, p.x + 4, p.y + 4, .{ .r = 255, .g = 255, .b = 0 });
-        }
-    }
-
-    try writePpm(pixels, size, path);
-}
-
-fn writeLightingMap(
-    allocator: Allocator,
-    cluster_light: []const f32,
-    cluster_centroids: []const Vec3,
-    cluster_count: u32,
-    probe_sh: []const pvs_mod.SHCoeffs,
-    probes: []const pvs_mod.Probe,
-    max_light: f32,
-    world_min: [3]f32,
-    world_max: [3]f32,
-    path: []const u8,
-) !void {
-    const size = IMG_SIZE;
-    const pixels = try allocator.alloc(Color, size * size);
-    defer allocator.free(pixels);
-    @memset(pixels, Color{ .r = 5, .g = 5, .b = 8 });
-
-    // Find median intensity for adaptive exposure
-    _ = max_light;
-    const sorted = try allocator.alloc(f32, cluster_count);
-    defer allocator.free(sorted);
-    @memcpy(sorted, cluster_light);
-    std.mem.sort(f32, sorted, {}, std.sort.asc(f32));
-    // Use 90th percentile for exposure — most clusters should be visible
-    const p90 = sorted[@min(cluster_count - 1, cluster_count * 9 / 10)];
-    const exposure = if (p90 > 0.001) 8.0 / p90 else 1.0;
-
-    // Plot each cluster colored by its lighting intensity
-    for (0..cluster_count) |ci| {
-        const intensity = cluster_light[ci] * exposure;
-        const mapped = intensity / (1.0 + intensity); // Reinhard with adaptive exposure
-
-        // Warm/cool: bright = warm sun, dim = cool shadow
-        const color = Color{
-            .r = @intFromFloat(std.math.clamp(mapped * 255 * 1.1, 0, 255)),
-            .g = @intFromFloat(std.math.clamp(mapped * 255 * 0.9, 0, 255)),
-            .b = @intFromFloat(std.math.clamp(mapped * 255 * 0.7 + (1.0 - mapped) * 40, 0, 255)),
-        };
-
-        const p = worldToPixel(cluster_centroids[ci], world_min, world_max, size);
-        fillRect(pixels, size, p.x - 2, p.y - 2, p.x + 2, p.y + 2, color);
-    }
-
-    // Draw probes colored by their SH intensity
-    for (probes, 0..) |probe, pi| {
-        const p = worldToPixel(probe.position, world_min, world_max, size);
-        const sh_val = probe_sh[pi].intensity() * exposure;
-        const sh_mapped = sh_val / (1.0 + sh_val);
-        const bright: u8 = @intFromFloat(std.math.clamp(sh_mapped * 255, 0, 255));
-
-        if (probe.is_boundary) {
-            drawLine(pixels, size, p.x, p.y - 4, p.x + 4, p.y, .{ .r = bright, .g = bright, .b = 255 }, 1.0);
-            drawLine(pixels, size, p.x + 4, p.y, p.x, p.y + 4, .{ .r = bright, .g = bright, .b = 255 }, 1.0);
-            drawLine(pixels, size, p.x, p.y + 4, p.x - 4, p.y, .{ .r = bright, .g = bright, .b = 255 }, 1.0);
-            drawLine(pixels, size, p.x - 4, p.y, p.x, p.y - 4, .{ .r = bright, .g = bright, .b = 255 }, 1.0);
-        } else {
-            fillRect(pixels, size, p.x - 3, p.y - 3, p.x + 3, p.y + 3, .{ .r = bright, .g = bright, .b = bright });
-        }
-    }
-
-    try writePpm(pixels, size, path);
-}
+// (Visualization functions moved to pvs_viz.zig)

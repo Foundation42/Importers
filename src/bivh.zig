@@ -385,6 +385,8 @@ pub const TriangleMeshSet = struct {
     positions: []const [3]f32,
     indices: []u32, // mutable — BIVH reorders during build
     tri_count: u32,
+    perm: ?[]u32 = null, // optional: tracks original triangle index through BIVH reordering
+    perm_allocator: ?std.mem.Allocator = null,
 
     /// Wrap raw position + index arrays.
     pub fn fromArrays(positions: []const [3]f32, indices: []u32) TriangleMeshSet {
@@ -393,6 +395,27 @@ pub const TriangleMeshSet = struct {
             .indices = indices,
             .tri_count = @intCast(indices.len / 3),
         };
+    }
+
+    /// Wrap raw arrays and track permutation (perm[sorted_idx] = original_idx).
+    pub fn fromArraysWithPerm(positions: []const [3]f32, indices: []u32, allocator: std.mem.Allocator) !TriangleMeshSet {
+        const tc: u32 = @intCast(indices.len / 3);
+        const perm = try allocator.alloc(u32, tc);
+        for (0..tc) |i| perm[i] = @intCast(i);
+        return .{
+            .positions = positions,
+            .indices = indices,
+            .tri_count = tc,
+            .perm = perm,
+            .perm_allocator = allocator,
+        };
+    }
+
+    pub fn deinitPerm(self: *TriangleMeshSet) void {
+        if (self.perm) |p| {
+            if (self.perm_allocator) |a| a.free(p);
+            self.perm = null;
+        }
     }
 
     pub fn count(self: *const TriangleMeshSet) u32 {
@@ -436,6 +459,11 @@ pub const TriangleMeshSet = struct {
             const tmp = self.indices[ba + i];
             self.indices[ba + i] = self.indices[bb + i];
             self.indices[bb + i] = tmp;
+        }
+        if (self.perm) |p| {
+            const tmp = p[a];
+            p[a] = p[b];
+            p[b] = tmp;
         }
     }
 

@@ -170,9 +170,26 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = .ReleaseFast,
     });
+    const pvs_viz_module = b.addModule("pvs_viz", .{
+        .root_source_file = b.path("src/pvs_viz.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    pvs_viz_module.addImport("pvs", pvs_module);
+    pvs_viz_module.addImport("bivh", bivh_mod);
+
+    const pvs_neural_module = b.addModule("pvs_neural", .{
+        .root_source_file = b.path("src/pvs_neural.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    pvs_neural_module.addImport("bivh", bivh_mod);
+
     pvs_baker.root_module.addImport("valve-resource-format", vrf_fast);
     pvs_baker.root_module.addImport("bivh", bivh_mod);
     pvs_baker.root_module.addImport("pvs", pvs_module);
+    pvs_baker.root_module.addImport("pvs_viz", pvs_viz_module);
+    pvs_baker.root_module.addImport("pvs_neural", pvs_neural_module);
     b.installArtifact(pvs_baker);
 
     const pvs_run = b.addRunArtifact(pvs_baker);

@@ -1138,10 +1138,10 @@ pub const WalkerSolver = struct {
             for (self.adjacency[current]) |neighbor| {
                 if (depth_map[neighbor] != std.math.maxInt(u16)) continue; // already visited
 
-                // Already confirmed connected by another walker?
+                // Backward prune: if another walker already confirmed this pair,
+                // skip ray testing and just expand (saves ~40% ray casts).
                 const edge = self.transport.getEdge(source, neighbor);
                 if (edge.hits.load(.monotonic) > 0) {
-                    // Already known connected — still expand through it
                     depth_map[neighbor] = current_depth + 1;
                     queue.append(neighbor) catch continue;
                     continue;

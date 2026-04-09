@@ -193,10 +193,74 @@ Note: do NOT pass the content VPK (pak01_dir.vpk) — it loads all CS2 prop mode
    40% faster than stochastic, deterministic, graph distance free
 7. **Progressive pruning** (planned) — also skip confirmed-connected pairs (inverse of dead-edge)
 
+## Session 3: Runtime Integration (2025-04-09 → 2026-04-09)
+
+### Forge Renderer Wired Up
+Full runtime pipeline from baked data to draw calls:
+
+1. **Baker outputs** `_pvs_runtime.bin` (PVR2 format): cell centroids + per-cell model bitsets + probe SH
+2. **Runtime** (`source2_pvs.zig`): loads PVR2, nearest-centroid cell lookup, per-model visibility flags
+3. **Draw loop** (`main.zig`): Source 2 PVS branch — camera→cell→model bitset→frustum cull→draw
+4. **HUD**: S2 PVS stats (drawn/culled/cell), `pvs_freeze` command for debugging
+5. **Model name matching**: baker outputs `_models.txt`, runtime matches by VPK entry name
+
+### Key Bugs Fixed
+- **Cluster BIVH permutation**: the cluster BIVH reorders clusters during build, but cell_ranges
+  treated sorted positions as original cluster IDs. Fixed by adding `perm[]` tracking to
+  `TriangleMeshSet` (opt-in via `fromArraysWithPerm()`). Both world BIVH and cluster BIVH
+  now track their permutations.
+- **Cell lookup**: AABB containment failed because BIH cells overlap. Switched to nearest-centroid.
+- **PVS file paths**: `std.fs.path.stem()` strips directory — fixed to strip only `.vpk` extension.
+
+### Architecture Simplification
+- Removed intermediate cluster→model mapping. Cells now directly know which models they contain
+  (via world BIVH perm → original triangle → model range lookup).
+- Per-cell visible model bitsets precomputed at bake time: expand through transport graph,
+  OR model bitsets from all connected cells. Runtime is a single bitset lookup.
+- Viz code extracted to `pvs_viz.zig` (~500 lines).
+
+### Two Graphs Insight
+The omnidirectional transport graph is correct for **light transport** (photons bounce from
+any surface in any direction) but wrong for **player visibility** (eyes at player height,
+forward-facing ~100° cone). The current system over-estimates visibility because rooftop
+cells connect to distant buildings via sky sight lines that a ground-level player would never see.
+
+**Solution (next session)**: camera-based ray strategy for PVS, inspired by Christian's
+original C# PVS from Foundation42:
+- Rays from camera positions (player height), not random surface points
+- Forward-facing cone constraint (~50° half-angle)
+- Target only unseen geometry (skip already-confirmed)
+- Adaptive refinement: 6 child rays on hit (triangle verts + edge midpoints)
+- Multi-pass convergence
+
+Keep the current omnidirectional graph for GI probe transport — it's correct for light.
+
+### Files Changed/Added
+
+| File | Change |
+|------|--------|
+| `importers/src/bivh.zig` | Added `perm`, `fromArraysWithPerm()`, `deinitPerm()` to TriangleMeshSet |
+| `importers/src/pvs.zig` | Removed backward prune (skip-already-confirmed) from walker |
+| `importers/src/pvs_baker.zig` | Model tracking, cluster BIVH perm, per-cell model bitsets, PVR2 output |
+| `importers/src/pvs_viz.zig` | **NEW** — extracted visualization code (~500 lines) |
+| `importers/build.zig` | Added pvs_viz module |
+| `ac/src/source2_pvs.zig` | **NEW** — runtime PVS loader (PVR2 format, nearest-centroid lookup) |
+| `ac/src/source2_import.zig` | `tryLoadPVS()`, model name recording in both load paths |
+| `ac/src/gltf_import.zig` | Added `s2_pvs` field to ImportedScene |
+| `ac/src/main.zig` | S2 PVS draw loop branch, freeze state, HUD overlay |
+| `ac/src/perf.zig` | S2 PVS counters |
+| `ac/src/commands.zig` | `pvs_freeze` toggles both Q3 and S2 |
+
+### Current Numbers (Dust II, no backward prune)
+- 518 models, 3485 cells, 17651 clusters, 3567 probes
+- 871K transport edges, 72M rays, 185s solve time
+- Visible models/cell: min=22, max=457, avg=292 (56% — too high, needs camera-based rays)
+- Runtime file: 482KB (`_pvs_runtime.bin`)
+
 ## Next Steps
 
-- **Wire into Forge renderer** (ac project): PVS culling + probe-based GI at runtime
-- **Progressive pruning**: skip both confirmed-connected AND confirmed-dead pairs
+- **Camera-based PVS rays**: viewpoint rays with angle constraints for accurate player visibility
+- **Empty cell handling**: inherit visibility from neighbors for camera in open space
+- **Baked GI probes into ProbeManager**: load `_probes_sh.bin` into existing SSBO/shader pipeline
 - **Compute shader port**: SH propagation on GPU for real-time dynamic GI
-- **Sound transport**: same graph, audio impulse responses instead of SH
-- **Network relevancy**: transport-based PVS for multiplayer entity updates
+- **Sound transport**: same omnidirectional graph, audio impulse responses instead of SH
