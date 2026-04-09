@@ -143,4 +143,43 @@ pub fn build(b: *std.Build) void {
     });
     dump_world.root_module.addImport("valve-resource-format", vrf_mod);
     b.installArtifact(dump_world);
+
+    // Modules: BIVH + PVS (used by pvs-baker, available to importers of this package)
+    // Always ReleaseFast — the baker is compute-heavy.
+    const bivh_mod = b.addModule("bivh", .{
+        .root_source_file = b.path("src/bivh.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+
+    const pvs_module = b.addModule("pvs", .{
+        .root_source_file = b.path("src/pvs.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+
+    // Tool: pvs-baker — PVS solver for Source 2 maps (no Raylib)
+    const pvs_baker = b.addExecutable(.{
+        .name = "pvs-baker",
+        .root_source_file = b.path("src/pvs_baker.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    const vrf_fast = b.addModule("valve-resource-format-fast", .{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    pvs_baker.root_module.addImport("valve-resource-format", vrf_fast);
+    pvs_baker.root_module.addImport("bivh", bivh_mod);
+    pvs_baker.root_module.addImport("pvs", pvs_module);
+    b.installArtifact(pvs_baker);
+
+    const pvs_run = b.addRunArtifact(pvs_baker);
+    pvs_run.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        pvs_run.addArgs(args);
+    }
+    const pvs_step = b.step("pvs-baker", "Run PVS baker on a Source 2 map");
+    pvs_step.dependOn(&pvs_run.step);
 }
