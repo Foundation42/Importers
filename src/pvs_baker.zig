@@ -303,7 +303,7 @@ pub fn main() !void {
             .progress_fn = &progressCallback,
             .cluster_shift = cluster_shift,
             .exploration_rate = 0.3,
-            .max_time_seconds = 60,
+            .max_time_seconds = 300,
         },
     );
     defer solver.deinit();
@@ -728,6 +728,51 @@ fn fillRect(pixels: []Color, size: u32, x0: i32, y0: i32, x1: i32, y1: i32, colo
     }
 }
 
+/// Accumulate line into float RGB buffer (no clamping).
+fn drawLineAccum(accum: []f32, size: u32, x0: i32, y0: i32, x1: i32, y1: i32, color: Color, weight: f32) void {
+    var x = x0;
+    var y = y0;
+    const dx_abs: i32 = if (x1 > x0) x1 - x0 else x0 - x1;
+    const dy_abs: i32 = if (y1 > y0) y1 - y0 else y0 - y1;
+    const sx: i32 = if (x0 < x1) 1 else -1;
+    const sy: i32 = if (y0 < y1) 1 else -1;
+    var err = dx_abs - dy_abs;
+
+    const img_sz: i32 = @intCast(size);
+    const steps = dx_abs + dy_abs + 1;
+
+    const cr = @as(f32, @floatFromInt(color.r)) * weight;
+    const cg = @as(f32, @floatFromInt(color.g)) * weight;
+    const cb = @as(f32, @floatFromInt(color.b)) * weight;
+
+    for (0..@intCast(steps)) |_| {
+        if (x >= 0 and x < img_sz and y >= 0 and y < img_sz) {
+            const base: usize = @intCast(y * img_sz + x);
+            accum[base * 3] += cr;
+            accum[base * 3 + 1] += cg;
+            accum[base * 3 + 2] += cb;
+        }
+        if (x == x1 and y == y1) break;
+        const e2 = err * 2;
+        if (e2 > -dy_abs) {
+            err -= dy_abs;
+            x += sx;
+        }
+        if (e2 < dx_abs) {
+            err += dx_abs;
+            y += sy;
+        }
+    }
+}
+
+/// Reinhard tone mapping: maps [0, inf) → [0, 255]
+fn toneMap(val: f32, max_val: f32) u8 {
+    // Normalize, then Reinhard: L / (1 + L)
+    const normalized = val / max_val * 4.0; // exposure boost
+    const mapped = normalized / (1.0 + normalized);
+    return @intFromFloat(std.math.clamp(mapped * 255.0, 0, 255));
+}
+
 fn writePpm(pixels: []const Color, size: u32, path: []const u8) !void {
     var file = try std.fs.cwd().createFile(path, .{});
     defer file.close();
@@ -754,7 +799,11 @@ fn writeTransportHeatmap(
     defer allocator.free(pixels);
     @memset(pixels, Color{ .r = 15, .g = 15, .b = 20 }); // dark background
 
-    // Draw transport edges, colored by probability
+    // Accumulate edge density into a float buffer, then tone-map
+    const accum = try allocator.alloc(f32, size * size * 3);
+    defer allocator.free(accum);
+    @memset(accum, 0);
+
     for (0..num_cells) |i| {
         for (i + 1..num_cells) |j| {
             const edge = transport.getEdge(@intCast(i), @intCast(j));
@@ -765,19 +814,33 @@ fn writeTransportHeatmap(
 
             const prob = @as(f32, @floatFromInt(hits)) / @as(f32, @floatFromInt(casts));
             const color = heatColor(prob);
-            // Alpha scales with confidence (more casts = more opaque)
-            const alpha = @min(0.8, @as(f32, @floatFromInt(@min(casts, 1000))) / 1000.0);
+            // Weight by confidence (log scale to avoid blowout)
+            const confidence = @min(1.0, std.math.log2(@as(f32, @floatFromInt(@min(casts, 10000))) + 1.0) / 13.0);
+            const weight = prob * confidence;
 
             const p0 = worldToPixel(centroids[i], world_min, world_max, size);
             const p1 = worldToPixel(centroids[j], world_min, world_max, size);
-            drawLine(pixels, size, p0.x, p0.y, p1.x, p1.y, color, alpha);
+            drawLineAccum(accum, size, p0.x, p0.y, p1.x, p1.y, color, weight);
         }
     }
 
-    // Draw cell centers as white dots
+    // Tone-map: find max, then apply Reinhard
+    var max_val: f32 = 0.001;
+    for (accum) |v| max_val = @max(max_val, v);
+
+    for (0..size * size) |px| {
+        const base = px * 3;
+        pixels[px] = .{
+            .r = toneMap(accum[base], max_val),
+            .g = toneMap(accum[base + 1], max_val),
+            .b = toneMap(accum[base + 2], max_val),
+        };
+    }
+
+    // Draw cell centers as bright dots on top
     for (centroids[0..num_cells]) |c| {
         const p = worldToPixel(c, world_min, world_max, size);
-        fillRect(pixels, size, p.x - 2, p.y - 2, p.x + 2, p.y + 2, .{ .r = 255, .g = 255, .b = 255 });
+        fillRect(pixels, size, p.x - 1, p.y - 1, p.x + 1, p.y + 1, .{ .r = 255, .g = 255, .b = 255 });
     }
 
     try writePpm(pixels, size, path);
