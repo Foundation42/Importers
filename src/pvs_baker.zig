@@ -145,7 +145,7 @@ pub fn main() !void {
     // are nearby — clusters are naturally spatially coherent.
     // Build a second BIVH over cluster AABBs for view cell lookup.
 
-    const cluster_shift: u5 = 14; // clusters of 16384 triangles (~1700 clusters for Dust II)
+    const cluster_shift: u5 = 10; // clusters of 1024 triangles (~4400 clusters for Dust II)
     const cluster_size: u32 = @as(u32, 1) << cluster_shift;
     const cluster_count = (tri_count + cluster_size - 1) / cluster_size;
 
@@ -335,6 +335,60 @@ pub fn main() !void {
 
     try serializePvs(allocator, &solver, &cluster_bivh, out_path);
     try stdout.print("  PVS written to: {s}\n", .{out_path});
+
+    // ── Phase 7: Visualization ───────────────────────────────────────
+
+    const base_name = std.fs.path.stem(map_vpk_path);
+
+    // Compute cell centroids from cluster BIVH leaf bounds
+    const cell_centroids = try allocator.alloc(Vec3, num_cells);
+    defer allocator.free(cell_centroids);
+    for (cell_node_indices.items, 0..) |node_idx, ci| {
+        const node = cluster_bivh.nodes[node_idx];
+        cell_centroids[ci] = .{
+            (node.min[0] + node.max[0]) * 0.5,
+            (node.min[1] + node.max[1]) * 0.5,
+            (node.min[2] + node.max[2]) * 0.5,
+        };
+    }
+
+    // Get world bounds from the world BIVH root
+    const root = world_bivh.nodes[0];
+    const world_min = root.min;
+    const world_max = root.max;
+
+    // 1. Transport heatmap — top-down XZ view, lines colored by P(visible)
+    {
+        const heatmap_path = try std.fmt.allocPrint(allocator, "{s}_transport.ppm", .{base_name});
+        defer allocator.free(heatmap_path);
+        try writeTransportHeatmap(
+            allocator,
+            &solver.transport,
+            cell_centroids,
+            num_cells,
+            world_min,
+            world_max,
+            heatmap_path,
+        );
+        try stdout.print("  Transport heatmap: {s}\n", .{heatmap_path});
+    }
+
+    // 2. Visibility density — each cell colored by visible cluster count
+    {
+        const density_path = try std.fmt.allocPrint(allocator, "{s}_density.ppm", .{base_name});
+        defer allocator.free(density_path);
+        try writeVisibilityDensity(
+            allocator,
+            &solver,
+            &cluster_bivh,
+            cell_node_indices.items,
+            cluster_count,
+            world_min,
+            world_max,
+            density_path,
+        );
+        try stdout.print("  Density map:       {s}\n", .{density_path});
+    }
 }
 
 // ── BIVH adapter for PVS function pointers ──────────────────────────
@@ -571,4 +625,229 @@ fn serializePvs(
 
     try bw.flush();
     std.debug.print("  Serialized {d} cells to {s}\n", .{ cells_written, path });
+}
+
+// ── Visualization ───────────────────────────────────────────────────
+
+const IMG_SIZE: u32 = 2048;
+
+const Color = struct { r: u8, g: u8, b: u8 };
+
+/// Map world XZ coordinates to pixel coordinates (top-down Y-up view).
+/// X maps to pixel X, Z maps to pixel Y (inverted so +Z is up).
+fn worldToPixel(pos: Vec3, world_min: [3]f32, world_max: [3]f32, size: u32) struct { x: i32, y: i32 } {
+    const margin: f32 = 0.02; // 2% margin
+    const dx = world_max[0] - world_min[0];
+    const dz = world_max[2] - world_min[2];
+    const span = @max(dx, dz); // uniform scale
+    const pad = span * margin;
+
+    const fx = (pos[0] - world_min[0] + pad) / (span + 2 * pad);
+    const fz = (pos[2] - world_min[2] + pad) / (span + 2 * pad);
+
+    return .{
+        .x = @intFromFloat(fx * @as(f32, @floatFromInt(size - 1))),
+        .y = @intFromFloat((1.0 - fz) * @as(f32, @floatFromInt(size - 1))),
+    };
+}
+
+/// Lerp between two colors.
+fn lerpColor(a: Color, b: Color, t: f32) Color {
+    const ct = std.math.clamp(t, 0, 1);
+    return .{
+        .r = @intFromFloat(@as(f32, @floatFromInt(a.r)) * (1 - ct) + @as(f32, @floatFromInt(b.r)) * ct),
+        .g = @intFromFloat(@as(f32, @floatFromInt(a.g)) * (1 - ct) + @as(f32, @floatFromInt(b.g)) * ct),
+        .b = @intFromFloat(@as(f32, @floatFromInt(a.b)) * (1 - ct) + @as(f32, @floatFromInt(b.b)) * ct),
+    };
+}
+
+/// Heat color ramp: blue → cyan → green → yellow → red
+fn heatColor(t: f32) Color {
+    const ct = std.math.clamp(t, 0, 1);
+    if (ct < 0.25) {
+        return lerpColor(.{ .r = 0, .g = 0, .b = 128 }, .{ .r = 0, .g = 200, .b = 200 }, ct * 4.0);
+    } else if (ct < 0.5) {
+        return lerpColor(.{ .r = 0, .g = 200, .b = 200 }, .{ .r = 0, .g = 255, .b = 0 }, (ct - 0.25) * 4.0);
+    } else if (ct < 0.75) {
+        return lerpColor(.{ .r = 0, .g = 255, .b = 0 }, .{ .r = 255, .g = 255, .b = 0 }, (ct - 0.5) * 4.0);
+    } else {
+        return lerpColor(.{ .r = 255, .g = 255, .b = 0 }, .{ .r = 255, .g = 0, .b = 0 }, (ct - 0.75) * 4.0);
+    }
+}
+
+/// Draw a line using Bresenham's algorithm with additive blending.
+fn drawLine(pixels: []Color, size: u32, x0: i32, y0: i32, x1: i32, y1: i32, color: Color, alpha: f32) void {
+    var x = x0;
+    var y = y0;
+    const dx_abs: i32 = if (x1 > x0) x1 - x0 else x0 - x1;
+    const dy_abs: i32 = if (y1 > y0) y1 - y0 else y0 - y1;
+    const sx: i32 = if (x0 < x1) 1 else -1;
+    const sy: i32 = if (y0 < y1) 1 else -1;
+    var err = dx_abs - dy_abs;
+
+    const img_sz: i32 = @intCast(size);
+    const steps = dx_abs + dy_abs + 1;
+
+    for (0..@intCast(steps)) |_| {
+        if (x >= 0 and x < img_sz and y >= 0 and y < img_sz) {
+            const idx: usize = @intCast(y * img_sz + x);
+            const old = pixels[idx];
+            pixels[idx] = .{
+                .r = @intCast(@min(255, @as(u16, old.r) + @as(u16, @intFromFloat(@as(f32, @floatFromInt(color.r)) * alpha)))),
+                .g = @intCast(@min(255, @as(u16, old.g) + @as(u16, @intFromFloat(@as(f32, @floatFromInt(color.g)) * alpha)))),
+                .b = @intCast(@min(255, @as(u16, old.b) + @as(u16, @intFromFloat(@as(f32, @floatFromInt(color.b)) * alpha)))),
+            };
+        }
+        if (x == x1 and y == y1) break;
+        const e2 = err * 2;
+        if (e2 > -dy_abs) {
+            err -= dy_abs;
+            x += sx;
+        }
+        if (e2 < dx_abs) {
+            err += dx_abs;
+            y += sy;
+        }
+    }
+}
+
+/// Fill an axis-aligned rectangle.
+fn fillRect(pixels: []Color, size: u32, x0: i32, y0: i32, x1: i32, y1: i32, color: Color) void {
+    const img_sz: i32 = @intCast(size);
+    const ax = std.math.clamp(x0, 0, img_sz - 1);
+    const ay = std.math.clamp(y0, 0, img_sz - 1);
+    const bx = std.math.clamp(x1, 0, img_sz - 1);
+    const by = std.math.clamp(y1, 0, img_sz - 1);
+
+    var row = ay;
+    while (row <= by) : (row += 1) {
+        var col = ax;
+        while (col <= bx) : (col += 1) {
+            pixels[@intCast(row * img_sz + col)] = color;
+        }
+    }
+}
+
+fn writePpm(pixels: []const Color, size: u32, path: []const u8) !void {
+    var file = try std.fs.cwd().createFile(path, .{});
+    defer file.close();
+    var bw = std.io.bufferedWriter(file.writer());
+    const w = bw.writer();
+    try w.print("P6\n{d} {d}\n255\n", .{ size, size });
+    for (pixels) |px| {
+        try w.writeAll(&[_]u8{ px.r, px.g, px.b });
+    }
+    try bw.flush();
+}
+
+fn writeTransportHeatmap(
+    allocator: Allocator,
+    transport: *const pvs_mod.TransportGraph,
+    centroids: []const Vec3,
+    num_cells: u32,
+    world_min: [3]f32,
+    world_max: [3]f32,
+    path: []const u8,
+) !void {
+    const size = IMG_SIZE;
+    const pixels = try allocator.alloc(Color, size * size);
+    defer allocator.free(pixels);
+    @memset(pixels, Color{ .r = 15, .g = 15, .b = 20 }); // dark background
+
+    // Draw transport edges, colored by probability
+    for (0..num_cells) |i| {
+        for (i + 1..num_cells) |j| {
+            const edge = transport.getEdge(@intCast(i), @intCast(j));
+            const casts = edge.casts.load(.monotonic);
+            if (casts == 0) continue;
+            const hits = edge.hits.load(.monotonic);
+            if (hits == 0) continue;
+
+            const prob = @as(f32, @floatFromInt(hits)) / @as(f32, @floatFromInt(casts));
+            const color = heatColor(prob);
+            // Alpha scales with confidence (more casts = more opaque)
+            const alpha = @min(0.8, @as(f32, @floatFromInt(@min(casts, 1000))) / 1000.0);
+
+            const p0 = worldToPixel(centroids[i], world_min, world_max, size);
+            const p1 = worldToPixel(centroids[j], world_min, world_max, size);
+            drawLine(pixels, size, p0.x, p0.y, p1.x, p1.y, color, alpha);
+        }
+    }
+
+    // Draw cell centers as white dots
+    for (centroids[0..num_cells]) |c| {
+        const p = worldToPixel(c, world_min, world_max, size);
+        fillRect(pixels, size, p.x - 2, p.y - 2, p.x + 2, p.y + 2, .{ .r = 255, .g = 255, .b = 255 });
+    }
+
+    try writePpm(pixels, size, path);
+}
+
+fn writeVisibilityDensity(
+    allocator: Allocator,
+    solver: *const pvs_mod.PvsSolver,
+    cluster_bivh: *const bivh_mod.Bivh,
+    cell_node_indices: []const u32,
+    cluster_count: u32,
+    world_min: [3]f32,
+    world_max: [3]f32,
+    path: []const u8,
+) !void {
+    const size = IMG_SIZE;
+    const pixels = try allocator.alloc(Color, size * size);
+    defer allocator.free(pixels);
+    @memset(pixels, Color{ .r = 15, .g = 15, .b = 20 });
+
+    // Find max visible count for normalization
+    var max_count: u32 = 1;
+    for (cell_node_indices) |node_idx| {
+        const count = solver.visibility.visibleCount(node_idx);
+        max_count = @max(max_count, count);
+    }
+
+    // Draw each cell as a filled rectangle colored by visibility density
+    for (cell_node_indices) |node_idx| {
+        const node = cluster_bivh.nodes[node_idx];
+        const count = solver.visibility.visibleCount(node_idx);
+        const t = @as(f32, @floatFromInt(count)) / @as(f32, @floatFromInt(max_count));
+
+        const p_min = worldToPixel(node.min, world_min, world_max, size);
+        const p_max = worldToPixel(node.max, world_min, world_max, size);
+
+        // p_min.y > p_max.y because Y is inverted in screen space
+        const color = heatColor(t);
+        fillRect(pixels, size, p_min.x, p_max.y, p_max.x, p_min.y, color);
+    }
+
+    // Overlay: draw outline text showing count / total
+    // (PPM is simple — no text, but the colors tell the story)
+
+    // Draw cell outlines in white for structure
+    for (cell_node_indices) |node_idx| {
+        const node = cluster_bivh.nodes[node_idx];
+        const p_min = worldToPixel(node.min, world_min, world_max, size);
+        const p_max = worldToPixel(node.max, world_min, world_max, size);
+        const outline = Color{ .r = 80, .g = 80, .b = 80 };
+        drawLine(pixels, size, p_min.x, p_max.y, p_max.x, p_max.y, outline, 1.0);
+        drawLine(pixels, size, p_max.x, p_max.y, p_max.x, p_min.y, outline, 1.0);
+        drawLine(pixels, size, p_max.x, p_min.y, p_min.x, p_min.y, outline, 1.0);
+        drawLine(pixels, size, p_min.x, p_min.y, p_min.x, p_max.y, outline, 1.0);
+    }
+
+    // Legend: draw a color bar at the bottom
+    const bar_y: i32 = @intCast(size - 30);
+    const bar_h: i32 = 20;
+    for (0..size) |xi| {
+        const t = @as(f32, @floatFromInt(xi)) / @as(f32, @floatFromInt(size - 1));
+        const color = heatColor(t);
+        fillRect(pixels, size, @intCast(xi), bar_y, @intCast(xi), bar_y + bar_h, color);
+    }
+
+    // Labels: "0" on left, max on right (as pixel text is hard, just mark with white ticks)
+    fillRect(pixels, size, 0, bar_y - 5, 2, bar_y - 1, .{ .r = 255, .g = 255, .b = 255 });
+    fillRect(pixels, size, @intCast(size - 3), bar_y - 5, @intCast(size - 1), bar_y - 1, .{ .r = 255, .g = 255, .b = 255 });
+
+    _ = cluster_count;
+
+    try writePpm(pixels, size, path);
 }
