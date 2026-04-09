@@ -657,6 +657,88 @@ pub fn main() !void {
                 try aw.flush();
                 try stdout.print("  → {s}\n", .{assign_bin});
             }
+
+            // ── Phase 4: Light Propagation ───────────────────────────────
+
+            try stdout.print("\n  ╔═══════════════════════════╗\n", .{});
+            try stdout.print("  ║  Light Propagation (SH)   ║\n", .{});
+            try stdout.print("  ╚═══════════════════════════╝\n", .{});
+
+            // Initialize per-probe SH coefficients
+            const probe_sh = try allocator.alloc(pvs_mod.SHCoeffs, probes.len);
+            defer allocator.free(probe_sh);
+            @memset(probe_sh, pvs_mod.SHCoeffs{});
+
+            // Inject lights:
+            // 1. Sun light from above-right (warm)
+            const sun_dir = Vec3{ 0.5, 0.8, 0.3 };
+            const sun_len = @sqrt(sun_dir[0] * sun_dir[0] + sun_dir[1] * sun_dir[1] + sun_dir[2] * sun_dir[2]);
+            const sun_norm = Vec3{ sun_dir[0] / sun_len, sun_dir[1] / sun_len, sun_dir[2] / sun_len };
+            const sun_sh = pvs_mod.SHCoeffs.fromDirectional(sun_norm, .{ 1.0, 0.9, 0.7 });
+
+            // 2. Sky ambient (cool blue)
+            const sky_sh = pvs_mod.SHCoeffs.fromAmbient(.{ 0.15, 0.2, 0.35 });
+
+            // Inject sun + sky into all probes that are "outdoors"
+            // (heuristic: probes above the median Y height are outdoors)
+            var median_y: f32 = 0;
+            for (probes) |p| median_y += p.position[1];
+            median_y /= @floatFromInt(probes.len);
+
+            var outdoor_count: u32 = 0;
+            for (probes, 0..) |probe, pi| {
+                if (probe.position[1] >= median_y - 1.0) {
+                    // Outdoor probe — gets sun + sky
+                    probe_sh[pi].add(sun_sh);
+                    probe_sh[pi].add(sky_sh);
+                    outdoor_count += 1;
+                } else {
+                    // Indoor probe — just a little ambient
+                    probe_sh[pi].add(pvs_mod.SHCoeffs.fromAmbient(.{ 0.05, 0.05, 0.08 }));
+                }
+            }
+
+            try stdout.print("  Probes:       {d} ({d} outdoor)\n", .{ probes.len, outdoor_count });
+
+            // Propagate through transport graph
+            const num_bounces: u32 = 4;
+            const bounce_falloff: f32 = 0.4;
+            try stdout.print("  Bounces:      {d} (falloff={d:.1})\n", .{ num_bounces, bounce_falloff });
+
+            pvs_mod.propagateLight(
+                probe_sh,
+                @intCast(probes.len),
+                probe_cells,
+                pt,
+                num_bounces,
+                bounce_falloff,
+            );
+
+            // Map probe lighting to clusters via assignment
+            // Each cluster gets its assigned probe's SH intensity
+            const cluster_light = try allocator.alloc(f32, final_cluster_count);
+            defer allocator.free(cluster_light);
+            var max_light: f32 = 0.001;
+
+            for (0..final_cluster_count) |ci| {
+                const pid = assignment.cluster_to_probe[ci];
+                if (pid < probes.len) {
+                    cluster_light[ci] = probe_sh[pid].intensity();
+                    max_light = @max(max_light, cluster_light[ci]);
+                } else {
+                    cluster_light[ci] = 0;
+                }
+            }
+
+            try stdout.print("  Max intensity: {d:.3}\n", .{max_light});
+
+            // Visualize lighting
+            {
+                const light_path = try std.fmt.allocPrint(allocator, "{s}_lighting.ppm", .{base_name});
+                defer allocator.free(light_path);
+                try writeLightingMap(allocator, cluster_light, cluster_centroids, final_cluster_count, probe_sh, probes, max_light, world_min, world_max, light_path);
+                try stdout.print("  → {s}\n", .{light_path});
+            }
         }
     }
 
@@ -1342,6 +1424,69 @@ fn writeProbeAssignment(
         } else {
             // Yellow square
             fillRect(pixels, size, p.x - 4, p.y - 4, p.x + 4, p.y + 4, .{ .r = 255, .g = 255, .b = 0 });
+        }
+    }
+
+    try writePpm(pixels, size, path);
+}
+
+fn writeLightingMap(
+    allocator: Allocator,
+    cluster_light: []const f32,
+    cluster_centroids: []const Vec3,
+    cluster_count: u32,
+    probe_sh: []const pvs_mod.SHCoeffs,
+    probes: []const pvs_mod.Probe,
+    max_light: f32,
+    world_min: [3]f32,
+    world_max: [3]f32,
+    path: []const u8,
+) !void {
+    const size = IMG_SIZE;
+    const pixels = try allocator.alloc(Color, size * size);
+    defer allocator.free(pixels);
+    @memset(pixels, Color{ .r = 5, .g = 5, .b = 8 });
+
+    // Find median intensity for adaptive exposure
+    _ = max_light;
+    const sorted = try allocator.alloc(f32, cluster_count);
+    defer allocator.free(sorted);
+    @memcpy(sorted, cluster_light);
+    std.mem.sort(f32, sorted, {}, std.sort.asc(f32));
+    // Use 90th percentile for exposure — most clusters should be visible
+    const p90 = sorted[@min(cluster_count - 1, cluster_count * 9 / 10)];
+    const exposure = if (p90 > 0.001) 8.0 / p90 else 1.0;
+
+    // Plot each cluster colored by its lighting intensity
+    for (0..cluster_count) |ci| {
+        const intensity = cluster_light[ci] * exposure;
+        const mapped = intensity / (1.0 + intensity); // Reinhard with adaptive exposure
+
+        // Warm/cool: bright = warm sun, dim = cool shadow
+        const color = Color{
+            .r = @intFromFloat(std.math.clamp(mapped * 255 * 1.1, 0, 255)),
+            .g = @intFromFloat(std.math.clamp(mapped * 255 * 0.9, 0, 255)),
+            .b = @intFromFloat(std.math.clamp(mapped * 255 * 0.7 + (1.0 - mapped) * 40, 0, 255)),
+        };
+
+        const p = worldToPixel(cluster_centroids[ci], world_min, world_max, size);
+        fillRect(pixels, size, p.x - 2, p.y - 2, p.x + 2, p.y + 2, color);
+    }
+
+    // Draw probes colored by their SH intensity
+    for (probes, 0..) |probe, pi| {
+        const p = worldToPixel(probe.position, world_min, world_max, size);
+        const sh_val = probe_sh[pi].intensity() * exposure;
+        const sh_mapped = sh_val / (1.0 + sh_val);
+        const bright: u8 = @intFromFloat(std.math.clamp(sh_mapped * 255, 0, 255));
+
+        if (probe.is_boundary) {
+            drawLine(pixels, size, p.x, p.y - 4, p.x + 4, p.y, .{ .r = bright, .g = bright, .b = 255 }, 1.0);
+            drawLine(pixels, size, p.x + 4, p.y, p.x, p.y + 4, .{ .r = bright, .g = bright, .b = 255 }, 1.0);
+            drawLine(pixels, size, p.x, p.y + 4, p.x - 4, p.y, .{ .r = bright, .g = bright, .b = 255 }, 1.0);
+            drawLine(pixels, size, p.x - 4, p.y, p.x, p.y - 4, .{ .r = bright, .g = bright, .b = 255 }, 1.0);
+        } else {
+            fillRect(pixels, size, p.x - 3, p.y - 3, p.x + 3, p.y + 3, .{ .r = bright, .g = bright, .b = bright });
         }
     }
 

@@ -819,6 +819,146 @@ pub fn assignProbes(
     };
 }
 
+// ── Spherical Harmonics (Order 1) ───────────────────────────────────────
+//
+// L0 (1 coeff) + L1 (3 coeffs) = 4 coefficients per color channel.
+// L0 = ambient/DC, L1 = directional.  Enough for diffuse GI.
+//
+// SH basis functions (unnormalized):
+//   Y00 = 1                  (constant)
+//   Y1m1 = y                 (up/down)
+//   Y10 = z                  (forward/back)
+//   Y11 = x                  (left/right)
+
+pub const SHCoeffs = struct {
+    /// 4 coefficients per RGB channel = 12 floats
+    r: [4]f32 = .{ 0, 0, 0, 0 },
+    g: [4]f32 = .{ 0, 0, 0, 0 },
+    b: [4]f32 = .{ 0, 0, 0, 0 },
+
+    pub fn add(self: *SHCoeffs, other: SHCoeffs) void {
+        for (0..4) |i| {
+            self.r[i] += other.r[i];
+            self.g[i] += other.g[i];
+            self.b[i] += other.b[i];
+        }
+    }
+
+    pub fn scale(self: *SHCoeffs, s: f32) void {
+        for (0..4) |i| {
+            self.r[i] *= s;
+            self.g[i] *= s;
+            self.b[i] *= s;
+        }
+    }
+
+    pub fn scaled(self: SHCoeffs, s: f32) SHCoeffs {
+        var result = self;
+        result.scale(s);
+        return result;
+    }
+
+    /// Encode a directional light into SH.
+    /// dir = normalized direction FROM surface TO light.
+    pub fn fromDirectional(dir: [3]f32, color: [3]f32) SHCoeffs {
+        // SH basis eval for order 1
+        const y00: f32 = 0.282095; // 1/(2*sqrt(pi))
+        const y1m1: f32 = 0.488603 * dir[1]; // sqrt(3)/(2*sqrt(pi)) * y
+        const y10: f32 = 0.488603 * dir[2]; // sqrt(3)/(2*sqrt(pi)) * z
+        const y11: f32 = 0.488603 * dir[0]; // sqrt(3)/(2*sqrt(pi)) * x
+
+        return .{
+            .r = .{ color[0] * y00, color[0] * y1m1, color[0] * y10, color[0] * y11 },
+            .g = .{ color[1] * y00, color[1] * y1m1, color[1] * y10, color[1] * y11 },
+            .b = .{ color[2] * y00, color[2] * y1m1, color[2] * y10, color[2] * y11 },
+        };
+    }
+
+    /// Encode an omnidirectional (ambient) light into SH.
+    pub fn fromAmbient(color: [3]f32) SHCoeffs {
+        const y00: f32 = 0.282095;
+        return .{
+            .r = .{ color[0] * y00, 0, 0, 0 },
+            .g = .{ color[1] * y00, 0, 0, 0 },
+            .b = .{ color[2] * y00, 0, 0, 0 },
+        };
+    }
+
+    /// Evaluate SH in a given direction → RGB irradiance.
+    pub fn evaluate(self: *const SHCoeffs, dir: [3]f32) [3]f32 {
+        const y00: f32 = 0.282095;
+        const y1m1: f32 = 0.488603 * dir[1];
+        const y10: f32 = 0.488603 * dir[2];
+        const y11: f32 = 0.488603 * dir[0];
+
+        return .{
+            self.r[0] * y00 + self.r[1] * y1m1 + self.r[2] * y10 + self.r[3] * y11,
+            self.g[0] * y00 + self.g[1] * y1m1 + self.g[2] * y10 + self.g[3] * y11,
+            self.b[0] * y00 + self.b[1] * y1m1 + self.b[2] * y10 + self.b[3] * y11,
+        };
+    }
+
+    /// Get the DC (ambient) intensity = L0 coefficient.
+    pub fn intensity(self: *const SHCoeffs) f32 {
+        const y00: f32 = 0.282095;
+        return (self.r[0] + self.g[0] + self.b[0]) * y00;
+    }
+};
+
+/// Propagate light through the transport graph.
+///
+/// Starting from initial per-probe SH coefficients (e.g. from direct
+/// light injection), bounce light through transport edges for N iterations.
+/// Each bounce transfers SH from probe to probe weighted by the edge's
+/// transport probability.
+pub fn propagateLight(
+    probe_sh: []SHCoeffs,
+    num_probes: u32,
+    probe_cells: []const u32,
+    transport: *const TransportGraph,
+    bounces: u32,
+    falloff: f32, // energy conservation per bounce (0.5 = half energy transferred)
+) void {
+    // Double buffer: read from current, write to next
+    var current = probe_sh;
+
+    for (0..bounces) |_| {
+        // For each probe, gather incoming light from connected probes
+        // Normalize by number of contributing neighbors (energy conservation)
+        for (0..num_probes) |i| {
+            const my_cell = probe_cells[i];
+            if (my_cell >= transport.cell_count) continue;
+
+            var incoming = SHCoeffs{};
+            var neighbor_count: f32 = 0;
+
+            for (0..num_probes) |j| {
+                if (i == j) continue;
+                const other_cell = probe_cells[j];
+                if (other_cell >= transport.cell_count) continue;
+                if (my_cell == other_cell) continue;
+
+                const edge = transport.getEdge(my_cell, other_cell);
+                const casts = edge.casts.load(.monotonic);
+                if (casts == 0) continue;
+                const hits = edge.hits.load(.monotonic);
+                if (hits == 0) continue;
+
+                const prob = @as(f32, @floatFromInt(hits)) / @as(f32, @floatFromInt(casts));
+                incoming.add(current[j].scaled(prob));
+                neighbor_count += prob;
+            }
+
+            // Normalize by total incoming weight and apply falloff
+            if (neighbor_count > 0) {
+                incoming.scale(falloff / neighbor_count);
+            }
+
+            current[i].add(incoming);
+        }
+    }
+}
+
 // ── PVS Solver ──────────────────────────────────────────────────────────
 //
 // Importance-sampled PVS solver.  Instead of picking random triangles
