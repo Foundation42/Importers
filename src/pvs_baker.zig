@@ -873,15 +873,44 @@ pub fn main() !void {
             try stdout.print("  → {s}\n", .{assign_bin});
         }
 
-        // ── Phase: Neural PVS Training ─────────────────────────────────
+        // ── Phase: Neural PVS Training (frustum-integrated) ────────────
         {
             try stdout.print("\n  ╔═══════════════════════════╗\n", .{});
-            try stdout.print("  ║  Neural PVS Training      ║\n", .{});
+            try stdout.print("  ║  Neural PVS Training v2   ║\n", .{});
             try stdout.print("  ╚═══════════════════════════╝\n", .{});
 
             const t_neural0 = std.time.nanoTimestamp();
 
-            // Generate training data via ray bundles
+            // Compute model centroids (for spatial loss weighting)
+            const model_centroids = try allocator.alloc([3]f32, num_models);
+            defer allocator.free(model_centroids);
+            for (model_ranges.items, 0..) |mr, mi| {
+                var cx: f64 = 0;
+                var cy: f64 = 0;
+                var cz: f64 = 0;
+                var count: f64 = 0;
+                for (mr.tri_start..mr.tri_end) |ti| {
+                    const base = ti * 3;
+                    for (0..3) |vi| {
+                        const pos = all_positions.items[mesh_set.indices[base + vi]];
+                        cx += pos[0];
+                        cy += pos[1];
+                        cz += pos[2];
+                        count += 1;
+                    }
+                }
+                if (count > 0) {
+                    model_centroids[mi] = .{
+                        @floatCast(cx / count),
+                        @floatCast(cy / count),
+                        @floatCast(cz / count),
+                    };
+                } else {
+                    model_centroids[mi] = .{ 0, 0, 0 };
+                }
+            }
+
+            // Generate frustum-aware training data
             var train_data = try pvs_neural.generateTrainingData(
                 allocator,
                 &world_bivh,
@@ -892,8 +921,8 @@ pub fn main() !void {
                 world_min,
                 world_max,
                 .{
-                    .num_samples = 10_000,
-                    .rays_per_sample = 512,
+                    .num_samples = 20_000,
+                    .rays_per_sample = 256,
                     .max_ray_dist = 2000.0,
                 },
                 stdout,
@@ -903,10 +932,11 @@ pub fn main() !void {
             const t_data = std.time.nanoTimestamp();
             try stdout.print("  Data gen: {d}ms\n", .{@divTrunc(t_data - t_neural0, 1_000_000)});
 
-            // Train MLP
+            // Train MLP with spatial + distance weighted loss
             var mlp = try pvs_neural.train(
                 allocator,
                 &train_data,
+                model_centroids,
                 world_min,
                 world_max,
                 .{
@@ -915,6 +945,9 @@ pub fn main() !void {
                     .batch_size = 32,
                     .hidden_size = 256,
                     .eval_threshold = 0.3,
+                    .center_boost = 2.0,
+                    .near_boost = 2.0,
+                    .ref_dist = 5.0,
                 },
                 stdout,
             );

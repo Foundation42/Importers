@@ -1,19 +1,25 @@
-// Neural PVS — learns visibility as a function of position + view direction.
+// Neural PVS v2 — frustum-integrated visibility prediction.
 //
-// Direction-aware MLP predicts which models are visible from a position
-// looking in a specific direction. Training data generated via ray bundles
-// within a FOV cone (adaptive refinement on hit).
+// Direction + frustum-aware MLP predicts which models are visible AND
+// in-frustum from a camera state. Eliminates separate frustum cull pass.
+// Training uses spatial + distance weighted loss (center/near > edge/far).
 //
-// Architecture: (x,y,z,sin_yaw,cos_yaw) → [H LeakyReLU] → [H LeakyReLU] → [N sigmoid]
-// Loss: class-balanced BCE (auto-weighted from label statistics)
-// Like a neural, spatially aware bloom filter.
+// Input (9): x, y, z, sin_yaw, cos_yaw, sin_pitch, cos_pitch, vfov_norm, aspect_norm
+// Architecture: input(9) → [H LeakyReLU] → [H LeakyReLU] → [N sigmoid]
+// Output: per-model visibility probability (combined PVS + frustum)
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const bivh_mod = @import("bivh");
 
 const Vec3 = [3]f32;
-const INPUT_SIZE: u32 = 5; // x, y, z, sin_yaw, cos_yaw
+pub const INPUT_SIZE: u32 = 9;
+
+// Frustum parameter ranges (for normalization)
+const MIN_VFOV: f32 = 1.05; // ~60 degrees
+const MAX_VFOV: f32 = 2.09; // ~120 degrees
+const MIN_ASPECT: f32 = 1.33; // 4:3
+const MAX_ASPECT: f32 = 2.33; // ultrawide
 
 // ── Vector math helpers ─────────────────────────────────────────────
 
@@ -29,8 +35,12 @@ fn scale3(v: Vec3, s: f32) Vec3 {
     return .{ v[0] * s, v[1] * s, v[2] * s };
 }
 
+fn dot3(a: Vec3, b: Vec3) f32 {
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+
 fn length3(v: Vec3) f32 {
-    return @sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+    return @sqrt(dot3(v, v));
 }
 
 fn normalize3(v: Vec3) Vec3 {
@@ -55,34 +65,34 @@ fn midpoint(a: Vec3, b: Vec3) Vec3 {
     };
 }
 
-/// Random direction within a cone of half_angle around look_dir.
-/// Uses uniform sampling on spherical cap.
-fn randomInCone(look_dir: Vec3, half_angle: f32, rng: std.Random) Vec3 {
-    const cos_half = @cos(half_angle);
-    // Uniform on spherical cap: cos(theta) in [cos_half, 1]
-    const cos_theta = 1.0 - rng.float(f32) * (1.0 - cos_half);
-    const sin_theta = @sqrt(1.0 - cos_theta * cos_theta);
-    const phi = 2.0 * std.math.pi * rng.float(f32);
+/// Build look direction from yaw + pitch (Y-up coordinate system).
+fn lookDirFromAngles(sin_yaw: f32, cos_yaw: f32, sin_pitch: f32, cos_pitch: f32) Vec3 {
+    return .{ cos_pitch * sin_yaw, sin_pitch, cos_pitch * cos_yaw };
+}
 
-    // Local direction (z = look_dir)
-    const lx = sin_theta * @cos(phi);
-    const ly = sin_theta * @sin(phi);
-    const lz = cos_theta;
-
-    // Build orthonormal basis from look_dir
+/// Random ray direction within a camera frustum.
+/// Frustum defined by look_dir, vfov, aspect ratio.
+fn randomInFrustum(look_dir: Vec3, vfov: f32, aspect: f32, rng: std.Random) Vec3 {
+    // Build camera basis
     const up = Vec3{ 0, 1, 0 };
-    var x_axis = normalize3(cross3(up, look_dir));
-    // Degenerate case: look_dir parallel to up
-    if (length3(x_axis) < 0.001) {
-        x_axis = normalize3(cross3(.{ 1, 0, 0 }, look_dir));
+    var right = normalize3(cross3(up, look_dir));
+    if (length3(right) < 0.001) {
+        right = normalize3(cross3(.{ 1, 0, 0 }, look_dir));
     }
-    const y_axis = cross3(look_dir, x_axis);
+    const cam_up = cross3(look_dir, right);
 
-    // Rotate local → world
+    // Frustum half-extents at unit distance
+    const v_tan = @tan(vfov * 0.5);
+    const h_tan = aspect * v_tan;
+
+    // Random point in frustum rectangle [-1,1] x [-1,1]
+    const u = rng.float(f32) * 2.0 - 1.0;
+    const v = rng.float(f32) * 2.0 - 1.0;
+
     return normalize3(.{
-        x_axis[0] * lx + y_axis[0] * ly + look_dir[0] * lz,
-        x_axis[1] * lx + y_axis[1] * ly + look_dir[1] * lz,
-        x_axis[2] * lx + y_axis[2] * ly + look_dir[2] * lz,
+        look_dir[0] + u * h_tan * right[0] + v * v_tan * cam_up[0],
+        look_dir[1] + u * h_tan * right[1] + v * v_tan * cam_up[1],
+        look_dir[2] + u * h_tan * right[2] + v * v_tan * cam_up[2],
     });
 }
 
@@ -122,19 +132,35 @@ fn leakyReluDeriv(x: f32) f32 {
     return if (x > 0) @as(f32, 1.0) else 0.01;
 }
 
+/// Normalize vfov to [0,1]
+pub fn normVfov(vfov: f32) f32 {
+    return std.math.clamp((vfov - MIN_VFOV) / (MAX_VFOV - MIN_VFOV), 0, 1);
+}
+
+/// Normalize aspect to [0,1]
+pub fn normAspect(aspect: f32) f32 {
+    return std.math.clamp((aspect - MIN_ASPECT) / (MAX_ASPECT - MIN_ASPECT), 0, 1);
+}
+
 // ── Training Data ───────────────────────────────────────────────────
 
 pub const TrainingConfig = struct {
-    num_samples: u32 = 10_000,
+    num_samples: u32 = 20_000,
     rays_per_sample: u32 = 256,
     max_ray_dist: f32 = 2000.0,
     bundle_offset: f32 = 0.001,
-    fov_half_angle: f32 = 0.87, // ~50 degrees in radians
+    // Frustum parameter ranges for random sampling
+    min_pitch: f32 = -0.785, // -45 degrees
+    max_pitch: f32 = 0.785, // +45 degrees
+    min_vfov: f32 = MIN_VFOV,
+    max_vfov: f32 = MAX_VFOV,
+    min_aspect: f32 = MIN_ASPECT,
+    max_aspect: f32 = MAX_ASPECT,
 };
 
 pub const TrainingData = struct {
     positions: []Vec3,
-    directions: [][2]f32, // sin_yaw, cos_yaw per sample
+    params: [][6]f32, // sin_yaw, cos_yaw, sin_pitch, cos_pitch, vfov_norm, aspect_norm
     labels: [][]u8, // packed model bitsets
     num_models: u32,
     bitset_stride: u32,
@@ -145,14 +171,14 @@ pub const TrainingData = struct {
     pub fn deinit(self: *TrainingData) void {
         for (self.labels) |l| self.allocator.free(l);
         self.allocator.free(self.labels);
-        self.allocator.free(self.directions);
+        self.allocator.free(self.params);
         self.allocator.free(self.positions);
     }
 };
 
-/// Generate direction-aware training data via ray bundles.
-/// Each sample: random position + random yaw → cast rays within FOV cone →
-/// record which models are visible. Bundle refinement on hit (6 child rays).
+/// Generate frustum-aware training data via ray bundles.
+/// Each sample: random (position, yaw, pitch, vfov, aspect) → cast rays within frustum →
+/// record which models are visible. Bundle refinement on hit.
 pub fn generateTrainingData(
     allocator: Allocator,
     bivh: *const bivh_mod.Bivh,
@@ -170,8 +196,8 @@ pub fn generateTrainingData(
 
     var positions = std.ArrayList(Vec3).init(allocator);
     defer positions.deinit();
-    var directions = std.ArrayList([2]f32).init(allocator);
-    defer directions.deinit();
+    var params = std.ArrayList([6]f32).init(allocator);
+    defer params.deinit();
     var labels = std.ArrayList([]u8).init(allocator);
     defer labels.deinit();
 
@@ -180,10 +206,8 @@ pub fn generateTrainingData(
     var attempts: u64 = 0;
     const max_attempts: u64 = @as(u64, config.num_samples) * 10;
 
-    try stdout.print("  Generating {d} direction-aware samples ({d} rays/sample, FOV={d:.0}deg)...\n", .{
-        config.num_samples,
-        config.rays_per_sample,
-        config.fov_half_angle * 180.0 / std.math.pi * 2.0,
+    try stdout.print("  Generating {d} frustum-aware samples ({d} rays/sample)...\n", .{
+        config.num_samples, config.rays_per_sample,
     });
 
     while (sample < config.num_samples and attempts < max_attempts) : (attempts += 1) {
@@ -194,19 +218,25 @@ pub fn generateTrainingData(
             pos_min[2] + rng.float(f32) * (pos_max[2] - pos_min[2]),
         };
 
-        // Random yaw (horizontal look direction in XZ plane, Y-up)
+        // Random camera parameters
         const yaw = rng.float(f32) * 2.0 * std.math.pi;
+        const pitch = config.min_pitch + rng.float(f32) * (config.max_pitch - config.min_pitch);
+        const vfov = config.min_vfov + rng.float(f32) * (config.max_vfov - config.min_vfov);
+        const aspect = config.min_aspect + rng.float(f32) * (config.max_aspect - config.min_aspect);
+
         const sin_yaw = @sin(yaw);
         const cos_yaw = @cos(yaw);
-        const look_dir = Vec3{ sin_yaw, 0, cos_yaw }; // horizontal
+        const sin_pitch = @sin(pitch);
+        const cos_pitch = @cos(pitch);
+        const look_dir = lookDirFromAngles(sin_yaw, cos_yaw, sin_pitch, cos_pitch);
 
         const bitset = try allocator.alloc(u8, bitset_stride);
         @memset(bitset, 0);
         var found_any = false;
 
-        // Cast rays within FOV cone around look direction
+        // Cast rays within frustum
         for (0..config.rays_per_sample) |_| {
-            const dir = randomInCone(look_dir, config.fov_half_angle, rng);
+            const dir = randomInFrustum(look_dir, vfov, aspect, rng);
 
             var ray = bivh_mod.TraceRay.make(pos[0], pos[1], pos[2], dir[0], dir[1], dir[2], config.max_ray_dist);
             const hit = bivh.trace(mesh_set, &ray, 0.0001, config.max_ray_dist);
@@ -272,10 +302,17 @@ pub fn generateTrainingData(
 
         if (found_any) {
             try positions.append(pos);
-            try directions.append(.{ sin_yaw, cos_yaw });
+            try params.append(.{
+                sin_yaw,
+                cos_yaw,
+                sin_pitch,
+                cos_pitch,
+                normVfov(vfov),
+                normAspect(aspect),
+            });
             try labels.append(bitset);
             sample += 1;
-            if (sample % 1000 == 0) {
+            if (sample % 2000 == 0) {
                 try stdout.print("    {d}/{d} samples, {d}M rays\n", .{ sample, config.num_samples, total_rays / 1_000_000 });
             }
         } else {
@@ -307,7 +344,7 @@ pub fn generateTrainingData(
 
     return .{
         .positions = try positions.toOwnedSlice(),
-        .directions = try directions.toOwnedSlice(),
+        .params = try params.toOwnedSlice(),
         .labels = try labels.toOwnedSlice(),
         .num_models = num_models,
         .bitset_stride = bitset_stride,
@@ -317,20 +354,52 @@ pub fn generateTrainingData(
     };
 }
 
+// ── Spatial + Distance Loss Weighting ───────────────────────────────
+
+/// Compute per-model FN penalty weights based on angular distance from
+/// view center and distance from camera. Close + center = max penalty.
+pub fn computeSpatialWeights(
+    weights: []f32, // output: one weight per model
+    pos: Vec3,
+    look_dir: Vec3,
+    model_centroids: []const Vec3,
+    base_weight: f32,
+    center_boost: f32, // extra FN penalty for center models (~2.0)
+    near_boost: f32, // extra FN penalty for nearby models (~2.0)
+    ref_dist: f32, // distance reference (~5.0 meters)
+) void {
+    for (weights, 0..) |*w, i| {
+        if (i >= model_centroids.len) {
+            w.* = base_weight;
+            continue;
+        }
+        const to_model = sub3(model_centroids[i], pos);
+        const dist = length3(to_model);
+
+        // Angular factor: dot with look direction (1.0 = dead center, 0 = 90deg)
+        const cos_angle = if (dist > 0.01) dot3(look_dir, scale3(to_model, 1.0 / dist)) else 0;
+        const center_factor = @max(0.0, cos_angle);
+
+        // Distance factor: close models matter more
+        const near_factor = 1.0 / (1.0 + dist / ref_dist);
+
+        w.* = base_weight * (1.0 + center_boost * center_factor + near_boost * near_factor);
+    }
+}
+
 // ── MLP ─────────────────────────────────────────────────────────────
 
 pub const MLP = struct {
-    // Architecture
     hidden_size: u32,
     output_size: u32,
 
     // Parameters (owned by arena)
     w1: []f32, // INPUT_SIZE × hidden
-    b1: []f32, // hidden
+    b1: []f32,
     w2: []f32, // hidden × hidden
-    b2: []f32, // hidden
+    b2: []f32,
     w3: []f32, // hidden × output
-    b3: []f32, // output
+    b3: []f32,
 
     // Adam moment estimates
     m_w1: []f32, v_w1: []f32,
@@ -341,29 +410,23 @@ pub const MLP = struct {
     m_b3: []f32, v_b3: []f32,
 
     // Activation cache
-    z1: []f32,
-    a1: []f32, // post-LeakyReLU
-    z2: []f32,
-    a2: []f32, // post-LeakyReLU
-    out: []f32, // post-sigmoid = predictions
+    z1: []f32, a1: []f32,
+    z2: []f32, a2: []f32,
+    out: []f32,
 
     // Backprop deltas
-    d3: []f32,
-    d2: []f32,
-    d1: []f32,
+    d3: []f32, d2: []f32, d1: []f32,
 
-    // Gradient accumulation buffers (for mini-batch)
+    // Gradient accumulation (mini-batch)
     gw1: []f32, gb1: []f32,
     gw2: []f32, gb2: []f32,
     gw3: []f32, gb3: []f32,
 
-    // Normalization (position only — direction is already [-1,1])
+    // Normalization
     pos_min: Vec3,
     pos_scale: Vec3,
 
-    // Adam state
     adam_t: u32 = 0,
-
     arena: std.heap.ArenaAllocator,
 
     const adam_beta1: f32 = 0.9;
@@ -375,7 +438,6 @@ pub const MLP = struct {
         var arena = std.heap.ArenaAllocator.init(allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
-
         const h = hidden;
         const o = num_models;
         const inp = INPUT_SIZE;
@@ -383,39 +445,22 @@ pub const MLP = struct {
         const mlp = MLP{
             .hidden_size = h,
             .output_size = o,
-            .w1 = try a.alloc(f32, inp * h),
-            .b1 = try a.alloc(f32, h),
-            .w2 = try a.alloc(f32, h * h),
-            .b2 = try a.alloc(f32, h),
-            .w3 = try a.alloc(f32, h * o),
-            .b3 = try a.alloc(f32, o),
-            .m_w1 = try a.alloc(f32, inp * h),
-            .v_w1 = try a.alloc(f32, inp * h),
-            .m_b1 = try a.alloc(f32, h),
-            .v_b1 = try a.alloc(f32, h),
-            .m_w2 = try a.alloc(f32, h * h),
-            .v_w2 = try a.alloc(f32, h * h),
-            .m_b2 = try a.alloc(f32, h),
-            .v_b2 = try a.alloc(f32, h),
-            .m_w3 = try a.alloc(f32, h * o),
-            .v_w3 = try a.alloc(f32, h * o),
-            .m_b3 = try a.alloc(f32, o),
-            .v_b3 = try a.alloc(f32, o),
-            .z1 = try a.alloc(f32, h),
-            .a1 = try a.alloc(f32, h),
-            .z2 = try a.alloc(f32, h),
-            .a2 = try a.alloc(f32, h),
+            .w1 = try a.alloc(f32, inp * h), .b1 = try a.alloc(f32, h),
+            .w2 = try a.alloc(f32, h * h), .b2 = try a.alloc(f32, h),
+            .w3 = try a.alloc(f32, h * o), .b3 = try a.alloc(f32, o),
+            .m_w1 = try a.alloc(f32, inp * h), .v_w1 = try a.alloc(f32, inp * h),
+            .m_b1 = try a.alloc(f32, h), .v_b1 = try a.alloc(f32, h),
+            .m_w2 = try a.alloc(f32, h * h), .v_w2 = try a.alloc(f32, h * h),
+            .m_b2 = try a.alloc(f32, h), .v_b2 = try a.alloc(f32, h),
+            .m_w3 = try a.alloc(f32, h * o), .v_w3 = try a.alloc(f32, h * o),
+            .m_b3 = try a.alloc(f32, o), .v_b3 = try a.alloc(f32, o),
+            .z1 = try a.alloc(f32, h), .a1 = try a.alloc(f32, h),
+            .z2 = try a.alloc(f32, h), .a2 = try a.alloc(f32, h),
             .out = try a.alloc(f32, o),
-            .d3 = try a.alloc(f32, o),
-            .d2 = try a.alloc(f32, h),
-            .d1 = try a.alloc(f32, h),
-            // Gradient accumulators
-            .gw1 = try a.alloc(f32, inp * h),
-            .gb1 = try a.alloc(f32, h),
-            .gw2 = try a.alloc(f32, h * h),
-            .gb2 = try a.alloc(f32, h),
-            .gw3 = try a.alloc(f32, h * o),
-            .gb3 = try a.alloc(f32, o),
+            .d3 = try a.alloc(f32, o), .d2 = try a.alloc(f32, h), .d1 = try a.alloc(f32, h),
+            .gw1 = try a.alloc(f32, inp * h), .gb1 = try a.alloc(f32, h),
+            .gw2 = try a.alloc(f32, h * h), .gb2 = try a.alloc(f32, h),
+            .gw3 = try a.alloc(f32, h * o), .gb3 = try a.alloc(f32, o),
             .pos_min = pos_min,
             .pos_scale = .{
                 1.0 / @max(pos_max[0] - pos_min[0], 0.001),
@@ -425,29 +470,16 @@ pub const MLP = struct {
             .arena = arena,
         };
 
-        // Zero Adam moments
-        @memset(mlp.m_w1, 0);
-        @memset(mlp.v_w1, 0);
-        @memset(mlp.m_b1, 0);
-        @memset(mlp.v_b1, 0);
-        @memset(mlp.m_w2, 0);
-        @memset(mlp.v_w2, 0);
-        @memset(mlp.m_b2, 0);
-        @memset(mlp.v_b2, 0);
-        @memset(mlp.m_w3, 0);
-        @memset(mlp.v_w3, 0);
-        @memset(mlp.m_b3, 0);
-        @memset(mlp.v_b3, 0);
+        // Zero all moment + gradient buffers
+        inline for (.{
+            mlp.m_w1, mlp.v_w1, mlp.m_b1, mlp.v_b1,
+            mlp.m_w2, mlp.v_w2, mlp.m_b2, mlp.v_b2,
+            mlp.m_w3, mlp.v_w3, mlp.m_b3, mlp.v_b3,
+            mlp.gw1,  mlp.gb1,  mlp.gw2,  mlp.gb2,
+            mlp.gw3,  mlp.gb3,
+        }) |buf| @memset(buf, 0);
 
-        // Zero gradient accumulators
-        @memset(mlp.gw1, 0);
-        @memset(mlp.gb1, 0);
-        @memset(mlp.gw2, 0);
-        @memset(mlp.gb2, 0);
-        @memset(mlp.gw3, 0);
-        @memset(mlp.gb3, 0);
-
-        // Xavier/Glorot initialization
+        // Xavier initialization
         const rng = std.crypto.random;
         xavierInit(mlp.w1, inp, h, rng);
         xavierInit(mlp.w2, h, h, rng);
@@ -463,24 +495,26 @@ pub const MLP = struct {
         self.arena.deinit();
     }
 
-    /// Build 5-element input vector: normalized (x,y,z) + (sin_yaw, cos_yaw)
-    fn buildInput(self: *const MLP, pos: Vec3, dir: [2]f32) [INPUT_SIZE]f32 {
+    /// Build 9-element input vector
+    fn buildInput(self: *const MLP, pos: Vec3, p: [6]f32) [INPUT_SIZE]f32 {
         return .{
             (pos[0] - self.pos_min[0]) * self.pos_scale[0],
             (pos[1] - self.pos_min[1]) * self.pos_scale[1],
             (pos[2] - self.pos_min[2]) * self.pos_scale[2],
-            dir[0], // sin_yaw (already [-1,1])
-            dir[1], // cos_yaw (already [-1,1])
+            p[0], // sin_yaw
+            p[1], // cos_yaw
+            p[2], // sin_pitch
+            p[3], // cos_pitch
+            p[4], // vfov_norm
+            p[5], // aspect_norm
         };
     }
 
-    /// Forward pass: (position, direction) → model visibility probabilities
-    pub fn forward(self: *MLP, pos: Vec3, dir: [2]f32) []const f32 {
-        const input = self.buildInput(pos, dir);
+    pub fn forward(self: *MLP, pos: Vec3, p: [6]f32) []const f32 {
+        const input = self.buildInput(pos, p);
         const h = self.hidden_size;
         const o = self.output_size;
 
-        // Layer 1: input(5) → hidden (LeakyReLU)
         for (0..h) |j| {
             var sum: f32 = self.b1[j];
             inline for (0..INPUT_SIZE) |k| {
@@ -490,99 +524,71 @@ pub const MLP = struct {
             self.a1[j] = leakyRelu(sum);
         }
 
-        // Layer 2: hidden → hidden (LeakyReLU)
         for (0..h) |j| {
             var sum: f32 = self.b2[j];
-            for (0..h) |k| {
-                sum += self.a1[k] * self.w2[k * h + j];
-            }
+            for (0..h) |k| sum += self.a1[k] * self.w2[k * h + j];
             self.z2[j] = sum;
             self.a2[j] = leakyRelu(sum);
         }
 
-        // Layer 3: hidden → output (sigmoid)
         for (0..o) |j| {
             var sum: f32 = self.b3[j];
-            for (0..h) |k| {
-                sum += self.a2[k] * self.w3[k * o + j];
-            }
+            for (0..h) |k| sum += self.a2[k] * self.w3[k * o + j];
             self.out[j] = sigmoid(sum);
         }
 
         return self.out;
     }
 
-    /// Accumulate gradients for one sample (call forward() first).
-    /// Does NOT update weights — call applyAdam() after a mini-batch.
-    pub fn accumulateGradients(self: *MLP, pos: Vec3, dir: [2]f32, target: []const u8, pos_weight: f32) f32 {
-        const input = self.buildInput(pos, dir);
+    /// Accumulate gradients with per-model spatial weights.
+    /// model_weights[j] is the FN penalty for model j (higher = more important).
+    pub fn accumulateGradients(self: *MLP, pos: Vec3, p: [6]f32, target: []const u8, model_weights: []const f32) f32 {
+        const input = self.buildInput(pos, p);
         const h = self.hidden_size;
         const o = self.output_size;
 
-        // Compute deltas
-
+        // Output deltas with per-model weighting
         var loss: f32 = 0;
         for (0..o) |j| {
             const t: f32 = if (bitsetGet(target, j)) 1.0 else 0.0;
-            const p = self.out[j];
-            const w = if (t > 0.5) pos_weight else 1.0;
-            self.d3[j] = w * (p - t);
-            const cp = std.math.clamp(p, 1e-7, 1.0 - 1e-7);
+            const pred = self.out[j];
+            const w = if (t > 0.5) model_weights[j] else 1.0;
+            self.d3[j] = w * (pred - t);
+            const cp = std.math.clamp(pred, 1e-7, 1.0 - 1e-7);
             loss -= w * (t * @log(cp) + (1.0 - t) * @log(1.0 - cp));
         }
 
+        // Hidden deltas
         for (0..h) |k| {
             var sum: f32 = 0;
-            for (0..o) |j| {
-                sum += self.w3[k * o + j] * self.d3[j];
-            }
+            for (0..o) |j| sum += self.w3[k * o + j] * self.d3[j];
             self.d2[k] = sum * leakyReluDeriv(self.z2[k]);
         }
-
         for (0..h) |k| {
             var sum: f32 = 0;
-            for (0..h) |j| {
-                sum += self.w2[k * h + j] * self.d2[j];
-            }
+            for (0..h) |j| sum += self.w2[k * h + j] * self.d2[j];
             self.d1[k] = sum * leakyReluDeriv(self.z1[k]);
         }
 
-        // Accumulate gradients (add, not replace)
+        // Accumulate gradients
+        for (0..h) |k| for (0..o) |j| {
+            self.gw3[k * o + j] += self.a2[k] * self.d3[j];
+        };
+        for (0..o) |j| self.gb3[j] += self.d3[j];
 
-        // Layer 3
-        for (0..h) |k| {
-            for (0..o) |j| {
-                self.gw3[k * o + j] += self.a2[k] * self.d3[j];
-            }
-        }
-        for (0..o) |j| {
-            self.gb3[j] += self.d3[j];
-        }
+        for (0..h) |k| for (0..h) |j| {
+            self.gw2[k * h + j] += self.a1[k] * self.d2[j];
+        };
+        for (0..h) |j| self.gb2[j] += self.d2[j];
 
-        // Layer 2
-        for (0..h) |k| {
-            for (0..h) |j| {
-                self.gw2[k * h + j] += self.a1[k] * self.d2[j];
-            }
-        }
-        for (0..h) |j| {
-            self.gb2[j] += self.d2[j];
-        }
-
-        // Layer 1
         inline for (0..INPUT_SIZE) |k| {
-            for (0..h) |j| {
-                self.gw1[k * h + j] += input[k] * self.d1[j];
-            }
+            for (0..h) |j| self.gw1[k * h + j] += input[k] * self.d1[j];
         }
-        for (0..h) |j| {
-            self.gb1[j] += self.d1[j];
-        }
+        for (0..h) |j| self.gb1[j] += self.d1[j];
 
         return loss;
     }
 
-    /// Apply accumulated gradients via Adam, then zero gradient buffers.
     pub fn applyAdam(self: *MLP, lr: f32, batch_size: f32) void {
         self.adam_t += 1;
         const t_f: f32 = @floatFromInt(self.adam_t);
@@ -606,11 +612,11 @@ pub const MLP = struct {
             const m_hat = mi.* / (1.0 - beta1_t);
             const v_hat = vi.* / (1.0 - beta2_t);
             wi.* -= lr * m_hat / (@sqrt(v_hat) + adam_eps);
-            gi.* = 0; // zero for next batch
+            gi.* = 0;
         }
     }
 
-    /// Save weights to binary file (NPVS v2 format).
+    /// Save weights (NPVS v3 format: frustum-integrated).
     pub fn save(self: *const MLP, path: []const u8) !void {
         var file = try std.fs.cwd().createFile(path, .{});
         defer file.close();
@@ -618,27 +624,26 @@ pub const MLP = struct {
         const w = bw.writer();
 
         try w.writeAll("NPVS");
-        try w.writeInt(u32, 2, .little); // version 2: direction-aware
+        try w.writeInt(u32, 3, .little); // version 3: frustum-integrated
         try w.writeInt(u32, INPUT_SIZE, .little);
         try w.writeInt(u32, self.hidden_size, .little);
         try w.writeInt(u32, self.output_size, .little);
-        for (self.pos_min) |v| try w.writeInt(u32, @bitCast(v), .little);
+        for (self.pos_min) |val| try w.writeInt(u32, @bitCast(val), .little);
         for (0..3) |i| {
             const max_v = self.pos_min[i] + 1.0 / self.pos_scale[i];
             try w.writeInt(u32, @bitCast(max_v), .little);
         }
 
-        for (self.w1) |v| try w.writeInt(u32, @bitCast(v), .little);
-        for (self.b1) |v| try w.writeInt(u32, @bitCast(v), .little);
-        for (self.w2) |v| try w.writeInt(u32, @bitCast(v), .little);
-        for (self.b2) |v| try w.writeInt(u32, @bitCast(v), .little);
-        for (self.w3) |v| try w.writeInt(u32, @bitCast(v), .little);
-        for (self.b3) |v| try w.writeInt(u32, @bitCast(v), .little);
+        for (self.w1) |val| try w.writeInt(u32, @bitCast(val), .little);
+        for (self.b1) |val| try w.writeInt(u32, @bitCast(val), .little);
+        for (self.w2) |val| try w.writeInt(u32, @bitCast(val), .little);
+        for (self.b2) |val| try w.writeInt(u32, @bitCast(val), .little);
+        for (self.w3) |val| try w.writeInt(u32, @bitCast(val), .little);
+        for (self.b3) |val| try w.writeInt(u32, @bitCast(val), .little);
 
         try bw.flush();
     }
 
-    /// Load weights from binary file.
     pub fn load(allocator: Allocator, path: []const u8) !MLP {
         const file = try std.fs.cwd().openFile(path, .{});
         defer file.close();
@@ -650,7 +655,7 @@ pub const MLP = struct {
         if (!std.mem.eql(u8, &magic, "NPVS")) return error.InvalidMagic;
 
         const version = try reader.readInt(u32, .little);
-        if (version != 2) return error.UnsupportedVersion;
+        if (version != 3) return error.UnsupportedVersion;
 
         const input_size = try reader.readInt(u32, .little);
         if (input_size != INPUT_SIZE) return error.InputSizeMismatch;
@@ -658,30 +663,22 @@ pub const MLP = struct {
         const hidden = try reader.readInt(u32, .little);
         const output = try reader.readInt(u32, .little);
 
-        var pos_min: Vec3 = undefined;
-        var pos_max: Vec3 = undefined;
-        for (&pos_min) |*v| v.* = @bitCast(try reader.readInt(u32, .little));
-        for (&pos_max) |*v| v.* = @bitCast(try reader.readInt(u32, .little));
+        var pm: Vec3 = undefined;
+        var px: Vec3 = undefined;
+        for (&pm) |*val| val.* = @bitCast(try reader.readInt(u32, .little));
+        for (&px) |*val| val.* = @bitCast(try reader.readInt(u32, .little));
 
-        var mlp = try MLP.init(allocator, output, hidden, pos_min, pos_max);
+        var mlp = try MLP.init(allocator, output, hidden, pm, px);
         errdefer mlp.deinit();
 
-        for (mlp.w1) |*v| v.* = @bitCast(try reader.readInt(u32, .little));
-        for (mlp.b1) |*v| v.* = @bitCast(try reader.readInt(u32, .little));
-        for (mlp.w2) |*v| v.* = @bitCast(try reader.readInt(u32, .little));
-        for (mlp.b2) |*v| v.* = @bitCast(try reader.readInt(u32, .little));
-        for (mlp.w3) |*v| v.* = @bitCast(try reader.readInt(u32, .little));
-        for (mlp.b3) |*v| v.* = @bitCast(try reader.readInt(u32, .little));
+        for (mlp.w1) |*val| val.* = @bitCast(try reader.readInt(u32, .little));
+        for (mlp.b1) |*val| val.* = @bitCast(try reader.readInt(u32, .little));
+        for (mlp.w2) |*val| val.* = @bitCast(try reader.readInt(u32, .little));
+        for (mlp.b2) |*val| val.* = @bitCast(try reader.readInt(u32, .little));
+        for (mlp.w3) |*val| val.* = @bitCast(try reader.readInt(u32, .little));
+        for (mlp.b3) |*val| val.* = @bitCast(try reader.readInt(u32, .little));
 
         return mlp;
-    }
-
-    /// Evaluate at runtime: returns model visibility flags.
-    pub fn evaluate(self: *MLP, pos: Vec3, dir: [2]f32, flags: []bool, threshold: f32) void {
-        _ = self.forward(pos, dir);
-        for (flags, 0..) |*f, i| {
-            f.* = if (i < self.out.len) self.out[i] > threshold else true;
-        }
     }
 };
 
@@ -689,16 +686,21 @@ pub const MLP = struct {
 
 pub const TrainConfig = struct {
     epochs: u32 = 100,
-    learning_rate: f32 = 0.001, // Adam LR — can be higher with mini-batch
+    learning_rate: f32 = 0.001,
     batch_size: u32 = 32,
     hidden_size: u32 = 256,
     eval_threshold: f32 = 0.3,
+    // Spatial loss weighting
+    center_boost: f32 = 2.0, // extra FN penalty for center-of-view models
+    near_boost: f32 = 2.0, // extra FN penalty for nearby models
+    ref_dist: f32 = 5.0, // distance reference (meters in world coords)
 };
 
-/// Train MLP on direction-aware training data.
+/// Train MLP on frustum-aware training data with spatial loss weighting.
 pub fn train(
     allocator: Allocator,
     data: *const TrainingData,
+    model_centroids: []const Vec3,
     pos_min: Vec3,
     pos_max: Vec3,
     config: TrainConfig,
@@ -710,20 +712,20 @@ pub fn train(
     const n = data.num_samples;
     if (n == 0) return mlp;
 
-    // Compute class-balanced positive weight
+    // Compute base class-balanced weight
     var total_pos: u64 = 0;
     const total_samples_models: u64 = @as(u64, n) * data.num_models;
-    for (data.labels[0..n]) |label| {
-        total_pos += bitsetCount(label);
-    }
+    for (data.labels[0..n]) |label| total_pos += bitsetCount(label);
     const total_neg = total_samples_models - total_pos;
-    const pos_weight: f32 = if (total_pos > 0)
-        @as(f32, @floatFromInt(total_neg)) / @as(f32, @floatFromInt(total_pos))
-    else
-        1.0;
-    const capped_weight = @min(pos_weight, 5.0);
+    const base_weight: f32 = @min(
+        if (total_pos > 0) @as(f32, @floatFromInt(total_neg)) / @as(f32, @floatFromInt(total_pos)) else 1.0,
+        5.0,
+    );
 
-    // Shuffle indices
+    // Per-model weight buffer (reused each sample)
+    const model_weights = try allocator.alloc(f32, data.num_models);
+    defer allocator.free(model_weights);
+
     const indices = try allocator.alloc(u32, n);
     defer allocator.free(indices);
     for (0..n) |i| indices[i] = @intCast(i);
@@ -732,19 +734,18 @@ pub fn train(
         config.hidden_size * config.hidden_size + config.hidden_size +
         config.hidden_size * data.num_models + data.num_models;
 
-    try stdout.print("  Training MLP (Adam + LeakyReLU + mini-batch + direction-aware)\n", .{});
-    try stdout.print("  Input: {d} (x,y,z,sin_yaw,cos_yaw), H={d}, Output: {d}\n", .{
+    try stdout.print("  Training MLP (frustum-integrated, spatial+distance weighted)\n", .{});
+    try stdout.print("  Input: {d} (pos+yaw+pitch+vfov+aspect), H={d}, Output: {d}\n", .{
         INPUT_SIZE, config.hidden_size, data.num_models,
     });
     try stdout.print("  Samples: {d}, Epochs: {d}, lr={d:.4}, batch={d}, params={d}\n", .{
         n, config.epochs, config.learning_rate, config.batch_size, num_params,
     });
-    try stdout.print("  pos_weight={d:.1} (auto from {d}/{d} pos/neg)\n", .{
-        capped_weight, total_pos, total_neg,
+    try stdout.print("  base_weight={d:.1}, center_boost={d:.1}, near_boost={d:.1}, ref_dist={d:.1}\n", .{
+        base_weight, config.center_boost, config.near_boost, config.ref_dist,
     });
 
     const bs = config.batch_size;
-    const bs_f: f32 = @floatFromInt(bs);
 
     for (0..config.epochs) |epoch| {
         shuffle(indices, std.crypto.random);
@@ -753,23 +754,31 @@ pub fn train(
         var batch_count: u32 = 0;
 
         for (indices, 0..) |idx, si| {
-            _ = mlp.forward(data.positions[idx], data.directions[idx]);
-            const loss = mlp.accumulateGradients(
+            const p = data.params[idx];
+            const look_dir = lookDirFromAngles(p[0], p[1], p[2], p[3]);
+
+            // Compute per-model spatial + distance weights
+            computeSpatialWeights(
+                model_weights,
                 data.positions[idx],
-                data.directions[idx],
-                data.labels[idx],
-                capped_weight,
+                look_dir,
+                model_centroids,
+                base_weight,
+                config.center_boost,
+                config.near_boost,
+                config.ref_dist,
             );
+
+            _ = mlp.forward(data.positions[idx], p);
+            const loss = mlp.accumulateGradients(data.positions[idx], p, data.labels[idx], model_weights);
             epoch_loss += loss;
             batch_count += 1;
 
-            // Apply Adam update at end of each mini-batch
             if (batch_count >= bs or si == indices.len - 1) {
                 mlp.applyAdam(config.learning_rate, @floatFromInt(batch_count));
                 batch_count = 0;
             }
         }
-        _ = bs_f;
 
         if (epoch % 10 == 0 or epoch == config.epochs - 1) {
             var eval_fn: u64 = 0;
@@ -778,7 +787,7 @@ pub fn train(
             var eval_neg: u64 = 0;
 
             for (0..n) |i| {
-                _ = mlp.forward(data.positions[i], data.directions[i]);
+                _ = mlp.forward(data.positions[i], data.params[i]);
                 for (0..data.num_models) |j| {
                     const actual = bitsetGet(data.labels[i], j);
                     const predicted = mlp.out[j] > config.eval_threshold;
