@@ -257,10 +257,144 @@ Keep the current omnidirectional graph for GI probe transport — it's correct f
 - Visible models/cell: min=22, max=457, avg=292 (56% — too high, needs camera-based rays)
 - Runtime file: 482KB (`_pvs_runtime.bin`)
 
+## Session 4: Neural PVS (2026-04-09)
+
+### The Idea
+
+Christian proposed replacing the cell-based bitset PVS with a neural learned visibility
+model — a small MLP that predicts which models are visible from any camera state. The key
+insight: instead of engineering the perfect ray heuristic, *learn* the visibility function
+directly from ray-traced ground truth. "Like a neural, spatially aware bloom filter."
+
+### Evolution (4 iterations in one session)
+
+**v1 — Position-only (3 inputs), online SGD**: Collapsed immediately. Loss diverged,
+network died from ReLU death + online SGD noise with 518 outputs. The class imbalance
+(~42/518 models visible per sample) overwhelmed the gradient signal.
+
+**v2 — Direction-aware (5 inputs: x,y,z,sin_yaw,cos_yaw)**: Christian's suggestion to add
+yaw as sin/cos encoding (avoids 0/360 wrap discontinuity). Cone sampling (~100 FOV) instead
+of omnidirectional rays. Loss decreased initially but oscillated — online SGD still too noisy
+with 518 outputs.
+
+**v3 — Mini-batch Adam (batch=32)**: The fix. Accumulate gradients over 32 samples before
+applying Adam update. Smooth monotonic convergence: loss 214→91, FN 16.6%→5.1%, FP 11.2%→7.2%.
+89% of models culled. First working neural PVS — 60 FPS in debug build.
+
+**v4 — Frustum-integrated (9 inputs: +pitch, vfov, aspect)**: Christian's next insight: if
+the network knows the frustum shape, it can learn BOTH occlusion AND frustum culling. No more
+per-model AABB loop. Added spatial + distance weighted loss (Christian's idea: center/near
+geometry penalized more for false negatives than distant/peripheral). Result: O(1) combined
+PVS + frustum visibility. 0 frustum culled in HUD — the MLP IS the draw list.
+
+### Architecture
+
+```
+Input (9 floats):
+  x, y, z          — position (normalized to [0,1] in world AABB)
+  sin_yaw, cos_yaw  — horizontal look direction
+  sin_pitch, cos_pitch — vertical look direction
+  vfov_norm         — vertical field of view (normalized)
+  aspect_norm       — aspect ratio (normalized)
+
+MLP:
+  Layer 1: 9 → 256 (LeakyReLU)
+  Layer 2: 256 → 256 (LeakyReLU)
+  Layer 3: 256 → 518 (sigmoid)  — one output per model
+
+Training:
+  - 20K samples, random (position, yaw, pitch, vfov, aspect)
+  - Ray bundles within frustum pyramid (not cone)
+  - Adaptive refinement: 6 child rays at hit triangle verts + edge midpoints
+  - Mini-batch Adam (batch=32, lr=0.001)
+  - Class-balanced loss (auto-weighted from label statistics)
+  - Spatial loss: FN penalty scaled by angular distance from center + distance from camera
+  - 100 epochs, ~12 minutes total bake
+
+Output:
+  - NPVS v3 binary: 788KB (201K parameters)
+  - Per-model visibility probability [0,1]
+  - Runtime: single forward pass when camera moves/turns
+```
+
+### Key Design Decisions
+
+1. **Sin/cos encoding for angles** — avoids discontinuity at 0/360. The network sees
+   smooth inputs where similar angles produce similar encodings.
+
+2. **Frustum as input, not assumption** — vfov and aspect are network inputs, not baked
+   constants. Change FOV (zoom scope, ultrawide) at runtime and culling adapts.
+
+3. **Spatial loss weighting** — penalize false negatives more for center-of-view and nearby
+   models. Missing geometry dead center at 2m is jarring. Missing a distant building at the
+   FOV edge is invisible. The network spends its capacity where it matters.
+
+4. **Mini-batch not online SGD** — with 518 outputs, each sample's gradient is dominated by
+   the ~495 negative (invisible) models. Averaging over 32 samples smooths the gradient
+   direction. This was the critical fix for convergence.
+
+5. **LeakyReLU not ReLU** — prevents dead neurons. With large gradients early in training,
+   standard ReLU neurons can go permanently negative and never recover.
+
+6. **Bloom filter bias** — false positives (drawing extra models) are safe. False negatives
+   (missing visible models) cause holes. The loss asymmetry ensures the network errs toward
+   over-drawing rather than under-drawing.
+
+### Training Convergence (Dust II, v4)
+
+```
+Epoch    0: loss=230.84, FN=9.12%, FP=14.9%
+Epoch   10: loss=142.13, FN=5.50%, FP=11.8%
+Epoch   20: loss=131.96, FN=5.25%, FP=10.5%
+Epoch   30: loss=126.51, FN=4.52%, FP=10.3%
+Epoch   50: loss=120.11, FN=4.21%, FP=9.7%
+Epoch   70: loss=116.13, FN=3.57%, FP=9.5%
+Epoch   99: loss=112.16, FN=3.58%, FP=8.9%
+```
+
+### Runtime Performance
+
+- **O(1) visibility**: single MLP forward pass (~50µs), no AABB iteration
+- **0 frustum culled**: MLP handles frustum, not the renderer
+- **12-38/518 models drawn** depending on view (vs 292/518 with cell-based)
+- **60 FPS debug build** on Dust II
+- **Updates only on camera movement** (>0.5 units) or turn (>~10 degrees)
+- **788KB** weight file (vs 482KB for cell-based bitsets, but does far more)
+
+### Files
+
+| File | Purpose |
+|------|---------|
+| `importers/src/pvs_neural.zig` | MLP architecture, training, frustum sampling, spatial loss, NPVS format |
+| `importers/src/pvs_baker.zig` | Neural training phase, model centroid computation |
+| `importers/build.zig` | pvs_neural module |
+| `ac/src/source2_pvs.zig` | NeuralPVS runtime inference (9-input, v3 format) |
+| `ac/src/main.zig` | O(1) draw loop, camera state extraction |
+| `ac/src/source2_import.zig` | NPVS file loading |
+| `ac/src/gltf_import.zig` | s2_neural_pvs field |
+
+### What Was Removed
+
+The cell-based bitset PVS system (PVSRenderer, PVR2 format, nearest-centroid cell lookup,
+per-cell model bitsets, _models.txt name matching) was fully removed from the renderer.
+The transport graph and probes remain for GI.
+
+### Future Directions
+
+- **Expose probabilities to renderer** — raw sigmoid outputs for LOD selection, shadow map
+  priority, streaming decisions, temporal smoothing (fade-in instead of pop)
+- **CSM shadow network** — separate smaller MLP per cascade, inputs are light direction +
+  cascade bounds, outputs are shadow-casting model set
+- **More training data** — 50K-100K samples for tighter frustum boundary learning
+- **Larger hidden layers** — 384 or third hidden layer for sharper frustum edges
+- **Temporal coherence** — EMA smoothing of outputs across frames to eliminate popping
+- **Sound transport** — same omnidirectional graph, audio impulse responses instead of SH
+- **Baked GI probes** — load probe SH into ProbeManager SSBO/shader pipeline
+
 ## Next Steps
 
-- **Camera-based PVS rays**: viewpoint rays with angle constraints for accurate player visibility
-- **Empty cell handling**: inherit visibility from neighbors for camera in open space
+- **Probability-based rendering**: expose raw MLP outputs for LOD, priority, streaming
+- **CSM shadow cascades**: separate network per cascade
+- **Temporal smoothing**: EMA across frames to eliminate popping artifacts
 - **Baked GI probes into ProbeManager**: load `_probes_sh.bin` into existing SSBO/shader pipeline
 - **Compute shader port**: SH propagation on GPU for real-time dynamic GI
-- **Sound transport**: same omnidirectional graph, audio impulse responses instead of SH
