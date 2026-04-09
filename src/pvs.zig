@@ -959,7 +959,317 @@ pub fn propagateLight(
     }
 }
 
-// ── PVS Solver ──────────────────────────────────────────────────────────
+// ── BFS Walker Solver ───────────────────────────────────────────────────
+//
+// Discovers cell-to-cell connectivity via BFS expansion from each cell.
+// Instead of stochastic sampling, walkers expand outward through spatial
+// neighbors.  A few rays per candidate pair — one hit confirms connection,
+// records graph distance, and expands the frontier.  Walls block BFS
+// expansion, pruning entire subtrees of unreachable cells.
+//
+// Much faster than stochastic: confirmed pairs are done immediately,
+// occluded subtrees are never tested.  Graph distance falls out for free.
+
+pub const WalkerConfig = struct {
+    /// Number of worker threads (0 = auto-detect).
+    thread_count: u32 = 0,
+    /// Maximum ray distance.
+    max_ray_distance: f32 = 2000.0,
+    /// Maximum BFS depth (graph hops from source cell).
+    max_depth: u32 = 50,
+    /// Number of rays to shoot per candidate cell pair.
+    /// One hit = confirmed connected, stop early.
+    rays_per_pair: u32 = 8,
+    /// Maximum gap between cell AABBs to be considered spatial neighbors.
+    neighbor_gap: f32 = 2.0,
+    /// Cluster size as power-of-2 shift (for visibility bitmap granularity).
+    cluster_shift: u5 = 0,
+    /// Progress callback.
+    progress_fn: ?*const fn (cells_done: u32, total_cells: u32, connections: u64) void = null,
+};
+
+pub const WalkerSolver = struct {
+    // Scene data
+    positions: []const [3]f32,
+    indices: []const u32,
+    tri_count: u32,
+    cluster_count: u32,
+
+    // Cell info
+    cell_ranges: []const CellRange,
+    cell_centroids: []const [3]f32,
+    cell_mins: []const [3]f32,
+    cell_maxs: []const [3]f32,
+    num_cells: u32,
+
+    // Spatial adjacency (precomputed)
+    adjacency: [][]u32,
+
+    // BIVH interface
+    trace_fn: TraceFn,
+    trace_ctx: *anyopaque,
+
+    // Outputs
+    transport: TransportGraph,
+    distances: []Atomic(u16), // graph distance per edge (u16 = max 65535 hops)
+
+    // Config
+    config: WalkerConfig,
+    allocator: Allocator,
+
+    // Progress
+    cells_done: Atomic(u32),
+
+    pub fn init(
+        allocator: Allocator,
+        positions: []const [3]f32,
+        indices: []const u32,
+        cell_ranges: []const CellRange,
+        cell_centroids: []const [3]f32,
+        cell_mins: []const [3]f32,
+        cell_maxs: []const [3]f32,
+        trace_fn: TraceFn,
+        trace_ctx: *anyopaque,
+        config: WalkerConfig,
+    ) !WalkerSolver {
+        const tri_count: u32 = @intCast(indices.len / 3);
+        const num_cells: u32 = @intCast(cell_ranges.len);
+        const cluster_count = (tri_count >> config.cluster_shift) +
+            @as(u32, if (tri_count & ((@as(u32, 1) << config.cluster_shift) - 1) != 0) 1 else 0);
+
+        var transport = try TransportGraph.init(allocator, num_cells);
+        errdefer transport.deinit();
+
+        const n: u64 = num_cells;
+        const edge_count = n * (n - 1) / 2;
+        const distances = try allocator.alloc(Atomic(u16), edge_count);
+        for (distances) |*d| d.raw = std.math.maxInt(u16);
+
+        // Precompute spatial adjacency
+        const adjacency = try buildAdjacency(allocator, cell_mins, cell_maxs, num_cells, config.neighbor_gap);
+
+        return .{
+            .positions = positions,
+            .indices = indices,
+            .tri_count = tri_count,
+            .cluster_count = cluster_count,
+            .cell_ranges = cell_ranges,
+            .cell_centroids = cell_centroids,
+            .cell_mins = cell_mins,
+            .cell_maxs = cell_maxs,
+            .num_cells = num_cells,
+            .adjacency = adjacency,
+            .trace_fn = trace_fn,
+            .trace_ctx = trace_ctx,
+            .transport = transport,
+            .distances = distances,
+            .config = config,
+            .allocator = allocator,
+            .cells_done = Atomic(u32).init(0),
+        };
+    }
+
+    pub fn deinit(self: *WalkerSolver) void {
+        self.transport.deinit();
+        self.allocator.free(self.distances);
+        for (self.adjacency) |adj| self.allocator.free(adj);
+        self.allocator.free(self.adjacency);
+    }
+
+    /// Run BFS walkers from all cells in parallel.
+    pub fn solve(self: *WalkerSolver) !void {
+        const num_threads = if (self.config.thread_count > 0)
+            self.config.thread_count
+        else
+            @as(u32, @intCast(Thread.getCpuCount() catch 4));
+
+        const threads = try self.allocator.alloc(Thread, num_threads);
+        defer self.allocator.free(threads);
+
+        for (threads, 0..) |*t, i| {
+            t.* = try Thread.spawn(.{}, workerThread, .{ self, @as(u32, @intCast(i)), num_threads });
+        }
+        for (threads) |t| t.join();
+    }
+
+    fn workerThread(self: *WalkerSolver, thread_id: u32, num_threads: u32) void {
+        // Each thread walks a strided subset of cells
+        var seed: u64 = @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())));
+        seed ^= @as(u64, thread_id) * 0x9E3779B97F4A7C15;
+        var prng = std.Random.DefaultPrng.init(seed);
+        const rng = prng.random();
+
+        // Per-thread BFS queue and visited set (reused across cells)
+        var queue = std.ArrayList(u32).init(self.allocator);
+        defer queue.deinit();
+        const depth_map = self.allocator.alloc(u16, self.num_cells) catch return;
+        defer self.allocator.free(depth_map);
+
+        var cell_idx = thread_id;
+        while (cell_idx < self.num_cells) : (cell_idx += num_threads) {
+            self.walkFromCell(cell_idx, rng, &queue, depth_map);
+
+            const done = self.cells_done.fetchAdd(1, .monotonic) + 1;
+            if (self.config.progress_fn) |progress| {
+                if (done % 100 == 0 or done == self.num_cells) {
+                    progress(done, self.num_cells, self.transport.connectedEdges());
+                }
+            }
+        }
+    }
+
+    fn walkFromCell(self: *WalkerSolver, source: u32, rng: std.Random, queue: *std.ArrayList(u32), depth_map: []u16) void {
+        @memset(depth_map, std.math.maxInt(u16));
+        depth_map[source] = 0;
+
+        queue.clearRetainingCapacity();
+        queue.append(source) catch return;
+
+        var head: usize = 0;
+
+        while (head < queue.items.len) {
+            const current = queue.items[head];
+            head += 1;
+
+            const current_depth = depth_map[current];
+            if (current_depth >= self.config.max_depth) continue;
+
+            // Expand to spatial neighbors of current
+            for (self.adjacency[current]) |neighbor| {
+                if (depth_map[neighbor] != std.math.maxInt(u16)) continue; // already visited
+
+                // Already confirmed connected by another walker?
+                const edge = self.transport.getEdge(source, neighbor);
+                if (edge.hits.load(.monotonic) > 0) {
+                    // Already known connected — still expand through it
+                    depth_map[neighbor] = current_depth + 1;
+                    queue.append(neighbor) catch continue;
+                    continue;
+                }
+
+                // Shoot rays from source cell to this neighbor
+                const connected = self.testConnectivity(source, neighbor, rng);
+
+                if (connected) {
+                    depth_map[neighbor] = current_depth + 1;
+
+                    // Record graph distance (keep minimum)
+                    const dist_idx = self.transport.edgeIndex(source, neighbor);
+                    const old_dist = self.distances[dist_idx].load(.monotonic);
+                    if (current_depth + 1 < old_dist) {
+                        self.distances[dist_idx].store(current_depth + 1, .monotonic);
+                    }
+
+                    // Expand frontier through this connected cell
+                    queue.append(neighbor) catch continue;
+                } else {
+                    // Mark as tested but not connected (don't expand)
+                    depth_map[neighbor] = std.math.maxInt(u16) - 1; // visited-but-blocked sentinel
+                }
+            }
+        }
+    }
+
+    /// Shoot a few rays between two cells. Returns true if ANY ray connects.
+    fn testConnectivity(self: *WalkerSolver, cell_a: u32, cell_b: u32, rng: std.Random) bool {
+        const range_a = self.cell_ranges[cell_a];
+        const range_b = self.cell_ranges[cell_b];
+        if (range_a.start_tri >= range_a.end_tri) return false;
+        if (range_b.start_tri >= range_b.end_tri) return false;
+
+        for (0..self.config.rays_per_pair) |_| {
+            const tri_a = rng.intRangeLessThan(u32, range_a.start_tri, range_a.end_tri);
+            const tri_b = rng.intRangeLessThan(u32, range_b.start_tri, range_b.end_tri);
+
+            const p1 = randomPointOnTriangle(self.positions, self.indices, tri_a, rng);
+            const p2 = randomPointOnTriangle(self.positions, self.indices, tri_b, rng);
+
+            const dir = vec3Sub(p2, p1);
+            const dist = vec3Length(dir);
+            if (dist < 1e-6 or dist > self.config.max_ray_distance) continue;
+
+            const norm_dir = vec3Scale(dir, 1.0 / dist);
+
+            // Record the cast
+            self.transport.recordCast(cell_a, cell_b);
+
+            const result = self.trace_fn(self.trace_ctx, p1, norm_dir, dist + 0.01);
+
+            // Check if ray reached cell_b's triangle (or close to it)
+            const reached = !result.hit or
+                result.primitive == @as(i32, @intCast(tri_b)) or
+                result.distance >= dist - 0.01;
+
+            if (reached) {
+                self.transport.recordHit(cell_a, cell_b);
+                return true; // One hit is enough!
+            }
+        }
+
+        return false;
+    }
+
+    pub fn stats(self: *const WalkerSolver) SolveStats {
+        var total_visible: u64 = 0;
+        var min_visible: u32 = std.math.maxInt(u32);
+        var max_visible: u32 = 0;
+
+        // Count connections per cell
+        for (0..self.num_cells) |i| {
+            var count: u32 = 0;
+            for (0..self.num_cells) |j| {
+                if (i == j) continue;
+                const edge = self.transport.getEdge(@intCast(i), @intCast(j));
+                if (edge.hits.load(.monotonic) > 0) count += 1;
+            }
+            total_visible += count;
+            min_visible = @min(min_visible, count);
+            max_visible = @max(max_visible, count);
+        }
+
+        return .{
+            .passes = self.cells_done.load(.monotonic),
+            .active_cells = self.num_cells,
+            .total_visible = total_visible,
+            .avg_visible = if (self.num_cells > 0) total_visible / self.num_cells else 0,
+            .min_visible = if (self.num_cells > 0) min_visible else 0,
+            .max_visible = max_visible,
+            .transport_casts = self.transport.totalCasts(),
+            .transport_edges = self.transport.connectedEdges(),
+        };
+    }
+
+    /// Precompute spatial adjacency from cell AABBs.
+    fn buildAdjacency(allocator: Allocator, mins: []const [3]f32, maxs: []const [3]f32, num_cells: u32, gap: f32) ![][]u32 {
+        const adj = try allocator.alloc([]u32, num_cells);
+        errdefer {
+            for (adj) |a| if (a.len > 0) allocator.free(a);
+            allocator.free(adj);
+        }
+
+        for (0..num_cells) |i| {
+            var neighbors = std.ArrayList(u32).init(allocator);
+            errdefer neighbors.deinit();
+
+            for (0..num_cells) |j| {
+                if (i == j) continue;
+                // Check if AABBs overlap or are within gap distance
+                const overlaps =
+                    mins[i][0] <= maxs[j][0] + gap and maxs[i][0] >= mins[j][0] - gap and
+                    mins[i][1] <= maxs[j][1] + gap and maxs[i][1] >= mins[j][1] - gap and
+                    mins[i][2] <= maxs[j][2] + gap and maxs[i][2] >= mins[j][2] - gap;
+
+                if (overlaps) try neighbors.append(@intCast(j));
+            }
+
+            adj[i] = try neighbors.toOwnedSlice();
+        }
+
+        return adj;
+    }
+};
+
+// ── Stochastic PVS Solver (v1) ──────────────────────────────────────────
 //
 // Importance-sampled PVS solver.  Instead of picking random triangles
 // from the full scene, we:
