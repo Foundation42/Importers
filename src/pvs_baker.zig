@@ -401,8 +401,151 @@ pub fn main() !void {
         prev_cell_node_indices = try allocator.dupe(u32, cell_node_indices.items);
     }
 
+    // ── Probe Placement ────────────────────────────────────────────────
+    //
+    // Use the final epoch's transport graph to find visibility islands
+    // and place GI probes at the transitions between them.
+
+    if (prev_transport) |*pt| {
+        if (prev_cluster_bivh) |*pcb| {
+            const final_cell_indices = prev_cell_node_indices.?;
+            const final_num_cells: u32 = @intCast(final_cell_indices.len);
+
+            try stdout.print("\n  ╔═══════════════════════════╗\n", .{});
+            try stdout.print("  ║    Probe Placement        ║\n", .{});
+            try stdout.print("  ╚═══════════════════════════╝\n", .{});
+
+            // Compute cell centroids for the final epoch
+            const final_centroids = try allocator.alloc(Vec3, final_num_cells);
+            defer allocator.free(final_centroids);
+            for (final_cell_indices, 0..) |node_idx, ci| {
+                const node = pcb.nodes[node_idx];
+                final_centroids[ci] = .{
+                    (node.min[0] + node.max[0]) * 0.5,
+                    (node.min[1] + node.max[1]) * 0.5,
+                    (node.min[2] + node.max[2]) * 0.5,
+                };
+            }
+
+            // Try a few thresholds to find meaningful island structure
+            const thresholds = [_]f32{ 0.05, 0.15, 0.25, 0.35 };
+            var best_threshold: f32 = 0.15;
+            var best_score: f32 = 0;
+
+            try stdout.writeAll("  Threshold scan:\n");
+            for (thresholds) |thresh| {
+                var test_islands = try pvs_mod.findIslands(allocator, pt, final_num_cells, thresh, 10);
+                defer test_islands.deinit();
+
+                // Score: prefer many islands with balanced sizes (entropy-like)
+                if (test_islands.num_islands > 1) {
+                    var score: f32 = 0;
+                    for (0..test_islands.num_islands) |isl| {
+                        var sz: u32 = 0;
+                        for (test_islands.island_ids[0..final_num_cells]) |id| {
+                            if (id == isl) sz += 1;
+                        }
+                        if (sz > 0) {
+                            const frac = @as(f32, @floatFromInt(sz)) / @as(f32, @floatFromInt(final_num_cells));
+                            score -= frac * @log(frac); // Shannon entropy
+                        }
+                    }
+                    try stdout.print("    {d:.0}%: {d} islands, {d} boundary, entropy={d:.2}\n", .{
+                        thresh * 100, test_islands.num_islands, test_islands.num_boundary, score,
+                    });
+                    if (score > best_score) {
+                        best_score = score;
+                        best_threshold = thresh;
+                    }
+                } else {
+                    try stdout.print("    {d:.0}%: 1 island (all connected)\n", .{thresh * 100});
+                }
+            }
+
+            try stdout.print("  Best threshold: {d:.0}% (entropy={d:.2})\n", .{ best_threshold * 100, best_score });
+
+            var islands = try pvs_mod.findIslands(allocator, pt, final_num_cells, best_threshold, 10);
+            defer islands.deinit();
+
+            try stdout.print("  Islands:    {d}\n", .{islands.num_islands});
+            try stdout.print("  Boundary:   {d} cells\n", .{islands.num_boundary});
+
+            // Print island sizes
+            {
+                const island_sizes = try allocator.alloc(u32, islands.num_islands);
+                defer allocator.free(island_sizes);
+                @memset(island_sizes, 0);
+                for (islands.island_ids[0..final_num_cells]) |id| island_sizes[id] += 1;
+
+                try stdout.writeAll("  Sizes:     ");
+                for (island_sizes, 0..) |sz, i| {
+                    if (i > 0) try stdout.writeAll(", ");
+                    if (i >= 20) {
+                        try stdout.print("... +{d} more", .{islands.num_islands - i});
+                        break;
+                    }
+                    try stdout.print("{d}", .{sz});
+                }
+                try stdout.writeAll("\n");
+            }
+
+            // Place probes: island interiors + transport gradient peaks
+            const island_probes = try pvs_mod.placeProbes(allocator, &islands, pt, final_centroids, final_num_cells);
+            defer allocator.free(island_probes);
+
+            const gradient_probes = try pvs_mod.findGradientProbes(allocator, pt, final_centroids, final_num_cells, 0.15);
+            defer allocator.free(gradient_probes);
+
+            // Merge into one list
+            var all_probes = std.ArrayList(pvs_mod.Probe).init(allocator);
+            defer all_probes.deinit();
+            try all_probes.appendSlice(island_probes);
+            try all_probes.appendSlice(gradient_probes);
+            const probes = all_probes.items;
+
+            var boundary_count: u32 = 0;
+            var interior_count: u32 = 0;
+            for (probes) |p| {
+                if (p.is_boundary) boundary_count += 1 else interior_count += 1;
+            }
+            try stdout.print("  Island probes:    {d} (interior)\n", .{interior_count});
+            try stdout.print("  Gradient probes:  {d} (transitions)\n", .{boundary_count});
+            try stdout.print("  Total probes:     {d}\n", .{probes.len});
+
+            // Visualize islands + probes
+            {
+                const island_path = try std.fmt.allocPrint(allocator, "{s}_islands.ppm", .{base_name});
+                defer allocator.free(island_path);
+                try writeIslandMap(allocator, &islands, probes, pcb, final_cell_indices, final_centroids, final_num_cells, world_min, world_max, island_path);
+                try stdout.print("  → {s}\n", .{island_path});
+            }
+
+            // Write probe positions to a simple text file
+            {
+                const probe_path = try std.fmt.allocPrint(allocator, "{s}_probes.txt", .{base_name});
+                defer allocator.free(probe_path);
+                var pf = try std.fs.cwd().createFile(probe_path, .{});
+                defer pf.close();
+                var pw = std.io.bufferedWriter(pf.writer());
+                const w = pw.writer();
+                try w.print("# PVS Probes: {d} total ({d} boundary, {d} interior)\n", .{ probes.len, boundary_count, interior_count });
+                try w.print("# Format: x y z island_id type\n", .{});
+                for (probes) |p| {
+                    try w.print("{d:.4} {d:.4} {d:.4} {d} {s}\n", .{
+                        p.position[0], p.position[1], p.position[2],
+                        p.island_id,
+                        if (p.is_boundary) "boundary" else "interior",
+                    });
+                }
+                try pw.flush();
+                try stdout.print("  → {s}\n", .{probe_path});
+            }
+        }
+    }
+
     if (prev_cell_node_indices) |pcni| allocator.free(pcni);
     if (prev_cluster_bivh) |*pcb| pcb.deinit();
+    if (prev_transport) |*pt| pt.deinit();
 
     const t_total = std.time.nanoTimestamp();
     try stdout.print("\n  ═══ Total time: {d}ms ═══\n", .{@divTrunc(t_total - t0, 1_000_000)});
@@ -930,4 +1073,109 @@ fn writeVisibilityDensity(
     _ = cluster_count;
 
     try writePpm(pixels, size, path);
+}
+
+fn writeIslandMap(
+    allocator: Allocator,
+    islands: *const pvs_mod.IslandResult,
+    probes: []const pvs_mod.Probe,
+    cluster_bivh: *const bivh_mod.Bivh,
+    cell_node_indices: []const u32,
+    cell_centroids: []const Vec3,
+    num_cells: u32,
+    world_min: [3]f32,
+    world_max: [3]f32,
+    path: []const u8,
+) !void {
+    const size = IMG_SIZE;
+    const pixels = try allocator.alloc(Color, size * size);
+    defer allocator.free(pixels);
+    @memset(pixels, Color{ .r = 15, .g = 15, .b = 20 });
+
+    // Distinct colors per island (golden ratio hue spread)
+    const island_colors = try allocator.alloc(Color, islands.num_islands);
+    defer allocator.free(island_colors);
+    for (0..islands.num_islands) |i| {
+        const hue = @as(f32, @floatFromInt(i)) * 0.618033988749895;
+        const h = hue - @floor(hue);
+        island_colors[i] = hsvToRgb(h, 0.7, 0.8);
+    }
+
+    // Draw cells colored by island
+    for (cell_node_indices[0..num_cells], 0..) |node_idx, ci| {
+        const node = cluster_bivh.nodes[node_idx];
+        const island = islands.island_ids[ci];
+        const color = island_colors[island];
+
+        const p_min = worldToPixel(node.min, world_min, world_max, size);
+        const p_max = worldToPixel(node.max, world_min, world_max, size);
+        fillRect(pixels, size, p_min.x, p_max.y, p_max.x, p_min.y, color);
+    }
+
+    // Draw cell outlines
+    for (cell_node_indices[0..num_cells]) |node_idx| {
+        const node = cluster_bivh.nodes[node_idx];
+        const p_min = worldToPixel(node.min, world_min, world_max, size);
+        const p_max = worldToPixel(node.max, world_min, world_max, size);
+        const outline = Color{ .r = 40, .g = 40, .b = 40 };
+        drawLine(pixels, size, p_min.x, p_max.y, p_max.x, p_max.y, outline, 1.0);
+        drawLine(pixels, size, p_max.x, p_max.y, p_max.x, p_min.y, outline, 1.0);
+        drawLine(pixels, size, p_max.x, p_min.y, p_min.x, p_min.y, outline, 1.0);
+        drawLine(pixels, size, p_min.x, p_min.y, p_min.x, p_max.y, outline, 1.0);
+    }
+
+    // Draw probes — boundary probes as white diamonds, interior as yellow circles
+    for (probes) |probe| {
+        const p = worldToPixel(probe.position, world_min, world_max, size);
+        if (probe.is_boundary) {
+            // White diamond for boundary probes
+            const s_half: i32 = 4;
+            drawLine(pixels, size, p.x, p.y - s_half, p.x + s_half, p.y, .{ .r = 255, .g = 255, .b = 255 }, 1.0);
+            drawLine(pixels, size, p.x + s_half, p.y, p.x, p.y + s_half, .{ .r = 255, .g = 255, .b = 255 }, 1.0);
+            drawLine(pixels, size, p.x, p.y + s_half, p.x - s_half, p.y, .{ .r = 255, .g = 255, .b = 255 }, 1.0);
+            drawLine(pixels, size, p.x - s_half, p.y, p.x, p.y - s_half, .{ .r = 255, .g = 255, .b = 255 }, 1.0);
+        } else {
+            // Yellow square for interior probes
+            fillRect(pixels, size, p.x - 3, p.y - 3, p.x + 3, p.y + 3, .{ .r = 255, .g = 255, .b = 0 });
+        }
+    }
+
+    // Mark boundary cells with a bright outline
+    for (islands.boundary_cells[0..islands.num_boundary]) |cell| {
+        const p = worldToPixel(cell_centroids[cell], world_min, world_max, size);
+        fillRect(pixels, size, p.x - 1, p.y - 1, p.x + 1, p.y + 1, .{ .r = 255, .g = 100, .b = 100 });
+    }
+
+    try writePpm(pixels, size, path);
+}
+
+fn hsvToRgb(h: f32, s: f32, v: f32) Color {
+    const c = v * s;
+    const hp = h * 6.0;
+    const x = c * (1.0 - @abs(@mod(hp, 2.0) - 1.0));
+    const m = v - c;
+
+    var r: f32 = 0;
+    var g: f32 = 0;
+    var b: f32 = 0;
+
+    if (hp < 1) {
+        r = c; g = x;
+    } else if (hp < 2) {
+        r = x; g = c;
+    } else if (hp < 3) {
+        g = c; b = x;
+    } else if (hp < 4) {
+        g = x; b = c;
+    } else if (hp < 5) {
+        r = x; b = c;
+    } else {
+        r = c; b = x;
+    }
+
+    return .{
+        .r = @intFromFloat((r + m) * 255),
+        .g = @intFromFloat((g + m) * 255),
+        .b = @intFromFloat((b + m) * 255),
+    };
 }

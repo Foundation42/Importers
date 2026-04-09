@@ -463,6 +463,262 @@ pub const TransportGraph = struct {
     }
 };
 
+// ── Visibility Islands & Probe Placement ────────────────────────────────
+//
+// Cluster cells into "visibility islands" — groups of cells that are
+// mutually well-connected.  The boundaries between islands are where
+// the visible environment changes most — doorways, windows, corners.
+// GI probes should be placed at these transitions.
+
+pub const IslandResult = struct {
+    /// Island ID per cell (0..num_islands-1).
+    island_ids: []u32,
+    num_islands: u32,
+    /// Cells that border multiple islands.
+    boundary_cells: []u32,
+    num_boundary: u32,
+    allocator: Allocator,
+
+    pub fn deinit(self: *IslandResult) void {
+        self.allocator.free(self.island_ids);
+        self.allocator.free(self.boundary_cells);
+    }
+};
+
+/// Find visibility islands via flood-fill on the thresholded transport graph.
+/// Two cells are "connected" if their transport probability > threshold.
+pub fn findIslands(
+    allocator: Allocator,
+    transport: *const TransportGraph,
+    num_cells: u32,
+    prob_threshold: f32,
+    min_casts: u32,
+) !IslandResult {
+    const island_ids = try allocator.alloc(u32, num_cells);
+    @memset(island_ids, std.math.maxInt(u32)); // unvisited sentinel
+
+    var current_island: u32 = 0;
+    var queue = std.ArrayList(u32).init(allocator);
+    defer queue.deinit();
+
+    // Flood-fill connected components
+    for (0..num_cells) |start| {
+        if (island_ids[start] != std.math.maxInt(u32)) continue;
+
+        // BFS from this unvisited cell
+        island_ids[start] = current_island;
+        queue.clearRetainingCapacity();
+        try queue.append(@intCast(start));
+
+        while (queue.items.len > 0) {
+            const cell = queue.orderedRemove(0);
+
+            // Visit all neighbors with P > threshold
+            for (0..num_cells) |j| {
+                if (j == cell) continue;
+                if (island_ids[j] != std.math.maxInt(u32)) continue;
+
+                const edge = transport.getEdge(cell, @intCast(j));
+                const casts = edge.casts.load(.monotonic);
+                if (casts < min_casts) continue;
+                const hits = edge.hits.load(.monotonic);
+                const prob = @as(f32, @floatFromInt(hits)) / @as(f32, @floatFromInt(casts));
+                if (prob >= prob_threshold) {
+                    island_ids[j] = current_island;
+                    try queue.append(@intCast(j));
+                }
+            }
+        }
+
+        current_island += 1;
+    }
+
+    // Find boundary cells — cells that have transport edges to cells in different islands
+    var boundary = std.ArrayList(u32).init(allocator);
+    errdefer boundary.deinit();
+
+    for (0..num_cells) |i| {
+        const my_island = island_ids[i];
+        var is_boundary = false;
+
+        for (0..num_cells) |j| {
+            if (i == j) continue;
+            if (island_ids[j] == my_island) continue;
+
+            // Check if there's ANY visibility between these cells
+            const edge = transport.getEdge(@intCast(i), @intCast(j));
+            if (edge.hits.load(.monotonic) > 0) {
+                is_boundary = true;
+                break;
+            }
+        }
+
+        if (is_boundary) try boundary.append(@intCast(i));
+    }
+
+    return .{
+        .island_ids = island_ids,
+        .num_islands = current_island,
+        .boundary_cells = try boundary.toOwnedSlice(),
+        .num_boundary = @intCast(boundary.items.len),
+        .allocator = allocator,
+    };
+}
+
+pub const Probe = struct {
+    position: [3]f32,
+    island_id: u32,
+    is_boundary: bool,
+};
+
+/// Place GI probes based on island analysis.
+/// - One probe at each boundary cell (lighting transitions)
+/// - One probe at the highest-connectivity cell per island (interior)
+pub fn placeProbes(
+    allocator: Allocator,
+    islands: *const IslandResult,
+    transport: *const TransportGraph,
+    cell_centroids: []const [3]f32,
+    num_cells: u32,
+) ![]Probe {
+    var probes = std.ArrayList(Probe).init(allocator);
+    errdefer probes.deinit();
+
+    // Boundary probes — one per boundary cell
+    for (islands.boundary_cells[0..islands.num_boundary]) |cell| {
+        probes.append(.{
+            .position = cell_centroids[cell],
+            .island_id = islands.island_ids[cell],
+            .is_boundary = true,
+        }) catch continue;
+    }
+
+    // Interior probes — find the best-connected cell per island
+    for (0..islands.num_islands) |island| {
+        var best_cell: u32 = 0;
+        var best_connectivity: u64 = 0;
+        var found = false;
+
+        for (0..num_cells) |ci| {
+            if (islands.island_ids[ci] != island) continue;
+
+            // Sum hit counts to all cells in the same island
+            var connectivity: u64 = 0;
+            for (0..num_cells) |cj| {
+                if (ci == cj) continue;
+                if (islands.island_ids[cj] != island) continue;
+                const edge = transport.getEdge(@intCast(ci), @intCast(cj));
+                connectivity += edge.hits.load(.monotonic);
+            }
+
+            if (connectivity > best_connectivity or !found) {
+                best_cell = @intCast(ci);
+                best_connectivity = connectivity;
+                found = true;
+            }
+        }
+
+        if (found) {
+            probes.append(.{
+                .position = cell_centroids[best_cell],
+                .island_id = @intCast(island),
+                .is_boundary = false,
+            }) catch continue;
+        }
+    }
+
+    return probes.toOwnedSlice();
+}
+
+/// Find probes at transport gradient peaks — where connectivity changes
+/// sharply between spatial neighbors.  These are doorways, windows,
+/// corners where the visible environment transitions.
+pub fn findGradientProbes(
+    allocator: Allocator,
+    transport: *const TransportGraph,
+    cell_centroids: []const [3]f32,
+    num_cells: u32,
+    gradient_threshold: f32,
+) ![]Probe {
+    // Step 1: Compute per-cell "openness" = total transport flow
+    const openness = try allocator.alloc(f32, num_cells);
+    defer allocator.free(openness);
+
+    for (0..num_cells) |i| {
+        var total: f64 = 0;
+        for (0..num_cells) |j| {
+            if (i == j) continue;
+            const edge = transport.getEdge(@intCast(i), @intCast(j));
+            total += @floatFromInt(edge.hits.load(.monotonic));
+        }
+        openness[i] = @floatCast(total);
+    }
+
+    // Normalize openness to [0, 1]
+    var max_open: f32 = 1.0;
+    for (openness) |v| max_open = @max(max_open, v);
+    for (openness) |*v| v.* /= max_open;
+
+    // Step 2: For each cell, compute gradient = max difference in openness
+    // to any spatially-connected neighbor (has transport > 0)
+    const gradient = try allocator.alloc(f32, num_cells);
+    defer allocator.free(gradient);
+
+    for (0..num_cells) |i| {
+        var max_diff: f32 = 0;
+        for (0..num_cells) |j| {
+            if (i == j) continue;
+            const edge = transport.getEdge(@intCast(i), @intCast(j));
+            if (edge.hits.load(.monotonic) == 0) continue;
+
+            // Only consider spatial neighbors (within reasonable distance)
+            const dx = cell_centroids[i][0] - cell_centroids[j][0];
+            const dy = cell_centroids[i][1] - cell_centroids[j][1];
+            const dz = cell_centroids[i][2] - cell_centroids[j][2];
+            const dist_sq = dx * dx + dy * dy + dz * dz;
+            // Skip very distant pairs — we want local gradient
+            if (dist_sq > 400.0) continue; // ~20m radius
+
+            const diff = @abs(openness[i] - openness[j]);
+            max_diff = @max(max_diff, diff);
+        }
+        gradient[i] = max_diff;
+    }
+
+    // Step 3: Find local maxima of the gradient above threshold
+    var probes = std.ArrayList(Probe).init(allocator);
+    errdefer probes.deinit();
+
+    for (0..num_cells) |i| {
+        if (gradient[i] < gradient_threshold) continue;
+
+        // Check if this is a local maximum (higher gradient than all
+        // nearby cells) — prevents clustering probes at the same doorway
+        var is_peak = true;
+        for (0..num_cells) |j| {
+            if (i == j) continue;
+            const dx = cell_centroids[i][0] - cell_centroids[j][0];
+            const dy = cell_centroids[i][1] - cell_centroids[j][1];
+            const dz = cell_centroids[i][2] - cell_centroids[j][2];
+            if (dx * dx + dy * dy + dz * dz > 100.0) continue; // ~10m radius
+            if (gradient[j] > gradient[i]) {
+                is_peak = false;
+                break;
+            }
+        }
+
+        if (is_peak) {
+            try probes.append(.{
+                .position = cell_centroids[i],
+                .island_id = 0,
+                .is_boundary = true,
+            });
+        }
+    }
+
+    return probes.toOwnedSlice();
+}
+
 // ── PVS Solver ──────────────────────────────────────────────────────────
 //
 // Importance-sampled PVS solver.  Instead of picking random triangles
