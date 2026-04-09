@@ -145,7 +145,7 @@ pub fn main() !void {
     // are nearby — clusters are naturally spatially coherent.
     // Build a second BIVH over cluster AABBs for view cell lookup.
 
-    const cluster_shift: u5 = 10; // clusters of 1024 triangles (~4400 clusters for Dust II)
+    const cluster_shift: u5 = 8; // clusters of 256 triangles (~17K clusters for Dust II)
     const cluster_size: u32 = @as(u32, 1) << cluster_shift;
     const cluster_count = (tri_count + cluster_size - 1) / cluster_size;
 
