@@ -540,6 +540,123 @@ pub fn main() !void {
                 try pw.flush();
                 try stdout.print("  → {s}\n", .{probe_path});
             }
+
+            // ── Visibility-Gated Probe Assignment ────────────────────────
+
+            try stdout.print("\n  ╔═══════════════════════════╗\n", .{});
+            try stdout.print("  ║  Probe Assignment (Gated) ║\n", .{});
+            try stdout.print("  ╚═══════════════════════════╝\n", .{});
+
+            // Compute cluster centroids and cell assignments for final epoch
+            const final_cluster_shift: u5 = epochs[epochs.len - 1].cluster_shift;
+            const final_cluster_size: u32 = @as(u32, 1) << final_cluster_shift;
+            const final_cluster_count = (tri_count + final_cluster_size - 1) / final_cluster_size;
+
+            const cluster_centroids = try allocator.alloc(Vec3, final_cluster_count);
+            defer allocator.free(cluster_centroids);
+            const cluster_cells = try allocator.alloc(u32, final_cluster_count);
+            defer allocator.free(cluster_cells);
+
+            for (0..final_cluster_count) |ci| {
+                const start_t = @as(u32, @intCast(ci)) * final_cluster_size;
+                const end_t = @min(start_t + final_cluster_size, tri_count);
+
+                // Compute cluster centroid from triangle centroids
+                var cx: f64 = 0;
+                var cy: f64 = 0;
+                var cz: f64 = 0;
+                var count: f64 = 0;
+                for (start_t..end_t) |ti| {
+                    const base = ti * 3;
+                    for (0..3) |vi| {
+                        const pos = all_positions.items[mesh_set.indices[base + vi]];
+                        cx += pos[0];
+                        cy += pos[1];
+                        cz += pos[2];
+                        count += 1;
+                    }
+                }
+                if (count > 0) {
+                    cluster_centroids[ci] = .{
+                        @floatCast(cx / count),
+                        @floatCast(cy / count),
+                        @floatCast(cz / count),
+                    };
+                } else {
+                    cluster_centroids[ci] = .{ 0, 0, 0 };
+                }
+
+                // Find which cell this cluster belongs to
+                if (pcb.findLeaf(cluster_centroids[ci], null)) |node_idx| {
+                    // Map BIVH node index → cell index
+                    var cell_idx: u32 = 0;
+                    for (final_cell_indices) |cni| {
+                        if (cni == node_idx) break;
+                        cell_idx += 1;
+                    }
+                    cluster_cells[ci] = @min(cell_idx, final_num_cells - 1);
+                } else {
+                    cluster_cells[ci] = 0;
+                }
+            }
+
+            // Find which cell each probe is in
+            const probe_cells = try allocator.alloc(u32, probes.len);
+            defer allocator.free(probe_cells);
+            for (probes, 0..) |probe, pi| {
+                if (pcb.findLeaf(probe.position, null)) |node_idx| {
+                    var cell_idx: u32 = 0;
+                    for (final_cell_indices) |cni| {
+                        if (cni == node_idx) break;
+                        cell_idx += 1;
+                    }
+                    probe_cells[pi] = @min(cell_idx, final_num_cells - 1);
+                } else {
+                    probe_cells[pi] = 0;
+                }
+            }
+
+            // Assign clusters to probes with visibility gating
+            var assignment = try pvs_mod.assignProbes(
+                allocator,
+                cluster_centroids,
+                cluster_cells,
+                final_cluster_count,
+                probes,
+                probe_cells,
+                pt,
+            );
+            defer assignment.deinit();
+
+            try stdout.print("  Clusters:     {d}\n", .{final_cluster_count});
+            try stdout.print("  Assigned:     {d} (gated)\n", .{assignment.assigned_count});
+            try stdout.print("  Fallback:     {d} (nearest, no visible probe)\n", .{assignment.fallback_count});
+
+            // Visualize: color each cluster by its assigned probe
+            {
+                const assign_path = try std.fmt.allocPrint(allocator, "{s}_probe_assign.ppm", .{base_name});
+                defer allocator.free(assign_path);
+                try writeProbeAssignment(allocator, &assignment, cluster_centroids, final_cluster_count, probes, world_min, world_max, assign_path);
+                try stdout.print("  → {s}\n", .{assign_path});
+            }
+
+            // Write assignment to binary
+            {
+                const assign_bin = try std.fmt.allocPrint(allocator, "{s}_probe_assign.bin", .{base_name});
+                defer allocator.free(assign_bin);
+                var af = try std.fs.cwd().createFile(assign_bin, .{});
+                defer af.close();
+                var aw = std.io.bufferedWriter(af.writer());
+                const w = aw.writer();
+                try w.writeAll("PASN"); // magic
+                try w.writeInt(u32, final_cluster_count, .little);
+                try w.writeInt(u32, @intCast(probes.len), .little);
+                for (assignment.cluster_to_probe) |pid| {
+                    try w.writeInt(u32, pid, .little);
+                }
+                try aw.flush();
+                try stdout.print("  → {s}\n", .{assign_bin});
+            }
         }
     }
 
@@ -1178,4 +1295,55 @@ fn hsvToRgb(h: f32, s: f32, v: f32) Color {
         .g = @intFromFloat((g + m) * 255),
         .b = @intFromFloat((b + m) * 255),
     };
+}
+
+fn writeProbeAssignment(
+    allocator: Allocator,
+    assignment: *const pvs_mod.ProbeAssignment,
+    cluster_centroids: []const Vec3,
+    cluster_count: u32,
+    probes: []const pvs_mod.Probe,
+    world_min: [3]f32,
+    world_max: [3]f32,
+    path: []const u8,
+) !void {
+    const size = IMG_SIZE;
+    const pixels = try allocator.alloc(Color, size * size);
+    defer allocator.free(pixels);
+    @memset(pixels, Color{ .r = 10, .g = 10, .b = 15 });
+
+    // Generate a color per probe using golden ratio hue
+    const probe_colors = try allocator.alloc(Color, probes.len);
+    defer allocator.free(probe_colors);
+    for (0..probes.len) |i| {
+        const hue = @as(f32, @floatFromInt(i)) * 0.618033988749895;
+        const h = hue - @floor(hue);
+        probe_colors[i] = hsvToRgb(h, 0.8, 0.85);
+    }
+
+    // Plot each cluster as a dot colored by its assigned probe
+    for (0..cluster_count) |ci| {
+        const probe_id = assignment.cluster_to_probe[ci];
+        if (probe_id >= probes.len) continue;
+        const color = probe_colors[probe_id];
+        const p = worldToPixel(cluster_centroids[ci], world_min, world_max, size);
+        fillRect(pixels, size, p.x - 1, p.y - 1, p.x + 1, p.y + 1, color);
+    }
+
+    // Draw probe positions — white for boundary, yellow for interior
+    for (probes) |probe| {
+        const p = worldToPixel(probe.position, world_min, world_max, size);
+        if (probe.is_boundary) {
+            // White diamond
+            drawLine(pixels, size, p.x, p.y - 5, p.x + 5, p.y, .{ .r = 255, .g = 255, .b = 255 }, 1.0);
+            drawLine(pixels, size, p.x + 5, p.y, p.x, p.y + 5, .{ .r = 255, .g = 255, .b = 255 }, 1.0);
+            drawLine(pixels, size, p.x, p.y + 5, p.x - 5, p.y, .{ .r = 255, .g = 255, .b = 255 }, 1.0);
+            drawLine(pixels, size, p.x - 5, p.y, p.x, p.y - 5, .{ .r = 255, .g = 255, .b = 255 }, 1.0);
+        } else {
+            // Yellow square
+            fillRect(pixels, size, p.x - 4, p.y - 4, p.x + 4, p.y + 4, .{ .r = 255, .g = 255, .b = 0 });
+        }
+    }
+
+    try writePpm(pixels, size, path);
 }

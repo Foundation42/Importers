@@ -719,6 +719,106 @@ pub fn findGradientProbes(
     return probes.toOwnedSlice();
 }
 
+// ── Visibility-Gated Probe Assignment ───────────────────────────────────
+//
+// Each cluster is assigned to the nearest probe that it can actually SEE
+// via the transport graph.  This is the hard constraint that prevents
+// light leaks — a cluster behind a wall will never pull lighting from
+// a probe on the other side, because the PVS says they can't see each other.
+
+pub const ProbeAssignment = struct {
+    /// probe_id per cluster (index into probes array), or max_int if unassigned
+    cluster_to_probe: []u32,
+    cluster_count: u32,
+    /// Number of clusters successfully assigned
+    assigned_count: u32,
+    /// Number of clusters that couldn't see any probe (fallback to nearest)
+    fallback_count: u32,
+    allocator: Allocator,
+
+    pub fn deinit(self: *ProbeAssignment) void {
+        self.allocator.free(self.cluster_to_probe);
+    }
+};
+
+/// Assign each cluster to its nearest PVS-visible probe.
+///
+/// `cluster_centroids[i]` = centroid of cluster i
+/// `cluster_cells[i]` = which cell (index into cell list) cluster i belongs to
+/// `probe_cells[i]` = which cell probe i is in
+///
+/// The visibility gate: cluster C in cell X can only use probe P in cell Y
+/// if the transport graph shows hits > 0 between X and Y (or X == Y).
+pub fn assignProbes(
+    allocator: Allocator,
+    cluster_centroids: []const [3]f32,
+    cluster_cells: []const u32,
+    cluster_count: u32,
+    probes: []const Probe,
+    probe_cells: []const u32,
+    transport: *const TransportGraph,
+) !ProbeAssignment {
+    const mapping = try allocator.alloc(u32, cluster_count);
+    var assigned: u32 = 0;
+    var fallback: u32 = 0;
+
+    for (0..cluster_count) |ci| {
+        const my_cell = cluster_cells[ci];
+        const cx = cluster_centroids[ci][0];
+        const cy = cluster_centroids[ci][1];
+        const cz = cluster_centroids[ci][2];
+
+        var best_probe: u32 = std.math.maxInt(u32);
+        var best_dist_sq: f32 = std.math.floatMax(f32);
+        var best_fallback: u32 = std.math.maxInt(u32);
+        var best_fallback_dist: f32 = std.math.floatMax(f32);
+
+        for (probes, 0..) |probe, pi| {
+            const dx = cx - probe.position[0];
+            const dy = cy - probe.position[1];
+            const dz = cz - probe.position[2];
+            const dist_sq = dx * dx + dy * dy + dz * dz;
+
+            // Track nearest probe regardless (fallback)
+            if (dist_sq < best_fallback_dist) {
+                best_fallback = @intCast(pi);
+                best_fallback_dist = dist_sq;
+            }
+
+            // Visibility gate: can my cell see the probe's cell?
+            const probe_cell = probe_cells[pi];
+            const visible = if (my_cell == probe_cell)
+                true
+            else if (my_cell < transport.cell_count and probe_cell < transport.cell_count) blk: {
+                const edge = transport.getEdge(my_cell, probe_cell);
+                break :blk edge.hits.load(.monotonic) > 0;
+            } else false;
+
+            if (visible and dist_sq < best_dist_sq) {
+                best_probe = @intCast(pi);
+                best_dist_sq = dist_sq;
+            }
+        }
+
+        if (best_probe != std.math.maxInt(u32)) {
+            mapping[ci] = best_probe;
+            assigned += 1;
+        } else {
+            // No visible probe — fall back to nearest (shouldn't happen often)
+            mapping[ci] = best_fallback;
+            fallback += 1;
+        }
+    }
+
+    return .{
+        .cluster_to_probe = mapping,
+        .cluster_count = cluster_count,
+        .assigned_count = assigned,
+        .fallback_count = fallback,
+        .allocator = allocator,
+    };
+}
+
 // ── PVS Solver ──────────────────────────────────────────────────────────
 //
 // Importance-sampled PVS solver.  Instead of picking random triangles
