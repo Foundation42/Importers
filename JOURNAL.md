@@ -489,3 +489,154 @@ For further capacity improvements, discussed:
 - **CSM shadow cascades**: separate network per cascade
 - **Baked GI probes into ProbeManager**: load `_probes_sh.bin` into existing SSBO/shader pipeline
 - **Compute shader port**: SH propagation on GPU for real-time dynamic GI
+
+## Session 6: Omnidirectional Position-Only PVS + Cell Graph Hybrid (2026-04-10)
+
+This was a major architecture day. We started with a working but flawed exemplar PVS
+(half-the-world-missing in some camera positions) and ended with a 3-backend hybrid
+that's "almost perfect" on Dust II. The journey rebuilt PVS from the ground up around
+two key insights: **visibility is fundamentally a property of position alone**, and
+**aggregate Source 2 models need per-submesh granularity**.
+
+### The Insights, In Order
+
+**1. Visibility is positional, not directional.**
+
+The original Neural PVS v3 had a 9-input MLP: (xyz, qw, qx, qy, qz, vfov_norm, aspect_norm).
+Six of those nine dims encode camera orientation/frustum. But "what's visible from this
+point" doesn't actually depend on which way you're looking — orientation just frustum-culls
+the visible set. Carrying orientation into the PVS:
+- Wastes ~⅓ of the input layer's capacity learning to ignore noise
+- Forces per-orientation training data (multiple samples per position with conflicting labels)
+- Mixes two concerns (visibility + frustum) the engine should handle separately
+
+**Fix:** Drop orientation entirely. MLP/EPVS take only `(x,y,z)`. Bake samples are
+omnidirectional (full sphere of rays per probe). Frustum culling becomes a separate
+draw-time pass on top.
+
+**2. Source 2 aggregate models pollute per-model PVS data.**
+
+Maps merge ground/asphalt props into single "agg_merge" models with 100+ sub-meshes
+spanning the entire map. The worst offender on Dust II: `agg_merge_hr_dust_blend_asphalt_06_0`
+with 125 sub-meshes and an AABB covering 171×29×165 meters. With one PVS bit per model,
+that bit was set from anywhere with line-of-sight to ANY asphalt triangle — i.e. nearly
+everywhere. The bit carried zero discriminating information AND polluted the exemplar
+selection (every sample looked similar).
+
+**Fix:** Per-submesh PVS units. Each of the 3449 sub-meshes on Dust II gets its own bit.
+106 truly world-spanning sub-meshes (AABB > 25% of world diagonal) are excluded entirely
+from PVS — kept in the BIVH for ray occlusion, always drawn at runtime.
+
+Stats after the change: **3343 PVS bits** (vs 518), **average models-per-sample 127** (vs much
+lower with per-model bits). Exemplar count actually *dropped* from 18,817 → 5,625 because
+each exemplar carries far more discriminating information.
+
+**3. Topological propagation via the BFS Walker is the right base layer.**
+
+Distance-based exemplar kNN has a fundamental flaw: an exemplar across a thin wall is
+"close" in Euclidean distance but should not contribute. The BFS Walker phase of the
+baker already builds a transport graph (cell-to-cell hits/casts) that natively respects
+walls — if a ray can't reach cell B from cell A, there's no transport edge.
+
+**Fix:** Cell PVS — at bake time, OR-merge each cell's own sub-mesh set with all
+transport-graph-connected cells. At runtime, find nearest cell centroid, return its
+bitset. O(1) query (linear scan over 3519 cells), wall-aware, smaller file than EPVS
+(1.5 MB), built in **521 ms** at bake time. The propagation respects the topology
+because the graph itself is built from rays.
+
+**Distribution on Dust II:**
+- min visible units/cell: 42 (deeply enclosed corridor)
+- max: 2912 (CT spawn looking across the map)
+- avg: 1390
+- **70× ratio** between min and max — graph propagation is doing real work
+
+### The Hybrid
+
+Each backend has a complementary weakness:
+
+| | Cell | Exemplar | Hybrid |
+|--|--|--|--|
+| Wall awareness | ✅ Graph | ❌ Euclidean | ✅ |
+| Local precision | ⚠️ Cell-coarse | ✅ Per-position | ✅ |
+| Open spaces (sparse probes) | ⚠️ Big cells | ⚠️ Sparse exemplars | ⚠️ |
+| Query cost | O(1) | O(K=16) bitset OR | O(1) + O(K) |
+| File size | 1.5 MB | 2.4 MB | (composite) |
+
+`pvs_mode hybrid` is just `cell.visible_flags OR exemplar.visible_flags`, computed
+once per camera move. The OR-merge is strictly conservative: if either backend thinks
+a sub-mesh is visible, draw it. Each backend catches the other's failures:
+
+- Cell catches what the exemplar misses in narrow corridors (too sparse to cover)
+- Exemplar catches what the cell coarsely-aggregated away (sub-cell variation)
+
+**Result on Dust II:** "almost perfect" — major remaining issues are popping in large
+open spaces where GI probes are sparse (because the BFS Walker put fewer cells/probes
+there, making the hybrid inherit the sparsity).
+
+### The MLP, In Memoriam
+
+The position-only MLP also got rebuilt this session: Input=3, Output=3343, hidden=384,
+1.44M params, 30 epochs, 27 minutes train time. Final eval: **FN=9.90%, FP=8.2%**.
+That's worse FN than the old per-model MLP (4.88%) but better FP (8.2 vs 9.7), on a
+problem with 6.5× more outputs and 4× less training data.
+
+In-game, the MLP at default threshold 0.30 over-predicts (~378 visible per query vs
+ground truth ~127) — it learned a smooth "this region typically sees X" instead of
+the cell graph's exact "from your specific cell you can see Y". After seeing the cell
+PVS work so well, the MLP feels redundant. Kept around as `pvs_mode mlp` for comparison.
+
+### Code Structure
+
+- **Baker (pvs_baker.zig)**: New `Cell PVS (per-submesh)` phase reuses the existing
+  cell propagation logic but at sub-mesh granularity. Writes `_pvs_cells.bin` (CELL v1).
+  Per-submesh tri-to-PVS-unit mapping computed once, reused by both cell + exemplar +
+  MLP paths.
+- **Baker (pvs_neural.zig)**: TDAT v2 cache format includes per-PVS-unit centroids,
+  so `FAST_EPVS=1` can rerun BOTH exemplar selection AND MLP training without
+  re-loading geometry. Cache files are now self-contained handoff state — if a
+  downstream stage needs something, it goes in the cache.
+- **Baker (pvs_exemplar.zig)**: EPVS v3 format, position-only inputs.
+- **Runtime (source2_pvs.zig)**: New `CellPVS` and `HybridPVS` structs. `PvsBackend`
+  union grew to 4 variants (`neural`, `exemplar`, `cell`, `hybrid`). NPVS v4, EPVS v3.
+- **Runtime (model.zig)**: `drawCulledPvs` does per-submesh PVS gating + per-submesh
+  AABB frustum cull. Sentinel bit indices (oversized excluded sub-meshes) always pass
+  the PVS gate.
+- **Runtime (main.zig)**: `pvs_mode` kvar selects backend. `pvsmode` console command
+  cycles `hybrid → cell → exemplar → mlp → hybrid`. Default is `hybrid`.
+
+### Cache Completeness Lesson
+
+When I first built the per-submesh refactor, the FAST_EPVS path could iterate on
+exemplar selection but couldn't retrain the MLP because per-PVS-unit centroids were
+only computed during the geometry-load phase that FAST_EPVS skips. Christian called
+this out: **"the cache should be the state of the system before anything that comes
+next in the pipeline"** — a cache that only fast-paths some downstream stages is
+half-broken. Bumped TDAT to v2 and added centroids; now FAST_EPVS is a true
+self-contained handoff.
+
+### Implications for GI
+
+The cell-graph PVS is structurally identical to what GI needs. The same BFS Walker
+transport graph that propagates visibility through walls is what the GI light
+propagation should run on. The current GI compute shader does light propagation
+through a learned probe graph; replacing the learned graph with the BFS Walker's
+transport graph would give:
+
+- Wall-aware light bounces (no leak through thin walls)
+- Per-probe visibility cache as a free side-effect of the transport solve
+- Single unified data structure for both PVS and GI (matches the original
+  Baker.md plan from Session 4 of the journal)
+
+The fact that cell PVS is **almost perfect** with 521 ms of compute and a 1.5 MB
+sidecar suggests the same approach will work brilliantly for GI when we get there.
+
+### Next Steps
+
+- **Tweak cell granularity in open spaces** — popping happens where probes are sparse.
+  Either bake denser probes in open areas, or add a "halo" of N-hop transport
+  neighbors to each cell's visibility set.
+- **Higher walker rays-per-pair** to densify the transport graph.
+- **Optional**: replace cell-centroid lookup with probe-centroid lookup — probes are
+  semantically placed at gradient transitions, may give more meaningful spatial buckets.
+- **Wire BFS Walker transport graph into the GI propagation** — the unification
+  the original plan called for.

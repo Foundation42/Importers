@@ -836,7 +836,10 @@ pub fn main() !void {
         const num_models: u32 = @intCast(model_ranges.items.len);
         const bitset_stride = (num_models + 7) / 8; // bytes per model bitset
 
-        // Build reverse mapping: original_tri_idx → model_id
+        // Build reverse mapping: original_tri_idx → model_id (per-model bits
+        // for the legacy GI/PVR2 path). The omni branch later builds a
+        // separate per-submesh tri-to-PVS-unit mapping for the cell PVS
+        // sidecar (`_pvs_cells.bin`).
         const tri_to_model = try allocator.alloc(u32, tri_count);
         defer allocator.free(tri_to_model);
         @memset(tri_to_model, std.math.maxInt(u32));
@@ -919,6 +922,148 @@ pub fn main() !void {
 
         const t_map1 = std.time.nanoTimestamp();
         try stdout.print("  Mapping time: {d}ms\n", .{@divTrunc(t_map1 - t_map0, 1_000_000)});
+
+        // ── Per-submesh Cell PVS (omni mode, written as _pvs_cells.bin) ──
+        //
+        // Repurposes the same transport-graph-propagated cell visibility
+        // structure from above, but at sub-mesh granularity. The runtime
+        // looks up which cell the camera is in and reads off the bitset —
+        // O(1) query, topologically aware (graph propagation respects walls
+        // — exemplars behind a thin wall don't leak in).
+        //
+        // We compute it here (after the legacy per-model pass) because we
+        // need `pt` (transport graph) and `cell_cluster_ids` which are both
+        // local to this block. The per-submesh PVS units we'll build below
+        // are also reused later by the Neural PVS Training phase.
+        const omni_for_cells = std.process.getEnvVarOwned(allocator, "OMNI_EPVS") catch null;
+        defer if (omni_for_cells) |s| allocator.free(s);
+
+        var cell_pvs_tri_to_unit: ?[]u32 = null;
+        defer if (cell_pvs_tri_to_unit) |slice| allocator.free(slice);
+        var cell_pvs_units_count: u32 = 0;
+        var cell_pvs_centroids: ?[][3]f32 = null;
+        defer if (cell_pvs_centroids) |c| allocator.free(c);
+
+        if (omni_for_cells != null) {
+            try buildSubmeshPvsUnits(
+                allocator,
+                submesh_ranges.items,
+                all_positions.items,
+                all_indices.items,
+                world_min,
+                world_max,
+                base_name,
+                tri_count,
+                &cell_pvs_tri_to_unit,
+                &cell_pvs_units_count,
+                &cell_pvs_centroids,
+                stdout,
+            );
+
+            // Build per-submesh cell bitsets, propagated through the transport graph
+            try stdout.print("\n  ╔═══════════════════════════════╗\n", .{});
+            try stdout.print("  ║  Cell PVS (per-submesh)       ║\n", .{});
+            try stdout.print("  ╚═══════════════════════════════╝\n", .{});
+            const t_cpvs0 = std.time.nanoTimestamp();
+
+            const sub_stride: u32 = (cell_pvs_units_count + 7) / 8;
+            const tri_to_unit = cell_pvs_tri_to_unit.?;
+
+            // Per-cell own-bitsets (which submeshes intersect this cell)
+            const cell_own_bs = try allocator.alloc([]u8, final_num_cells);
+            defer {
+                for (cell_own_bs) |bs| allocator.free(bs);
+                allocator.free(cell_own_bs);
+            }
+            for (0..final_num_cells) |ci| {
+                const bs = try allocator.alloc(u8, sub_stride);
+                @memset(bs, 0);
+                for (cell_cluster_ids.items[ci]) |orig_cluster| {
+                    const start_t = orig_cluster * cluster_size;
+                    const end_t = @min(start_t + cluster_size, tri_count);
+                    for (start_t..end_t) |sorted_idx| {
+                        const original_idx = world_perm[sorted_idx];
+                        const unit_id = tri_to_unit[original_idx];
+                        if (unit_id != std.math.maxInt(u32)) {
+                            bs[unit_id / 8] |= @as(u8, 1) << @intCast(unit_id % 8);
+                        }
+                    }
+                }
+                cell_own_bs[ci] = bs;
+            }
+
+            // Propagate through transport graph: each cell's visible set is
+            // the union of its own + all cells reachable via a transport edge.
+            const cell_vis_bs = try allocator.alloc([]u8, final_num_cells);
+            defer {
+                for (cell_vis_bs) |bs| allocator.free(bs);
+                allocator.free(cell_vis_bs);
+            }
+            for (0..final_num_cells) |ci| {
+                const bs = try allocator.alloc(u8, sub_stride);
+                @memcpy(bs, cell_own_bs[ci]);
+                for (0..final_num_cells) |cj| {
+                    if (ci == cj) continue;
+                    const edge = pt.getEdge(@intCast(ci), @intCast(cj));
+                    if (edge.hits.load(.monotonic) > 0) {
+                        for (0..sub_stride) |bi| {
+                            bs[bi] |= cell_own_bs[cj][bi];
+                        }
+                    }
+                }
+                cell_vis_bs[ci] = bs;
+            }
+
+            // Stats
+            {
+                var min_v: u32 = std.math.maxInt(u32);
+                var max_v: u32 = 0;
+                var total_v: u64 = 0;
+                for (cell_vis_bs) |bs| {
+                    var c: u32 = 0;
+                    for (bs) |b| c += @popCount(b);
+                    min_v = @min(min_v, c);
+                    max_v = @max(max_v, c);
+                    total_v += c;
+                }
+                try stdout.print("  Visible units/cell: min={d}, max={d}, avg={d} (of {d})\n", .{
+                    min_v, max_v, @as(u32, @intCast(total_v / final_num_cells)), cell_pvs_units_count,
+                });
+            }
+
+            // Write _pvs_cells.bin (CELL v1)
+            //   magic "CELL" / version u32=1 / num_cells u32 / num_units u32 /
+            //   bitset_stride u32 / pos_min[3]f32 / pos_max[3]f32 /
+            //   per cell: centroid[3]f32 + bitset[stride]u8
+            {
+                const cells_path = try std.fmt.allocPrint(allocator, "{s}_pvs_cells.bin", .{base_name});
+                defer allocator.free(cells_path);
+                var cf = try std.fs.cwd().createFile(cells_path, .{});
+                defer cf.close();
+                var cbw = std.io.bufferedWriter(cf.writer());
+                const cw = cbw.writer();
+
+                try cw.writeAll("CELL");
+                try cw.writeInt(u32, 1, .little);
+                try cw.writeInt(u32, final_num_cells, .little);
+                try cw.writeInt(u32, cell_pvs_units_count, .little);
+                try cw.writeInt(u32, sub_stride, .little);
+                for (world_min) |v| try cw.writeInt(u32, @bitCast(v), .little);
+                for (world_max) |v| try cw.writeInt(u32, @bitCast(v), .little);
+                for (0..final_num_cells) |ci| {
+                    const c = final_centroids[ci];
+                    for (c) |v| try cw.writeInt(u32, @bitCast(v), .little);
+                    try cw.writeAll(cell_vis_bs[ci]);
+                }
+                try cbw.flush();
+                try stdout.print("  → {s} ({d} cells × {d} bytes)\n", .{
+                    cells_path, final_num_cells, sub_stride,
+                });
+            }
+
+            const t_cpvs1 = std.time.nanoTimestamp();
+            try stdout.print("  Cell PVS time: {d}ms\n", .{@divTrunc(t_cpvs1 - t_cpvs0, 1_000_000)});
+        }
 
         // ── Write _pvs_runtime.bin (single output file) ─────────────
         {
@@ -1058,41 +1203,12 @@ pub fn main() !void {
                 stderr.print("[NPVS] OMNI_EPVS set — omnidirectional sampling enabled\n", .{}) catch {};
             }
 
-            // ── Per-submesh PVS units (omni mode only) ──
-            // In omni mode we treat each submesh as its own PVS unit instead
-            // of one bit per model. This fixes data quality for Source 2
-            // aggregate models (e.g. asphalt agg_merge_*) that span the whole
-            // map: a single per-model PVS bit for those is "always visible"
-            // and carries no information. Per-submesh, each chunk gets its
-            // own bit. Submeshes whose AABB exceeds the world-fraction
-            // threshold are excluded from PVS entirely (still ray-traced for
-            // occlusion, but always drawn at runtime — see drawCulled).
-            var pvs_units_tri_to_unit: ?[]u32 = null;
-            defer if (pvs_units_tri_to_unit) |slice| allocator.free(slice);
-            var pvs_units_count: u32 = num_models;
-            var pvs_units_centroids: ?[][3]f32 = null;
-            defer if (pvs_units_centroids) |c| allocator.free(c);
-
-            if (omni_epvs != null) {
-                try buildSubmeshPvsUnits(
-                    allocator,
-                    submesh_ranges.items,
-                    all_positions.items,
-                    all_indices.items,
-                    world_min,
-                    world_max,
-                    base_name,
-                    tri_count,
-                    &pvs_units_tri_to_unit,
-                    &pvs_units_count,
-                    &pvs_units_centroids,
-                    stdout,
-                );
-            }
-
-            const data_tri_to_unit: []const u32 = pvs_units_tri_to_unit orelse tri_to_model;
-            const data_num_units: u32 = pvs_units_count;
-            const data_centroids: []const Vec3 = if (pvs_units_centroids) |c| c else model_centroids;
+            // Per-submesh PVS units were already built up in the Cell PVS
+            // section above (when omni mode is on) — reuse them here so the
+            // sidecar isn't computed twice.
+            const data_tri_to_unit: []const u32 = if (cell_pvs_tri_to_unit) |t| t else tri_to_model;
+            const data_num_units: u32 = if (omni_epvs != null) cell_pvs_units_count else num_models;
+            const data_centroids: []const Vec3 = if (cell_pvs_centroids) |c| c else model_centroids;
 
             // Generate training data, seeded from GI probes
             stderr.print("[NPVS] Starting probe-seeded data generation...\n", .{}) catch {};
