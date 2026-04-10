@@ -47,7 +47,10 @@ pub fn main() !void {
 
     const t0 = std.time.nanoTimestamp();
 
-    // ── FAST_EPVS fast path: skip walker/probes/datagen, just rerun exemplar selection ──
+    // ── FAST_EPVS fast path: skip walker/probes/datagen, rerun exemplar
+    // selection AND MLP training from the cached training data. The cache
+    // is self-contained (TDAT v2 includes per-PVS-unit centroids) so no
+    // geometry re-load is needed.
     const fast_epvs = std.process.getEnvVarOwned(allocator, "FAST_EPVS") catch null;
     defer if (fast_epvs) |s| allocator.free(s);
 
@@ -69,6 +72,7 @@ pub fn main() !void {
             (train_data.num_samples * (12 + 24 + train_data.bitset_stride)) / (1024 * 1024),
         });
 
+        // ── Exemplar selection ──
         const t_ex0 = std.time.nanoTimestamp();
         try stderr.print("[Exemplar] Building exemplar model...\n", .{});
         var epvs = try pvs_exemplar.selectExemplars(
@@ -95,6 +99,43 @@ pub fn main() !void {
         defer allocator.free(epvs_path);
         try epvs.save(epvs_path);
         try stdout.print("  → {s}\n", .{epvs_path});
+
+        // ── MLP training (skippable via SKIP_MLP) ──
+        const skip_mlp = std.process.getEnvVarOwned(allocator, "SKIP_MLP") catch null;
+        defer if (skip_mlp) |s| allocator.free(s);
+
+        if (skip_mlp == null) {
+            try stderr.print("[FastEPVS] Training MLP from cached data...\n", .{});
+            const t_mlp0 = std.time.nanoTimestamp();
+            var mlp = try pvs_neural.train(
+                allocator,
+                &train_data,
+                train_data.centroids,
+                train_data.world_min,
+                train_data.world_max,
+                .{
+                    .epochs = 30,
+                    .learning_rate = 0.0005,
+                    .batch_size = 32,
+                    .hidden_size = 384,
+                    .eval_threshold = 0.3,
+                    .near_boost = 2.0,
+                    .ref_dist = 5.0,
+                },
+                stdout,
+            );
+            defer mlp.deinit();
+
+            const t_mlp1 = std.time.nanoTimestamp();
+            try stdout.print("  MLP training: {d}ms\n", .{@divTrunc(t_mlp1 - t_mlp0, 1_000_000)});
+
+            const npvs_path = try std.fmt.allocPrint(allocator, "{s}_npvs.bin", .{base_name});
+            defer allocator.free(npvs_path);
+            try mlp.save(npvs_path);
+            try stdout.print("  → {s}\n", .{npvs_path});
+        } else {
+            try stderr.print("[FastEPVS] SKIP_MLP set — skipping MLP training\n", .{});
+        }
 
         const t_total = std.time.nanoTimestamp();
         try stdout.print("\n  ═══ Total time: {d}ms ═══\n", .{@divTrunc(t_total - t0, 1_000_000)});
@@ -1029,6 +1070,8 @@ pub fn main() !void {
             var pvs_units_tri_to_unit: ?[]u32 = null;
             defer if (pvs_units_tri_to_unit) |slice| allocator.free(slice);
             var pvs_units_count: u32 = num_models;
+            var pvs_units_centroids: ?[][3]f32 = null;
+            defer if (pvs_units_centroids) |c| allocator.free(c);
 
             if (omni_epvs != null) {
                 try buildSubmeshPvsUnits(
@@ -1042,12 +1085,14 @@ pub fn main() !void {
                     tri_count,
                     &pvs_units_tri_to_unit,
                     &pvs_units_count,
+                    &pvs_units_centroids,
                     stdout,
                 );
             }
 
             const data_tri_to_unit: []const u32 = pvs_units_tri_to_unit orelse tri_to_model;
             const data_num_units: u32 = pvs_units_count;
+            const data_centroids: []const Vec3 = if (pvs_units_centroids) |c| c else model_centroids;
 
             // Generate training data, seeded from GI probes
             stderr.print("[NPVS] Starting probe-seeded data generation...\n", .{}) catch {};
@@ -1078,6 +1123,13 @@ pub fn main() !void {
             const data_gen_ms = @divTrunc(t_data - t_neural0, 1_000_000);
             try stdout.print("  Data gen: {d}ms\n", .{data_gen_ms});
 
+            // Copy the per-PVS-unit centroids into the training data so the
+            // cache file is self-contained — FAST_EPVS can then re-run BOTH
+            // exemplar selection AND MLP training without re-loading geometry.
+            if (train_data.centroids.len == data_centroids.len) {
+                @memcpy(train_data.centroids, data_centroids);
+            }
+
             // Save training data cache for fast iteration (FAST_EPVS path)
             {
                 const train_path = try std.fmt.allocPrint(allocator, "{s}_train.bin", .{base_name});
@@ -1087,19 +1139,21 @@ pub fn main() !void {
             }
 
             // Skip MLP training when SKIP_MLP env var is set (faster iteration on exemplars).
-            // Also skip when OMNI_EPVS is set — the MLP's input is direction-aware and
-            // the omnidirectional training data has no orientation to learn from.
+            // In OMNI_EPVS mode the MLP still trains, just with all-zero orientation
+            // dimensions in the input (those weights will train to zero) and a much
+            // larger output layer (one neuron per PVS unit / sub-mesh instead of one
+            // per model). Worth seeing what the MLP learns from the richer signal.
             const skip_mlp = std.process.getEnvVarOwned(allocator, "SKIP_MLP") catch null;
             defer if (skip_mlp) |s| allocator.free(s);
 
-            if (skip_mlp == null and omni_epvs == null) {
+            if (skip_mlp == null) {
                 stderr.print("[NPVS] Data gen: {d}ms, starting training...\n", .{data_gen_ms}) catch {};
 
-                // Train MLP with spatial + distance weighted loss
+                // Train MLP with distance-weighted loss (position-only input).
                 var mlp = try pvs_neural.train(
                     allocator,
                     &train_data,
-                    model_centroids,
+                    data_centroids,
                     world_min,
                     world_max,
                     .{
@@ -1108,7 +1162,6 @@ pub fn main() !void {
                         .batch_size = 32,
                         .hidden_size = 384,
                         .eval_threshold = 0.3,
-                        .center_boost = 2.0,
                         .near_boost = 2.0,
                         .ref_dist = 5.0,
                     },
@@ -1432,6 +1485,7 @@ fn buildSubmeshPvsUnits(
     tri_count: u32,
     out_tri_to_unit: *?[]u32,
     out_num_units: *u32,
+    out_centroids: *?[][3]f32,
     stdout: anytype,
 ) !void {
     const stderr = std.io.getStdErr().writer();
@@ -1614,8 +1668,23 @@ fn buildSubmeshPvsUnits(
         try stdout.print("  → {s} ({d} models, {d} units)\n", .{ sidecar_path, num_models_in_sidecar, assigned });
     }
 
+    // Build per-PVS-unit centroids (AABB midpoints) for the MLP's spatial
+    // loss weighting. Skipped sub-meshes don't get a centroid since they
+    // have no PVS bit. The MLP needs one centroid per output neuron.
+    const centroids = try allocator.alloc([3]f32, assigned);
+    for (submesh_ranges, infos) |sr, info| {
+        _ = sr;
+        if (info.skipped) continue;
+        centroids[info.pvs_id] = .{
+            (info.aabb_min[0] + info.aabb_max[0]) * 0.5,
+            (info.aabb_min[1] + info.aabb_max[1]) * 0.5,
+            (info.aabb_min[2] + info.aabb_max[2]) * 0.5,
+        };
+    }
+
     out_tri_to_unit.* = tri_to_unit;
     out_num_units.* = assigned;
+    out_centroids.* = centroids;
     stderr.print("[Submesh PVS] {d} units, {d} skipped\n", .{ assigned, skipped_count }) catch {};
 }
 

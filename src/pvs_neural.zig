@@ -13,7 +13,11 @@ const Allocator = std.mem.Allocator;
 const bivh_mod = @import("bivh");
 
 const Vec3 = [3]f32;
-pub const INPUT_SIZE: u32 = 9;
+// Position-only MLP input. Was 9 (xyz + quaternion + vfov + aspect) but
+// the omnidirectional baker drops orientation entirely — visibility is
+// modelled as a property of position alone, frustum culling is done at
+// draw time. The 6 orientation dims were dead capacity.
+pub const INPUT_SIZE: u32 = 3;
 
 // Frustum parameter ranges (for normalization)
 const MIN_VFOV: f32 = 1.05; // ~60 degrees
@@ -212,8 +216,11 @@ pub const TrainingConfig = struct {
 
 pub const TrainingData = struct {
     positions: []Vec3,
-    params: [][6]f32, // qw, qx, qy, qz, vfov_norm, aspect_norm
+    params: [][6]f32, // qw, qx, qy, qz, vfov_norm, aspect_norm (legacy, unused by position-only MLP)
     labels: [][]u8, // packed model bitsets
+    /// Per-PVS-unit centroids for the MLP's distance-based loss weighting.
+    /// Length == num_models. Owned by the TrainingData arena.
+    centroids: []Vec3,
     num_models: u32,
     bitset_stride: u32,
     num_samples: u32,
@@ -228,11 +235,14 @@ pub const TrainingData = struct {
         self.allocator.free(self.labels);
         self.allocator.free(self.params);
         self.allocator.free(self.positions);
+        self.allocator.free(self.centroids);
     }
 
-    /// Save training data to a binary cache file (TDAT v1).
-    /// Lets us skip walker + probes + ray tracing on subsequent runs
-    /// when iterating on exemplar/MLP parameters.
+    /// Save training data to a binary cache file (TDAT v2).
+    /// Self-contained — includes everything needed to run BOTH exemplar
+    /// selection AND MLP training without re-loading geometry. v2 added
+    /// the centroids array to make the cache complete; v1 only had
+    /// positions/params/labels and FAST_EPVS could only feed exemplars.
     pub fn save(self: *const TrainingData, path: []const u8) !void {
         var file = try std.fs.cwd().createFile(path, .{});
         defer file.close();
@@ -240,7 +250,7 @@ pub const TrainingData = struct {
         const w = bw.writer();
 
         try w.writeAll("TDAT");
-        try w.writeInt(u32, 1, .little); // version
+        try w.writeInt(u32, 2, .little); // version 2: includes centroids
         try w.writeInt(u32, self.num_models, .little);
         try w.writeInt(u32, self.num_samples, .little);
         try w.writeInt(u32, self.bitset_stride, .little);
@@ -253,6 +263,11 @@ pub const TrainingData = struct {
             for (self.positions[i]) |v| try w.writeInt(u32, @bitCast(v), .little);
             for (self.params[i]) |v| try w.writeInt(u32, @bitCast(v), .little);
             try w.writeAll(self.labels[i]);
+        }
+
+        // Centroids — one Vec3 per PVS unit
+        for (self.centroids) |c| {
+            for (c) |v| try w.writeInt(u32, @bitCast(v), .little);
         }
 
         try bw.flush();
@@ -269,7 +284,7 @@ pub const TrainingData = struct {
         if (!std.mem.eql(u8, &magic, "TDAT")) return error.InvalidMagic;
 
         const version = try reader.readInt(u32, .little);
-        if (version != 1) return error.UnsupportedVersion;
+        if (version != 2) return error.UnsupportedVersion;
 
         const num_models = try reader.readInt(u32, .little);
         const num_samples = try reader.readInt(u32, .little);
@@ -298,10 +313,18 @@ pub const TrainingData = struct {
             _ = try reader.readAll(labels[i]);
         }
 
+        // Centroids — one Vec3 per PVS unit
+        const centroids = try allocator.alloc(Vec3, num_models);
+        errdefer allocator.free(centroids);
+        for (centroids) |*c| {
+            for (c) |*v| v.* = @bitCast(try reader.readInt(u32, .little));
+        }
+
         return .{
             .positions = positions,
             .params = params,
             .labels = labels,
+            .centroids = centroids,
             .num_models = num_models,
             .bitset_stride = bitset_stride,
             .num_samples = num_samples,
@@ -767,10 +790,18 @@ pub fn generateTrainingData(
         }
     }
 
+    // Centroids start empty — the caller fills them in from geometry
+    // (per-PVS-unit AABB midpoints) before saving the cache file. This
+    // way the cache contains everything FAST_EPVS needs to also retrain
+    // the MLP without re-loading geometry.
+    const centroids = try allocator.alloc(Vec3, num_models);
+    for (centroids) |*c| c.* = .{ 0, 0, 0 };
+
     return .{
         .positions = positions,
         .params = params,
         .labels = labels_arr,
+        .centroids = centroids,
         .num_models = num_models,
         .bitset_stride = (num_models + 7) / 8,
         .num_samples = @intCast(total_samples),
@@ -781,17 +812,17 @@ pub fn generateTrainingData(
     };
 }
 
-// ── Spatial + Distance Loss Weighting ───────────────────────────────
+// ── Distance Loss Weighting ─────────────────────────────────────────
 
-/// Compute per-model FN penalty weights based on angular distance from
-/// view center and distance from camera. Close + center = max penalty.
+/// Compute per-model FN penalty weights based on distance from sample
+/// position. Close models matter more — boost their FN penalty.
+/// (The old version also had a camera-forward angular term, but the
+/// MLP is position-only now so direction has no meaning.)
 pub fn computeSpatialWeights(
     weights: []f32, // output: one weight per model
     pos: Vec3,
-    look_dir: Vec3,
     model_centroids: []const Vec3,
     base_weight: f32,
-    center_boost: f32, // extra FN penalty for center models (~2.0)
     near_boost: f32, // extra FN penalty for nearby models (~2.0)
     ref_dist: f32, // distance reference (~5.0 meters)
 ) void {
@@ -802,15 +833,8 @@ pub fn computeSpatialWeights(
         }
         const to_model = sub3(model_centroids[i], pos);
         const dist = length3(to_model);
-
-        // Angular factor: dot with look direction (1.0 = dead center, 0 = 90deg)
-        const cos_angle = if (dist > 0.01) dot3(look_dir, scale3(to_model, 1.0 / dist)) else 0;
-        const center_factor = @max(0.0, cos_angle);
-
-        // Distance factor: close models matter more
         const near_factor = 1.0 / (1.0 + dist / ref_dist);
-
-        w.* = base_weight * (1.0 + center_boost * center_factor + near_boost * near_factor);
+        w.* = base_weight * (1.0 + near_boost * near_factor);
     }
 }
 
@@ -922,23 +946,17 @@ pub const MLP = struct {
         self.arena.deinit();
     }
 
-    /// Build 9-element input vector
-    fn buildInput(self: *const MLP, pos: Vec3, p: [6]f32) [INPUT_SIZE]f32 {
+    /// Build position-only input vector (normalized to world bounds).
+    fn buildInput(self: *const MLP, pos: Vec3) [INPUT_SIZE]f32 {
         return .{
             (pos[0] - self.pos_min[0]) * self.pos_scale[0],
             (pos[1] - self.pos_min[1]) * self.pos_scale[1],
             (pos[2] - self.pos_min[2]) * self.pos_scale[2],
-            p[0], // qw
-            p[1], // qx
-            p[2], // qy
-            p[3], // qz
-            p[4], // vfov_norm
-            p[5], // aspect_norm
         };
     }
 
-    pub fn forward(self: *MLP, pos: Vec3, p: [6]f32) []const f32 {
-        const input = self.buildInput(pos, p);
+    pub fn forward(self: *MLP, pos: Vec3) []const f32 {
+        const input = self.buildInput(pos);
         const h = self.hidden_size;
         const o = self.output_size;
 
@@ -971,8 +989,8 @@ pub const MLP = struct {
     /// model_weights[j] is the FN penalty for model j (higher = more important).
     /// rvl_lambda blends BCE (λ) with RVL (1-λ). RVL pushes FPs down proportional to 1/GTP.
     /// Reference: Wang et al. "NeuralPVS: Learned Estimation of Potentially Visible Sets" (2025)
-    pub fn accumulateGradients(self: *MLP, pos: Vec3, p: [6]f32, target: []const u8, model_weights: []const f32, rvl_lambda: f32) f32 {
-        const input = self.buildInput(pos, p);
+    pub fn accumulateGradients(self: *MLP, pos: Vec3, target: []const u8, model_weights: []const f32, rvl_lambda: f32) f32 {
+        const input = self.buildInput(pos);
         const h = self.hidden_size;
         const o = self.output_size;
 
@@ -1069,7 +1087,7 @@ pub const MLP = struct {
         const w = bw.writer();
 
         try w.writeAll("NPVS");
-        try w.writeInt(u32, 3, .little); // version 3: frustum-integrated
+        try w.writeInt(u32, 4, .little); // version 4: position-only input
         try w.writeInt(u32, INPUT_SIZE, .little);
         try w.writeInt(u32, self.hidden_size, .little);
         try w.writeInt(u32, self.output_size, .little);
@@ -1135,9 +1153,8 @@ pub const TrainConfig = struct {
     batch_size: u32 = 32,
     hidden_size: u32 = 256,
     eval_threshold: f32 = 0.3,
-    // Spatial loss weighting
-    center_boost: f32 = 2.0, // extra FN penalty for center-of-view models
-    near_boost: f32 = 2.0, // extra FN penalty for nearby models
+    // Distance loss weighting (close models get higher FN penalty)
+    near_boost: f32 = 2.0,
     ref_dist: f32 = 5.0, // distance reference (meters in world coords)
     // Repulsive Visibility Loss (Wang et al. 2025)
     rvl_lambda: f32 = 0.85, // blend: λ·BCE + (1-λ)·RVL (paper uses 0.99 for Dice+RVL)
@@ -1181,15 +1198,15 @@ pub fn train(
         config.hidden_size * config.hidden_size + config.hidden_size +
         config.hidden_size * data.num_models + data.num_models;
 
-    try stdout.print("  Training MLP (frustum-integrated, spatial+distance weighted)\n", .{});
-    try stdout.print("  Input: {d} (pos+yaw+pitch+vfov+aspect), H={d}, Output: {d}\n", .{
+    try stdout.print("  Training MLP (position-only, distance-weighted loss)\n", .{});
+    try stdout.print("  Input: {d} (xyz), H={d}, Output: {d}\n", .{
         INPUT_SIZE, config.hidden_size, data.num_models,
     });
     try stdout.print("  Samples: {d}, Epochs: {d}, lr={d:.4}, batch={d}, params={d}\n", .{
         n, config.epochs, config.learning_rate, config.batch_size, num_params,
     });
-    try stdout.print("  base_weight={d:.1}, center_boost={d:.1}, near_boost={d:.1}, ref_dist={d:.1}, rvl_λ={d:.2}\n", .{
-        base_weight, config.center_boost, config.near_boost, config.ref_dist, config.rvl_lambda,
+    try stdout.print("  base_weight={d:.1}, near_boost={d:.1}, ref_dist={d:.1}, rvl_λ={d:.2}\n", .{
+        base_weight, config.near_boost, config.ref_dist, config.rvl_lambda,
     });
 
     const bs = config.batch_size;
@@ -1205,23 +1222,19 @@ pub fn train(
         var batch_count: u32 = 0;
 
         for (indices, 0..) |idx, si| {
-            const p = data.params[idx];
-            const look_dir = lookDirFromQuat(.{ p[0], p[1], p[2], p[3] });
-
-            // Compute per-model spatial + distance weights
+            // Compute per-model distance weights (position-only — orientation
+            // was dropped from the MLP input)
             computeSpatialWeights(
                 model_weights,
                 data.positions[idx],
-                look_dir,
                 model_centroids,
                 base_weight,
-                config.center_boost,
                 config.near_boost,
                 config.ref_dist,
             );
 
-            _ = mlp.forward(data.positions[idx], p);
-            const loss = mlp.accumulateGradients(data.positions[idx], p, data.labels[idx], model_weights, config.rvl_lambda);
+            _ = mlp.forward(data.positions[idx]);
+            const loss = mlp.accumulateGradients(data.positions[idx], data.labels[idx], model_weights, config.rvl_lambda);
             epoch_loss += loss;
             batch_count += 1;
 
@@ -1245,7 +1258,7 @@ pub fn train(
             var ei: u32 = 0;
             while (ei < n) : (ei += @intCast(eval_step)) {
                 const i = ei;
-                _ = mlp.forward(data.positions[i], data.params[i]);
+                _ = mlp.forward(data.positions[i]);
                 for (0..data.num_models) |j| {
                     const actual = bitsetGet(data.labels[i], j);
                     const predicted = mlp.out[j] > config.eval_threshold;

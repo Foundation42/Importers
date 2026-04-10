@@ -11,28 +11,30 @@
 // Input (9): x, y, z, qw, qx, qy, qz, vfov_norm, aspect_norm
 // Output: per-model visibility probability via RBF interpolation
 //
-// File format (EPVS v1):
+// File format (EPVS v3): position-only inputs.
 //   magic: "EPVS"
-//   version: u32 = 1
-//   input_size: u32 = 9
+//   version: u32 = 3
+//   input_size: u32 = 3
 //   num_models: u32
 //   num_exemplars: u32
 //   pos_min: [3]f32
 //   pos_max: [3]f32
 //   rbf_sigma: f32
+//   pos_weight: f32
 //   For each exemplar:
-//     input: [9]f32 (normalized)
+//     input: [3]f32 (normalized x,y,z)
 //     visibility: [ceil(num_models/8)]u8 (packed bitset)
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-const INPUT_SIZE: u32 = 9;
+const INPUT_SIZE: u32 = 3;
 
-// Position dimensions are weighted heavily because they're normalized to a
-// huge world while quaternions span [-1,1] — without weighting, orientation
-// dominates distance and "nearby" exemplars are wrong.
-pub const POS_WEIGHT: f32 = 20.0;
+// Position-weight scaling — keeps the RBF kernel sized appropriately
+// in normalized [0,1] coordinates. Inherited from the previous design
+// where it had to fight against quaternion dimensions; with position-only
+// inputs the value is just an RBF bandwidth tuning knob.
+pub const POS_WEIGHT: f32 = 50.0;
 
 const Exemplar = struct {
     input: [INPUT_SIZE]f32,
@@ -60,36 +62,26 @@ pub const ExemplarPVS = struct {
         self.arena.deinit();
     }
 
-    /// Build normalized input vector (matches MLP convention).
-    fn buildInput(self: *const ExemplarPVS, pos: [3]f32, p: [6]f32) [INPUT_SIZE]f32 {
+    /// Build normalized position-only input vector.
+    fn buildInput(self: *const ExemplarPVS, pos: [3]f32) [INPUT_SIZE]f32 {
         return .{
             (pos[0] - self.pos_min[0]) * self.pos_scale[0],
             (pos[1] - self.pos_min[1]) * self.pos_scale[1],
             (pos[2] - self.pos_min[2]) * self.pos_scale[2],
-            p[0], // qw
-            p[1], // qx
-            p[2], // qy
-            p[3], // qz
-            p[4], // vfov_norm
-            p[5], // aspect_norm
         };
     }
 
     /// Query visibility via RBF-weighted interpolation of exemplars.
-    pub fn query(self: *ExemplarPVS, pos: [3]f32, params: [6]f32) []const f32 {
-        const input = self.buildInput(pos, params);
+    pub fn query(self: *ExemplarPVS, pos: [3]f32) []const f32 {
+        const input = self.buildInput(pos);
 
         @memset(self.out, 0);
         var weight_sum: f32 = 0;
 
         for (self.exemplars) |ex| {
             var dist_sq: f32 = 0;
-            inline for (0..3) |k| {
+            inline for (0..INPUT_SIZE) |k| {
                 const d = (input[k] - ex.input[k]) * POS_WEIGHT;
-                dist_sq += d * d;
-            }
-            inline for (3..INPUT_SIZE) |k| {
-                const d = input[k] - ex.input[k];
                 dist_sq += d * d;
             }
             const w = @exp(dist_sq * self.rbf_neg2sigma2);
@@ -123,7 +115,7 @@ pub const ExemplarPVS = struct {
         const w = bw.writer();
 
         try w.writeAll("EPVS");
-        try w.writeInt(u32, 2, .little); // version 2: includes pos_weight
+        try w.writeInt(u32, 3, .little); // version 3: position-only input
         try w.writeInt(u32, INPUT_SIZE, .little);
         try w.writeInt(u32, self.num_models, .little);
         try w.writeInt(u32, @intCast(self.exemplars.len), .little);
@@ -216,16 +208,14 @@ pub fn selectExemplars(
     // Outside this radius, the RBF weight is < 1e-5 — no need to update predictions
     const update_radius_sq = 4.0 * config.rbf_sigma * 4.0 * config.rbf_sigma;
 
-    // Build normalized inputs for all samples
+    // Build normalized position-only inputs for all samples
     const inputs = try a.alloc([INPUT_SIZE]f32, num_samples);
     for (0..num_samples) |i| {
         const pos = data.positions[i];
-        const p = data.params[i];
         inputs[i] = .{
             (pos[0] - pos_min[0]) * pos_scale[0],
             (pos[1] - pos_min[1]) * pos_scale[1],
             (pos[2] - pos_min[2]) * pos_scale[2],
-            p[0], p[1], p[2], p[3], p[4], p[5],
         };
     }
 
@@ -256,12 +246,8 @@ pub fn selectExemplars(
             err_out: *f32,
         ) void {
             var dist_sq: f32 = 0;
-            inline for (0..3) |k| {
-                const d = (sample_input[k] - ex_input[k]) * 20.0;
-                dist_sq += d * d;
-            }
-            inline for (3..INPUT_SIZE) |k| {
-                const d = sample_input[k] - ex_input[k];
+            inline for (0..INPUT_SIZE) |k| {
+                const d = (sample_input[k] - ex_input[k]) * POS_WEIGHT;
                 dist_sq += d * d;
             }
             if (dist_sq > update_r2) return;
@@ -374,14 +360,10 @@ pub fn selectExemplars(
         var updated: u32 = 0;
         for (0..num_samples) |si| {
             if (selected[si]) continue;
-            // Quick distance check before doing full work (weighted)
+            // Quick distance check before doing full work
             var dist_sq: f32 = 0;
-            inline for (0..3) |k| {
-                const d = (inputs[si][k] - new_ex.input[k]) * 20.0;
-                dist_sq += d * d;
-            }
-            inline for (3..INPUT_SIZE) |k| {
-                const d = inputs[si][k] - new_ex.input[k];
+            inline for (0..INPUT_SIZE) |k| {
+                const d = (inputs[si][k] - new_ex.input[k]) * POS_WEIGHT;
                 dist_sq += d * d;
             }
             if (dist_sq > update_radius_sq) continue;
@@ -454,8 +436,7 @@ pub fn evaluate(
 
     for (0..eval_count) |si| {
         const pos = data.positions[si];
-        const p = data.params[si];
-        _ = epvs.query(pos, p);
+        _ = epvs.query(pos);
 
         for (0..epvs.num_models) |j| {
             const gt = bitsetGet(data.labels[si], @intCast(j));
