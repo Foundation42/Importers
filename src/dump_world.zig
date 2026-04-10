@@ -11,15 +11,22 @@ pub fn main() !void {
 
     if (args.len < 2) {
         const stderr = std.io.getStdErr().writer();
-        try stderr.writeAll("Usage: dump-world <map.vpk> [resource-path]\n");
+        try stderr.writeAll("Usage: dump-world <map.vpk> [resource-path | submeshes]\n");
         try stderr.writeAll("\nExtracts and parses Source 2 world/model data from a map VPK.\n");
-        try stderr.writeAll("If no resource-path given, lists all entries.\n");
+        try stderr.writeAll("  (no second arg)     list all entries\n");
+        try stderr.writeAll("  <resource-path>     dump that resource\n");
+        try stderr.writeAll("  submeshes           tally draw-call (sub-mesh) counts across all vmdl_c\n");
         std.process.exit(1);
     }
 
     const vpk_path = args[1];
     const resource_path = if (args.len >= 3) args[2] else null;
     const stdout = std.io.getStdOut().writer();
+
+    if (resource_path != null and std.mem.eql(u8, resource_path.?, "submeshes")) {
+        try submeshStats(allocator, vpk_path, stdout);
+        return;
+    }
 
     // Open VPK
     var pkg = vrf.vpk.Package.init(allocator);
@@ -516,6 +523,166 @@ pub fn main() !void {
                 }
             }
         }
+    }
+}
+
+/// Count draw calls (= sub-meshes) for one vmdl_c. Mirrors the logic in
+/// pvs_baker's extractModelGeometry — first checks legacy VBIB/MBUF (always
+/// 1 sub-mesh), then walks the embedded mesh's MDAT block for m_drawCalls.
+fn countSubMeshes(allocator: std.mem.Allocator, data: []const u8) !u32 {
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    _ = allocator;
+
+    var resource = vrf.Resource.init(arena);
+    defer resource.deinit();
+    resource.resource_type = .model;
+    resource.read(data) catch return error.ParseFailed;
+
+    // Legacy VBIB/MBUF: one big buffer, treated as a single sub-mesh.
+    for (resource.blocks.items) |blk| {
+        if (blk.block_type == .vbib or blk.block_type == .mbuf) {
+            if (blk.size > 0) return 1;
+        }
+    }
+
+    // CTRL embedded-mesh path: count m_drawCalls inside the MDAT block.
+    const ctrl_block = resource.getBlockByType(.ctrl) orelse return error.ParseFailed;
+    const ctrl_raw = switch (ctrl_block.data) {
+        .kv3_block => |kb| kb.raw_data orelse return error.ParseFailed,
+        else => return error.ParseFailed,
+    };
+
+    var ctrl_doc = vrf.binary_kv3.decode(arena, ctrl_raw) catch return error.ParseFailed;
+    defer ctrl_doc.deinit();
+    const ctrl_root = ctrl_doc.root.asObject() orelse return error.ParseFailed;
+
+    const em_arr = ctrl_root.getArray("embedded_meshes") orelse return error.ParseFailed;
+    if (em_arr.count() == 0) return error.ParseFailed;
+    const em_obj = em_arr.items.items[0].asObject() orelse return error.ParseFailed;
+
+    const data_block_index = em_obj.get("m_nDataBlock") orelse return 1;
+    const dbi = data_block_index.asU32() orelse return 1;
+    const mdat_block = resource.getBlockByIndex(@intCast(dbi)) orelse return 1;
+    const mdat_raw = switch (mdat_block.data) {
+        .data_block => |db| db.raw_data orelse return 1,
+        else => return 1,
+    };
+
+    var mdat_doc = vrf.binary_kv3.decode(arena, mdat_raw) catch return 1;
+    defer mdat_doc.deinit();
+    const mdat_root = mdat_doc.root.asObject() orelse return 1;
+    const so_arr = mdat_root.getArray("m_sceneObjects") orelse return 1;
+
+    var dc_count: u32 = 0;
+    for (so_arr.items.items) |*so_val| {
+        const so_obj = so_val.asObject() orelse continue;
+        const dc_arr = so_obj.getArray("m_drawCalls") orelse continue;
+        for (dc_arr.items.items) |*dc_val| {
+            const dc_obj = dc_val.asObject() orelse continue;
+            const idx_count = dc_obj.getU32Property("m_nIndexCount") orelse continue;
+            if (idx_count == 0) continue;
+            dc_count += 1;
+        }
+    }
+
+    if (dc_count == 0) return 1; // fallback: one whole-buffer draw call
+    return dc_count;
+}
+
+const SubmeshTally = struct {
+    name: []const u8,
+    count: u32,
+};
+
+fn submeshStats(allocator: std.mem.Allocator, vpk_path: []const u8, stdout: anytype) !void {
+    var pkg = vrf.vpk.Package.init(allocator);
+    defer pkg.deinit();
+    pkg.readFile(vpk_path) catch |err| {
+        try std.io.getStdErr().writer().print("Error reading VPK: {}\n", .{err});
+        std.process.exit(1);
+    };
+
+    try stdout.print("Scanning {d} entries for vmdl_c...\n\n", .{pkg.entryCount()});
+
+    var tallies = std.ArrayList(SubmeshTally).init(allocator);
+    defer {
+        for (tallies.items) |t| allocator.free(t.name);
+        tallies.deinit();
+    }
+
+    var total_models: u32 = 0;
+    var total_submeshes: u64 = 0;
+    var failed: u32 = 0;
+
+    var it = pkg.iterateAll();
+    while (it.next()) |entry| {
+        if (!std.mem.eql(u8, entry.type_name, "vmdl_c")) continue;
+        const entry_data = pkg.readEntry(entry) catch {
+            failed += 1;
+            continue;
+        };
+        defer allocator.free(entry_data);
+
+        const n = countSubMeshes(allocator, entry_data) catch {
+            failed += 1;
+            continue;
+        };
+
+        const name = allocator.dupe(u8, entry.file_name) catch continue;
+        tallies.append(.{ .name = name, .count = n }) catch {
+            allocator.free(name);
+            continue;
+        };
+        total_models += 1;
+        total_submeshes += n;
+    }
+
+    // Sort descending by count so the worst offenders show first.
+    std.mem.sort(SubmeshTally, tallies.items, {}, struct {
+        fn lessThan(_: void, a: SubmeshTally, b: SubmeshTally) bool {
+            return a.count > b.count;
+        }
+    }.lessThan);
+
+    try stdout.print("══ Submesh Stats ══\n", .{});
+    try stdout.print("  Models scanned:    {d}\n", .{total_models});
+    try stdout.print("  Failed parses:     {d}\n", .{failed});
+    try stdout.print("  Total submeshes:   {d}\n", .{total_submeshes});
+    if (total_models > 0) {
+        const avg = @as(f64, @floatFromInt(total_submeshes)) / @as(f64, @floatFromInt(total_models));
+        try stdout.print("  Avg per model:     {d:.1}\n", .{avg});
+    }
+
+    // Distribution buckets
+    var b1: u32 = 0;
+    var b2_5: u32 = 0;
+    var b6_20: u32 = 0;
+    var b21_50: u32 = 0;
+    var b51_100: u32 = 0;
+    var b100p: u32 = 0;
+    for (tallies.items) |t| {
+        if (t.count == 1) b1 += 1
+        else if (t.count <= 5) b2_5 += 1
+        else if (t.count <= 20) b6_20 += 1
+        else if (t.count <= 50) b21_50 += 1
+        else if (t.count <= 100) b51_100 += 1
+        else b100p += 1;
+    }
+    try stdout.print("\n  Distribution:\n", .{});
+    try stdout.print("    1 submesh:        {d}\n", .{b1});
+    try stdout.print("    2-5 submeshes:    {d}\n", .{b2_5});
+    try stdout.print("    6-20 submeshes:   {d}\n", .{b6_20});
+    try stdout.print("    21-50 submeshes:  {d}\n", .{b21_50});
+    try stdout.print("    51-100 submeshes: {d}\n", .{b51_100});
+    try stdout.print("    100+ submeshes:   {d}\n", .{b100p});
+
+    // Top 20 worst offenders
+    try stdout.print("\n  Top 20 by submesh count:\n", .{});
+    const top_n = @min(@as(usize, 20), tallies.items.len);
+    for (tallies.items[0..top_n], 0..) |t, i| {
+        try stdout.print("    [{d:>2}] {d:>5}  {s}\n", .{ i + 1, t.count, t.name });
     }
 }
 

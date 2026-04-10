@@ -1,10 +1,10 @@
-// Neural PVS v2 — frustum-integrated visibility prediction.
+// Neural PVS v3 — quaternion-input visibility prediction.
 //
 // Direction + frustum-aware MLP predicts which models are visible AND
 // in-frustum from a camera state. Eliminates separate frustum cull pass.
 // Training uses spatial + distance weighted loss (center/near > edge/far).
 //
-// Input (9): x, y, z, sin_yaw, cos_yaw, sin_pitch, cos_pitch, vfov_norm, aspect_norm
+// Input (9): x, y, z, qw, qx, qy, qz, vfov_norm, aspect_norm
 // Architecture: input(9) → [H LeakyReLU] → [H LeakyReLU] → [N sigmoid]
 // Output: per-model visibility probability (combined PVS + frustum)
 
@@ -65,9 +65,51 @@ fn midpoint(a: Vec3, b: Vec3) Vec3 {
     };
 }
 
-/// Build look direction from yaw + pitch (Y-up coordinate system).
-fn lookDirFromAngles(sin_yaw: f32, cos_yaw: f32, sin_pitch: f32, cos_pitch: f32) Vec3 {
-    return .{ cos_pitch * sin_yaw, sin_pitch, cos_pitch * cos_yaw };
+/// Quaternion type: [w, x, y, z]
+const Quat = [4]f32;
+
+/// Build quaternion from yaw (around Y) and pitch (around X).
+/// Pitch is negated to match FPS convention: positive pitch = look up.
+fn quatFromYawPitch(yaw: f32, pitch: f32) Quat {
+    const hy = yaw * 0.5;
+    const hp = -pitch * 0.5;
+    const sy = @sin(hy);
+    const cy = @cos(hy);
+    const sp = @sin(hp);
+    const cp = @cos(hp);
+    // q = q_yaw * q_pitch  (Y-up: yaw around Y, pitch around X)
+    return .{
+        cy * cp, // w
+        cy * sp, // x
+        sy * cp, // y
+        -sy * sp, // z
+    };
+}
+
+/// Rotate the forward vector (0,0,1) by quaternion to get look direction.
+fn lookDirFromQuat(q: Quat) Vec3 {
+    // Optimized: q * (0,0,1) * q^-1
+    return .{
+        2.0 * (q[1] * q[3] + q[0] * q[2]), // x
+        2.0 * (q[2] * q[3] - q[0] * q[1]), // y
+        1.0 - 2.0 * (q[1] * q[1] + q[2] * q[2]), // z
+    };
+}
+
+/// Uniform random direction on the unit sphere (Marsaglia's method).
+fn randomOnSphere(rng: std.Random) Vec3 {
+    while (true) {
+        const x = rng.float(f32) * 2.0 - 1.0;
+        const y = rng.float(f32) * 2.0 - 1.0;
+        const s = x * x + y * y;
+        if (s >= 1.0 or s == 0.0) continue;
+        const factor = 2.0 * @sqrt(1.0 - s);
+        return .{
+            x * factor,
+            y * factor,
+            1.0 - 2.0 * s,
+        };
+    }
 }
 
 /// Random ray direction within a camera frustum.
@@ -156,20 +198,29 @@ pub const TrainingConfig = struct {
     max_vfov: f32 = MAX_VFOV,
     min_aspect: f32 = MIN_ASPECT,
     max_aspect: f32 = MAX_ASPECT,
-    // From-region stability (Wang et al. 2025): jitter positions within radius
-    // to teach stable predictions across small camera movements
+    // From-region stability (Wang et al. 2025): jitter positions and angles
+    // to teach stable predictions across small camera movements/turns
     jitter_radius: f32 = 0.3, // meters — viewcell radius
+    jitter_angle: f32 = 0.087, // radians — angular jitter (~5 degrees)
     jitter_count: u32 = 3, // extra jittered samples per primary sample
+    // Omnidirectional mode: ignore orientation entirely. Each sample fires
+    // rays over the full sphere from a position and stores ALL visible
+    // models (not just those in some frustum). The exemplar baker then
+    // selects in position-only space. Frustum culling happens at runtime.
+    omni_mode: bool = false,
 };
 
 pub const TrainingData = struct {
     positions: []Vec3,
-    params: [][6]f32, // sin_yaw, cos_yaw, sin_pitch, cos_pitch, vfov_norm, aspect_norm
+    params: [][6]f32, // qw, qx, qy, qz, vfov_norm, aspect_norm
     labels: [][]u8, // packed model bitsets
     num_models: u32,
     bitset_stride: u32,
     num_samples: u32,
     total_rays: u64,
+    // World bounds — needed for normalization, kept here for cache reload
+    world_min: Vec3 = .{ 0, 0, 0 },
+    world_max: Vec3 = .{ 1, 1, 1 },
     allocator: Allocator,
 
     pub fn deinit(self: *TrainingData) void {
@@ -177,6 +228,88 @@ pub const TrainingData = struct {
         self.allocator.free(self.labels);
         self.allocator.free(self.params);
         self.allocator.free(self.positions);
+    }
+
+    /// Save training data to a binary cache file (TDAT v1).
+    /// Lets us skip walker + probes + ray tracing on subsequent runs
+    /// when iterating on exemplar/MLP parameters.
+    pub fn save(self: *const TrainingData, path: []const u8) !void {
+        var file = try std.fs.cwd().createFile(path, .{});
+        defer file.close();
+        var bw = std.io.bufferedWriter(file.writer());
+        const w = bw.writer();
+
+        try w.writeAll("TDAT");
+        try w.writeInt(u32, 1, .little); // version
+        try w.writeInt(u32, self.num_models, .little);
+        try w.writeInt(u32, self.num_samples, .little);
+        try w.writeInt(u32, self.bitset_stride, .little);
+        try w.writeInt(u64, self.total_rays, .little);
+
+        for (self.world_min) |v| try w.writeInt(u32, @bitCast(v), .little);
+        for (self.world_max) |v| try w.writeInt(u32, @bitCast(v), .little);
+
+        for (0..self.num_samples) |i| {
+            for (self.positions[i]) |v| try w.writeInt(u32, @bitCast(v), .little);
+            for (self.params[i]) |v| try w.writeInt(u32, @bitCast(v), .little);
+            try w.writeAll(self.labels[i]);
+        }
+
+        try bw.flush();
+    }
+
+    pub fn load(allocator: Allocator, path: []const u8) !TrainingData {
+        const file = try std.fs.cwd().openFile(path, .{});
+        defer file.close();
+        var br = std.io.bufferedReader(file.reader());
+        const reader = br.reader();
+
+        var magic: [4]u8 = undefined;
+        _ = try reader.readAll(&magic);
+        if (!std.mem.eql(u8, &magic, "TDAT")) return error.InvalidMagic;
+
+        const version = try reader.readInt(u32, .little);
+        if (version != 1) return error.UnsupportedVersion;
+
+        const num_models = try reader.readInt(u32, .little);
+        const num_samples = try reader.readInt(u32, .little);
+        const bitset_stride = try reader.readInt(u32, .little);
+        const total_rays = try reader.readInt(u64, .little);
+
+        var world_min: Vec3 = undefined;
+        var world_max: Vec3 = undefined;
+        for (&world_min) |*v| v.* = @bitCast(try reader.readInt(u32, .little));
+        for (&world_max) |*v| v.* = @bitCast(try reader.readInt(u32, .little));
+
+        const positions = try allocator.alloc(Vec3, num_samples);
+        errdefer allocator.free(positions);
+        const params = try allocator.alloc([6]f32, num_samples);
+        errdefer allocator.free(params);
+        const labels = try allocator.alloc([]u8, num_samples);
+        errdefer {
+            for (labels) |l| allocator.free(l);
+            allocator.free(labels);
+        }
+
+        for (0..num_samples) |i| {
+            for (&positions[i]) |*v| v.* = @bitCast(try reader.readInt(u32, .little));
+            for (&params[i]) |*v| v.* = @bitCast(try reader.readInt(u32, .little));
+            labels[i] = try allocator.alloc(u8, bitset_stride);
+            _ = try reader.readAll(labels[i]);
+        }
+
+        return .{
+            .positions = positions,
+            .params = params,
+            .labels = labels,
+            .num_models = num_models,
+            .bitset_stride = bitset_stride,
+            .num_samples = num_samples,
+            .total_rays = total_rays,
+            .world_min = world_min,
+            .world_max = world_max,
+            .allocator = allocator,
+        };
     }
 };
 
@@ -191,6 +324,8 @@ const ThreadResult = struct {
 };
 
 /// Generate a single training sample. Returns true if sample was valid (found visible models).
+/// If probe_positions is non-null, samples are seeded around probe positions
+/// (surprise-distributed). Otherwise uses uniform random world sampling.
 fn generateOneSample(
     bivh: *const bivh_mod.Bivh,
     mesh_set: *const bivh_mod.TriangleMeshSet,
@@ -200,13 +335,25 @@ fn generateOneSample(
     pos_min: Vec3,
     pos_max: Vec3,
     config: TrainingConfig,
+    probe_positions: ?[]const [3]f32,
     result: *ThreadResult,
     thread_alloc: Allocator,
 ) bool {
     const rng = std.crypto.random;
     const bitset_stride: u32 = (num_models + 7) / 8;
 
-    const pos = Vec3{
+    // Position: probe-seeded with jitter, or uniform random world space
+    const pos = if (probe_positions) |probes| blk: {
+        const pi = rng.uintLessThan(usize, probes.len);
+        const seed = probes[pi];
+        // Small jitter so we don't keep sampling the exact same point
+        const jr: f32 = 0.5; // meters
+        break :blk Vec3{
+            std.math.clamp(seed[0] + (rng.float(f32) * 2.0 - 1.0) * jr, pos_min[0], pos_max[0]),
+            std.math.clamp(seed[1] + (rng.float(f32) * 2.0 - 1.0) * jr, pos_min[1], pos_max[1]),
+            std.math.clamp(seed[2] + (rng.float(f32) * 2.0 - 1.0) * jr, pos_min[2], pos_max[2]),
+        };
+    } else Vec3{
         pos_min[0] + rng.float(f32) * (pos_max[0] - pos_min[0]),
         pos_min[1] + rng.float(f32) * (pos_max[1] - pos_min[1]),
         pos_min[2] + rng.float(f32) * (pos_max[2] - pos_min[2]),
@@ -217,11 +364,8 @@ fn generateOneSample(
     const vfov = config.min_vfov + rng.float(f32) * (config.max_vfov - config.min_vfov);
     const aspect = config.min_aspect + rng.float(f32) * (config.max_aspect - config.min_aspect);
 
-    const sin_yaw = @sin(yaw);
-    const cos_yaw = @cos(yaw);
-    const sin_pitch = @sin(pitch);
-    const cos_pitch = @cos(pitch);
-    const look_dir = lookDirFromAngles(sin_yaw, cos_yaw, sin_pitch, cos_pitch);
+    const quat = quatFromYawPitch(yaw, pitch);
+    const look_dir = lookDirFromQuat(quat);
 
     const bitset = thread_alloc.alloc(u8, bitset_stride) catch return false;
     @memset(bitset, 0);
@@ -295,13 +439,13 @@ fn generateOneSample(
     result.attempts += 1;
 
     if (found_any) {
-        const param = [6]f32{ sin_yaw, cos_yaw, sin_pitch, cos_pitch, normVfov(vfov), normAspect(aspect) };
+        const param = [6]f32{ quat[0], quat[1], quat[2], quat[3], normVfov(vfov), normAspect(aspect) };
         result.positions.append(pos) catch return false;
         result.params.append(param) catch return false;
         result.labels.append(bitset) catch return false;
         result.sample_count += 1;
 
-        // From-region jitter
+        // From-region jitter (position + angular)
         for (0..config.jitter_count) |_| {
             const jx = (rng.float(f32) * 2.0 - 1.0) * config.jitter_radius;
             const jy = (rng.float(f32) * 2.0 - 1.0) * config.jitter_radius;
@@ -312,13 +456,152 @@ fn generateOneSample(
                 std.math.clamp(pos[2] + jz, pos_min[2], pos_max[2]),
             };
 
+            // Angular jitter: perturb yaw and pitch slightly
+            const jyaw = yaw + (rng.float(f32) * 2.0 - 1.0) * config.jitter_angle;
+            const jpitch = std.math.clamp(
+                pitch + (rng.float(f32) * 2.0 - 1.0) * config.jitter_angle,
+                config.min_pitch,
+                config.max_pitch,
+            );
+            const jquat = quatFromYawPitch(jyaw, jpitch);
+            const jparam = [6]f32{ jquat[0], jquat[1], jquat[2], jquat[3], normVfov(vfov), normAspect(aspect) };
+
             const jittered_label = thread_alloc.alloc(u8, bitset_stride) catch continue;
             @memcpy(jittered_label, bitset);
             result.positions.append(jittered_pos) catch continue;
-            result.params.append(param) catch continue;
+            result.params.append(jparam) catch continue;
             result.labels.append(jittered_label) catch continue;
         }
 
+        return true;
+    } else {
+        thread_alloc.free(bitset);
+        return false;
+    }
+}
+
+/// Generate a single omnidirectional training sample.
+/// Fires rays over the full sphere from `pos` and records ALL visible models.
+/// No orientation, no frustum, no jitter clones — each call is one real measurement.
+/// Stores zero params (orientation slots are unused in position-only exemplar mode).
+fn generateOneOmniSample(
+    bivh: *const bivh_mod.Bivh,
+    mesh_set: *const bivh_mod.TriangleMeshSet,
+    world_perm: []const u32,
+    tri_to_model: []const u32,
+    num_models: u32,
+    pos_min: Vec3,
+    pos_max: Vec3,
+    config: TrainingConfig,
+    probe_positions: ?[]const [3]f32,
+    result: *ThreadResult,
+    thread_alloc: Allocator,
+) bool {
+    const rng = std.crypto.random;
+    const bitset_stride: u32 = (num_models + 7) / 8;
+
+    // Position: probe-seeded with jitter, or uniform random world space.
+    // (Same logic as the frustum sampler — orientation is what we're dropping,
+    // not the spatial sampling distribution.)
+    const pos = if (probe_positions) |probes| blk: {
+        const pi = rng.uintLessThan(usize, probes.len);
+        const seed = probes[pi];
+        const jr: f32 = 0.5; // meters
+        break :blk Vec3{
+            std.math.clamp(seed[0] + (rng.float(f32) * 2.0 - 1.0) * jr, pos_min[0], pos_max[0]),
+            std.math.clamp(seed[1] + (rng.float(f32) * 2.0 - 1.0) * jr, pos_min[1], pos_max[1]),
+            std.math.clamp(seed[2] + (rng.float(f32) * 2.0 - 1.0) * jr, pos_min[2], pos_max[2]),
+        };
+    } else Vec3{
+        pos_min[0] + rng.float(f32) * (pos_max[0] - pos_min[0]),
+        pos_min[1] + rng.float(f32) * (pos_max[1] - pos_min[1]),
+        pos_min[2] + rng.float(f32) * (pos_max[2] - pos_min[2]),
+    };
+
+    const bitset = thread_alloc.alloc(u8, bitset_stride) catch return false;
+    @memset(bitset, 0);
+    var found_any = false;
+    var rays: u64 = 0;
+
+    for (0..config.rays_per_sample) |_| {
+        const dir = randomOnSphere(rng);
+        var ray = bivh_mod.TraceRay.make(pos[0], pos[1], pos[2], dir[0], dir[1], dir[2], config.max_ray_dist);
+        const hit = bivh.trace(mesh_set, &ray, 0.0001, config.max_ray_dist);
+        rays += 1;
+
+        if (hit and ray.hit_primitive >= 0) {
+            const sorted_idx: u32 = @intCast(ray.hit_primitive);
+            if (sorted_idx >= world_perm.len) continue;
+            const orig_idx = world_perm[sorted_idx];
+            if (orig_idx >= tri_to_model.len) continue;
+            const model_id = tri_to_model[orig_idx];
+
+            if (model_id != std.math.maxInt(u32) and model_id < num_models) {
+                const was_new = !bitsetGet(bitset, model_id);
+                bitsetSet(bitset, model_id);
+                found_any = true;
+
+                // Bundle refinement: when we hit a new model, fire short rays
+                // from each triangle vertex/midpoint back toward our position
+                // to catch nearby co-visible geometry. Same trick as the
+                // frustum sampler — works equally well here.
+                if (was_new) {
+                    const tri_base = @as(usize, sorted_idx) * 3;
+                    if (tri_base + 2 >= mesh_set.indices.len) continue;
+                    const v0 = mesh_set.positions[mesh_set.indices[tri_base]];
+                    const v1 = mesh_set.positions[mesh_set.indices[tri_base + 1]];
+                    const v2 = mesh_set.positions[mesh_set.indices[tri_base + 2]];
+
+                    const probes_arr = [6]Vec3{
+                        v0,              v1,              v2,
+                        midpoint(v0, v1), midpoint(v0, v2), midpoint(v1, v2),
+                    };
+
+                    for (probes_arr) |probe| {
+                        const to_cam = sub3(pos, probe);
+                        const dist = length3(to_cam);
+                        if (dist < 0.01) continue;
+                        const dir_to_cam = scale3(to_cam, 1.0 / dist);
+                        const offset_probe = add3(probe, scale3(dir_to_cam, config.bundle_offset));
+
+                        var bundle_ray = bivh_mod.TraceRay.make(
+                            offset_probe[0], offset_probe[1], offset_probe[2],
+                            dir_to_cam[0],   dir_to_cam[1],   dir_to_cam[2],
+                            dist,
+                        );
+                        const bundle_hit = bivh.trace(mesh_set, &bundle_ray, 0.0001, dist);
+                        rays += 1;
+
+                        if (bundle_hit and bundle_ray.hit_primitive >= 0) {
+                            const b_sorted: u32 = @intCast(bundle_ray.hit_primitive);
+                            if (b_sorted < world_perm.len) {
+                                const b_orig = world_perm[b_sorted];
+                                if (b_orig < tri_to_model.len) {
+                                    const b_model = tri_to_model[b_orig];
+                                    if (b_model != std.math.maxInt(u32) and b_model < num_models) {
+                                        bitsetSet(bitset, b_model);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    result.total_rays += rays;
+    result.attempts += 1;
+
+    if (found_any) {
+        // Orientation slots zeroed — they're ignored at query time in
+        // position-only exemplar mode. Identity quaternion (w=1) for safety
+        // in case anything reads it.
+        const param = [6]f32{ 1, 0, 0, 0, 0.5, 0.5 };
+        result.positions.append(pos) catch return false;
+        result.params.append(param) catch return false;
+        result.labels.append(bitset) catch return false;
+        result.sample_count += 1;
         return true;
     } else {
         thread_alloc.free(bitset);
@@ -336,6 +619,7 @@ fn dataGenWorker(
     pos_min: Vec3,
     pos_max: Vec3,
     config: TrainingConfig,
+    probe_positions: ?[]const [3]f32,
     target_samples: u32,
     result: *ThreadResult,
 ) void {
@@ -345,18 +629,26 @@ fn dataGenWorker(
     const max_att: u64 = @as(u64, target_samples) * 10;
 
     while (generated < target_samples and att < max_att) : (att += 1) {
-        if (generateOneSample(
-            bivh, mesh_set, world_perm, tri_to_model,
-            num_models, pos_min, pos_max, config, result, thread_alloc,
-        )) {
-            generated += 1;
-        }
+        const ok = if (config.omni_mode)
+            generateOneOmniSample(
+                bivh, mesh_set, world_perm, tri_to_model,
+                num_models, pos_min, pos_max, config, probe_positions, result, thread_alloc,
+            )
+        else
+            generateOneSample(
+                bivh, mesh_set, world_perm, tri_to_model,
+                num_models, pos_min, pos_max, config, probe_positions, result, thread_alloc,
+            );
+        if (ok) generated += 1;
     }
 }
 
 /// Generate frustum-aware training data via ray bundles (parallelized).
 /// Each sample: random (position, yaw, pitch, vfov, aspect) → cast rays within frustum →
 /// record which models are visible. Bundle refinement on hit.
+///
+/// If `probe_positions` is non-null, positions are seeded from probes (surprise-distributed)
+/// instead of uniform world sampling. Each probe gets multiple orientations (camera spins).
 pub fn generateTrainingData(
     allocator: Allocator,
     bivh: *const bivh_mod.Bivh,
@@ -367,14 +659,22 @@ pub fn generateTrainingData(
     pos_min: Vec3,
     pos_max: Vec3,
     config: TrainingConfig,
+    probe_positions: ?[]const [3]f32,
     stdout: anytype,
 ) !TrainingData {
     const num_threads = @max(1, std.Thread.getCpuCount() catch 4);
     const samples_per_thread = (config.num_samples + @as(u32, @intCast(num_threads)) - 1) / @as(u32, @intCast(num_threads));
 
-    try stdout.print("  Generating {d} frustum-aware samples ({d} rays/sample, {d} threads)...\n", .{
-        config.num_samples, config.rays_per_sample, num_threads,
-    });
+    const mode_str: []const u8 = if (config.omni_mode) "omnidirectional" else "frustum";
+    if (probe_positions) |pp| {
+        try stdout.print("  Generating {d} probe-seeded {s} samples from {d} probes ({d} rays/sample, {d} threads)...\n", .{
+            config.num_samples, mode_str, pp.len, config.rays_per_sample, num_threads,
+        });
+    } else {
+        try stdout.print("  Generating {d} uniform random {s} samples ({d} rays/sample, {d} threads)...\n", .{
+            config.num_samples, mode_str, config.rays_per_sample, num_threads,
+        });
+    }
 
     // Per-thread arenas to avoid GPA mutex contention
     const thread_arenas = try allocator.alloc(std.heap.ArenaAllocator, num_threads);
@@ -404,7 +704,7 @@ pub fn generateTrainingData(
     for (thread_results, threads) |*tr, *t| {
         t.* = try std.Thread.spawn(.{}, dataGenWorker, .{
             bivh, mesh_set, world_perm, tri_to_model,
-            num_models, pos_min, pos_max, config,
+            num_models, pos_min, pos_max, config, probe_positions,
             samples_per_thread, tr,
         });
     }
@@ -475,6 +775,8 @@ pub fn generateTrainingData(
         .bitset_stride = (num_models + 7) / 8,
         .num_samples = @intCast(total_samples),
         .total_rays = total_rays,
+        .world_min = pos_min,
+        .world_max = pos_max,
         .allocator = allocator,
     };
 }
@@ -626,10 +928,10 @@ pub const MLP = struct {
             (pos[0] - self.pos_min[0]) * self.pos_scale[0],
             (pos[1] - self.pos_min[1]) * self.pos_scale[1],
             (pos[2] - self.pos_min[2]) * self.pos_scale[2],
-            p[0], // sin_yaw
-            p[1], // cos_yaw
-            p[2], // sin_pitch
-            p[3], // cos_pitch
+            p[0], // qw
+            p[1], // qx
+            p[2], // qy
+            p[3], // qz
             p[4], // vfov_norm
             p[5], // aspect_norm
         };
@@ -904,7 +1206,7 @@ pub fn train(
 
         for (indices, 0..) |idx, si| {
             const p = data.params[idx];
-            const look_dir = lookDirFromAngles(p[0], p[1], p[2], p[3]);
+            const look_dir = lookDirFromQuat(.{ p[0], p[1], p[2], p[3] });
 
             // Compute per-model spatial + distance weights
             computeSpatialWeights(

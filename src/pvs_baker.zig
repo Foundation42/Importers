@@ -15,6 +15,7 @@ const bivh_mod = @import("bivh");
 const pvs_mod = @import("pvs");
 const pvs_viz = @import("pvs_viz");
 const pvs_neural = @import("pvs_neural");
+const pvs_exemplar = @import("pvs_exemplar");
 
 const Vec3 = [3]f32;
 
@@ -46,6 +47,60 @@ pub fn main() !void {
 
     const t0 = std.time.nanoTimestamp();
 
+    // ── FAST_EPVS fast path: skip walker/probes/datagen, just rerun exemplar selection ──
+    const fast_epvs = std.process.getEnvVarOwned(allocator, "FAST_EPVS") catch null;
+    defer if (fast_epvs) |s| allocator.free(s);
+
+    if (fast_epvs != null) {
+        const base_name = std.fs.path.stem(map_vpk_path);
+        const train_path = try std.fmt.allocPrint(allocator, "{s}_train.bin", .{base_name});
+        defer allocator.free(train_path);
+
+        try stderr.print("[FastEPVS] Loading cached training data from {s}\n", .{train_path});
+        var train_data = pvs_neural.TrainingData.load(allocator, train_path) catch |err| {
+            try stderr.print("[FastEPVS] Failed to load training cache: {}\n", .{err});
+            try stderr.print("[FastEPVS] Run baker without FAST_EPVS once to generate the cache.\n", .{});
+            std.process.exit(1);
+        };
+        defer train_data.deinit();
+
+        try stdout.print("  Loaded {d} samples, {d} models, {d}MB\n", .{
+            train_data.num_samples, train_data.num_models,
+            (train_data.num_samples * (12 + 24 + train_data.bitset_stride)) / (1024 * 1024),
+        });
+
+        const t_ex0 = std.time.nanoTimestamp();
+        try stderr.print("[Exemplar] Building exemplar model...\n", .{});
+        var epvs = try pvs_exemplar.selectExemplars(
+            allocator,
+            &train_data,
+            train_data.world_min,
+            train_data.world_max,
+            .{
+                .max_exemplars = 64000,
+                .rbf_sigma = 0.5,
+                .surprise_threshold = 0.05,
+                .seed_count = 200,
+            },
+            stdout,
+        );
+        defer epvs.deinit();
+
+        const t_ex1 = std.time.nanoTimestamp();
+        try stdout.print("  Exemplar build: {d}ms\n", .{@divTrunc(t_ex1 - t_ex0, 1_000_000)});
+
+        try pvs_exemplar.evaluate(&epvs, &train_data, 0.3, stdout);
+
+        const epvs_path = try std.fmt.allocPrint(allocator, "{s}_epvs.bin", .{base_name});
+        defer allocator.free(epvs_path);
+        try epvs.save(epvs_path);
+        try stdout.print("  → {s}\n", .{epvs_path});
+
+        const t_total = std.time.nanoTimestamp();
+        try stdout.print("\n  ═══ Total time: {d}ms ═══\n", .{@divTrunc(t_total - t0, 1_000_000)});
+        return;
+    }
+
     // ── Phase 1: Load geometry from VPK ──────────────────────────────
 
     var all_positions = std.ArrayList(Vec3).init(allocator);
@@ -64,6 +119,12 @@ pub fn main() !void {
         for (model_ranges.items) |mr| allocator.free(mr.name);
         model_ranges.deinit();
     }
+
+    // Per-submesh ranges (one entry per draw call). The model_name field
+    // borrows from the corresponding model_ranges entry's owned name buffer
+    // — they have the same lifetime.
+    var submesh_ranges = std.ArrayList(SubmeshRange).init(allocator);
+    defer submesh_ranges.deinit();
 
     var model_count: u32 = 0;
     var failed_count: u32 = 0;
@@ -92,21 +153,31 @@ pub fn main() !void {
     }
 
     // Iterate all vmdl_c entries
+    var proxy_count: u32 = 0;
     var it = map_pkg.iterateAll();
     while (it.next()) |entry| {
         if (!std.mem.eql(u8, entry.type_name, "vmdl_c")) continue;
 
+        // Skip non-renderable proxy geometry (clip brushes, occluders, etc.)
+        if (isProxyModel(entry.file_name)) {
+            proxy_count += 1;
+            continue;
+        }
+
         const entry_data = map_pkg.readEntry(entry) catch continue;
         defer allocator.free(entry_data);
 
+        // Allocate the name first so the sub-mesh ranges can borrow it.
+        const name = allocator.dupe(u8, entry.file_name) catch continue;
+
         const tri_start = @as(u32, @intCast(all_indices.items.len / 3));
-        extractModelGeometry(allocator, entry_data, &all_positions, &all_indices) catch {
+        extractModelGeometry(allocator, entry_data, &all_positions, &all_indices, &submesh_ranges, name) catch {
+            allocator.free(name);
             failed_count += 1;
             continue;
         };
         const tri_end = @as(u32, @intCast(all_indices.items.len / 3));
 
-        const name = allocator.dupe(u8, entry.file_name) catch continue;
         model_ranges.append(.{
             .tri_start = tri_start,
             .tri_end = tri_end,
@@ -124,17 +195,25 @@ pub fn main() !void {
         var cit = cpkg.iterateAll();
         while (cit.next()) |entry| {
             if (!std.mem.eql(u8, entry.type_name, "vmdl_c")) continue;
+
+            if (isProxyModel(entry.file_name)) {
+                proxy_count += 1;
+                continue;
+            }
+
             const entry_data = cpkg.readEntry(entry) catch continue;
             defer allocator.free(entry_data);
 
+            const name = allocator.dupe(u8, entry.file_name) catch continue;
+
             const tri_start = @as(u32, @intCast(all_indices.items.len / 3));
-            extractModelGeometry(allocator, entry_data, &all_positions, &all_indices) catch {
+            extractModelGeometry(allocator, entry_data, &all_positions, &all_indices, &submesh_ranges, name) catch {
+                allocator.free(name);
                 failed_count += 1;
                 continue;
             };
             const tri_end = @as(u32, @intCast(all_indices.items.len / 3));
 
-            const name = allocator.dupe(u8, entry.file_name) catch continue;
             model_ranges.append(.{
                 .tri_start = tri_start,
                 .tri_end = tri_end,
@@ -145,6 +224,9 @@ pub fn main() !void {
             };
             model_count += 1;
         }
+    }
+    if (proxy_count > 0) {
+        try stderr.print("[Baker] Filtered {d} proxy models (clip brushes, occluders)\n", .{proxy_count});
     }
 
     const tri_count = @as(u32, @intCast(all_indices.items.len / 3));
@@ -913,69 +995,81 @@ pub fn main() !void {
                 }
             }
 
-            // Compute minimum enclosing spheres per model (Welzl's algorithm)
-            const BoundingSphere = struct { center: [3]f32, radius: f32 };
-            const model_bounds = try allocator.alloc(BoundingSphere, num_models);
-            defer allocator.free(model_bounds);
-            {
-                // Centroid + extremal point: tighter than AABB, O(n), guaranteed termination
-                for (model_ranges.items, 0..) |mr, mi| {
-                    const c = model_centroids[mi];
-                    var max_dist_sq: f32 = 0;
-                    for (mr.tri_start..mr.tri_end) |ti| {
-                        const base = ti * 3;
-                        for (0..3) |vi| {
-                            if (base + vi < mesh_set.indices.len) {
-                                const v = all_positions.items[mesh_set.indices[base + vi]];
-                                const dx = v[0] - c[0];
-                                const dy = v[1] - c[1];
-                                const dz = v[2] - c[2];
-                                max_dist_sq = @max(max_dist_sq, dx * dx + dy * dy + dz * dz);
-                            }
-                        }
-                    }
-                    model_bounds[mi] = .{ .center = c, .radius = @sqrt(max_dist_sq) };
-                }
-                try stdout.print("  Computed {d} bounding spheres\n", .{num_models});
-                stderr.print("[NPVS] Bounding spheres done\n", .{}) catch {};
+            // (Used to write a _model_bounds.bin sidecar with MinBall spheres
+            // per model. Removed: the baker's coordinate space didn't match the
+            // runtime's instance transforms, so the spheres ended up in the wrong
+            // place and frustum culling dropped half the geometry. The runtime
+            // now computes spheres from its own AABBs at load time.)
+
+            // Extract probe positions for surprise-distributed sampling
+            const probe_pos_array = try allocator.alloc([3]f32, probes.len);
+            defer allocator.free(probe_pos_array);
+            for (probes, 0..) |probe, pi| probe_pos_array[pi] = probe.position;
+
+            // OMNI_EPVS: omnidirectional sampling for the exemplar baker.
+            // Each sample fires rays over the full sphere from a position and
+            // stores ALL visible models — orientation is dropped entirely.
+            // The exemplar baker selects in position-only space and the runtime
+            // does standard frustum culling on top of the kNN result.
+            const omni_epvs = std.process.getEnvVarOwned(allocator, "OMNI_EPVS") catch null;
+            defer if (omni_epvs) |s| allocator.free(s);
+            if (omni_epvs != null) {
+                stderr.print("[NPVS] OMNI_EPVS set — omnidirectional sampling enabled\n", .{}) catch {};
             }
 
-            // Write _model_bounds.bin sidecar
-            {
-                const bounds_path = try std.fmt.allocPrint(allocator, "{s}_model_bounds.bin", .{base_name});
-                defer allocator.free(bounds_path);
-                var bf = try std.fs.cwd().createFile(bounds_path, .{});
-                defer bf.close();
-                var bw = std.io.bufferedWriter(bf.writer());
-                const bwr = bw.writer();
+            // ── Per-submesh PVS units (omni mode only) ──
+            // In omni mode we treat each submesh as its own PVS unit instead
+            // of one bit per model. This fixes data quality for Source 2
+            // aggregate models (e.g. asphalt agg_merge_*) that span the whole
+            // map: a single per-model PVS bit for those is "always visible"
+            // and carries no information. Per-submesh, each chunk gets its
+            // own bit. Submeshes whose AABB exceeds the world-fraction
+            // threshold are excluded from PVS entirely (still ray-traced for
+            // occlusion, but always drawn at runtime — see drawCulled).
+            var pvs_units_tri_to_unit: ?[]u32 = null;
+            defer if (pvs_units_tri_to_unit) |slice| allocator.free(slice);
+            var pvs_units_count: u32 = num_models;
 
-                try bwr.writeAll("MBND"); // magic
-                try bwr.writeInt(u32, 1, .little); // version
-                try bwr.writeInt(u32, num_models, .little);
-                for (model_bounds) |mb| {
-                    for (mb.center) |v| try bwr.writeInt(u32, @bitCast(v), .little);
-                    try bwr.writeInt(u32, @bitCast(mb.radius), .little);
-                }
-                try bw.flush();
-                try stdout.print("  → {s}\n", .{bounds_path});
+            if (omni_epvs != null) {
+                try buildSubmeshPvsUnits(
+                    allocator,
+                    submesh_ranges.items,
+                    all_positions.items,
+                    all_indices.items,
+                    world_min,
+                    world_max,
+                    base_name,
+                    tri_count,
+                    &pvs_units_tri_to_unit,
+                    &pvs_units_count,
+                    stdout,
+                );
             }
 
-            // Generate frustum-aware training data
-            stderr.print("[NPVS] Starting parallel data generation...\n", .{}) catch {};
+            const data_tri_to_unit: []const u32 = pvs_units_tri_to_unit orelse tri_to_model;
+            const data_num_units: u32 = pvs_units_count;
+
+            // Generate training data, seeded from GI probes
+            stderr.print("[NPVS] Starting probe-seeded data generation...\n", .{}) catch {};
             var train_data = try pvs_neural.generateTrainingData(
                 allocator,
                 &world_bivh,
                 &mesh_set,
                 world_perm,
-                tri_to_model,
-                num_models,
+                data_tri_to_unit,
+                data_num_units,
                 world_min,
                 world_max,
                 .{
                     .num_samples = 20_000,
-                    .rays_per_sample = 256,
+                    // Sphere covers ~6× the solid angle of a typical frustum,
+                    // so bump rays per sample in omni mode to keep per-direction
+                    // density similar.
+                    .rays_per_sample = if (omni_epvs != null) @as(u32, 1024) else @as(u32, 256),
                     .max_ray_dist = 2000.0,
+                    .omni_mode = omni_epvs != null,
                 },
+                probe_pos_array,
                 stdout,
             );
             defer train_data.deinit();
@@ -983,38 +1077,87 @@ pub fn main() !void {
             const t_data = std.time.nanoTimestamp();
             const data_gen_ms = @divTrunc(t_data - t_neural0, 1_000_000);
             try stdout.print("  Data gen: {d}ms\n", .{data_gen_ms});
-            stderr.print("[NPVS] Data gen: {d}ms, starting training...\n", .{data_gen_ms}) catch {};
 
-            // Train MLP with spatial + distance weighted loss
-            var mlp = try pvs_neural.train(
+            // Save training data cache for fast iteration (FAST_EPVS path)
+            {
+                const train_path = try std.fmt.allocPrint(allocator, "{s}_train.bin", .{base_name});
+                defer allocator.free(train_path);
+                try train_data.save(train_path);
+                try stdout.print("  → {s} (training cache)\n", .{train_path});
+            }
+
+            // Skip MLP training when SKIP_MLP env var is set (faster iteration on exemplars).
+            // Also skip when OMNI_EPVS is set — the MLP's input is direction-aware and
+            // the omnidirectional training data has no orientation to learn from.
+            const skip_mlp = std.process.getEnvVarOwned(allocator, "SKIP_MLP") catch null;
+            defer if (skip_mlp) |s| allocator.free(s);
+
+            if (skip_mlp == null and omni_epvs == null) {
+                stderr.print("[NPVS] Data gen: {d}ms, starting training...\n", .{data_gen_ms}) catch {};
+
+                // Train MLP with spatial + distance weighted loss
+                var mlp = try pvs_neural.train(
+                    allocator,
+                    &train_data,
+                    model_centroids,
+                    world_min,
+                    world_max,
+                    .{
+                        .epochs = 30,
+                        .learning_rate = 0.0005,
+                        .batch_size = 32,
+                        .hidden_size = 384,
+                        .eval_threshold = 0.3,
+                        .center_boost = 2.0,
+                        .near_boost = 2.0,
+                        .ref_dist = 5.0,
+                    },
+                    stdout,
+                );
+                defer mlp.deinit();
+
+                const t_train = std.time.nanoTimestamp();
+                try stdout.print("  Training: {d}ms\n", .{@divTrunc(t_train - t_data, 1_000_000)});
+
+                // Save weights
+                const npvs_path = try std.fmt.allocPrint(allocator, "{s}_npvs.bin", .{base_name});
+                defer allocator.free(npvs_path);
+                try mlp.save(npvs_path);
+                try stdout.print("  → {s}\n", .{npvs_path});
+                stderr.print("[NPVS] Done! Saved to {s}\n", .{npvs_path}) catch {};
+            } else {
+                stderr.print("[NPVS] SKIP_MLP set — skipping MLP training\n", .{}) catch {};
+            }
+
+            // ── Exemplar PVS (alternative model) ──
+            stderr.print("[Exemplar] Building exemplar model...\n", .{}) catch {};
+            const t_exemplar0 = std.time.nanoTimestamp();
+            var epvs = try pvs_exemplar.selectExemplars(
                 allocator,
                 &train_data,
-                model_centroids,
                 world_min,
                 world_max,
                 .{
-                    .epochs = 30,
-                    .learning_rate = 0.0005,
-                    .batch_size = 32,
-                    .hidden_size = 256,
-                    .eval_threshold = 0.3,
-                    .center_boost = 2.0,
-                    .near_boost = 2.0,
-                    .ref_dist = 5.0,
+                    .max_exemplars = 64000,
+                    .rbf_sigma = 0.5,
+                    .surprise_threshold = 0.05,
+                    .seed_count = 200,
                 },
                 stdout,
             );
-            defer mlp.deinit();
+            defer epvs.deinit();
 
-            const t_train = std.time.nanoTimestamp();
-            try stdout.print("  Training: {d}ms\n", .{@divTrunc(t_train - t_data, 1_000_000)});
+            const t_exemplar1 = std.time.nanoTimestamp();
+            try stdout.print("  Exemplar build: {d}ms\n", .{@divTrunc(t_exemplar1 - t_exemplar0, 1_000_000)});
 
-            // Save weights
-            const npvs_path = try std.fmt.allocPrint(allocator, "{s}_npvs.bin", .{base_name});
-            defer allocator.free(npvs_path);
-            try mlp.save(npvs_path);
-            try stdout.print("  → {s}\n", .{npvs_path});
-            stderr.print("[NPVS] Done! Saved to {s}\n", .{npvs_path}) catch {};
+            // Evaluate
+            try pvs_exemplar.evaluate(&epvs, &train_data, 0.3, stdout);
+
+            const epvs_path = try std.fmt.allocPrint(allocator, "{s}_epvs.bin", .{base_name});
+            defer allocator.free(epvs_path);
+            try epvs.save(epvs_path);
+            try stdout.print("  → {s}\n", .{epvs_path});
+            stderr.print("[Exemplar] Done! Saved to {s}\n", .{epvs_path}) catch {};
         }
     }
 
@@ -1070,11 +1213,25 @@ fn walkerProgress(cells_done: u32, total_cells: u32, connections: u64) void {
 
 // ── Geometry extraction ─────────────────────────────────────────────
 
+/// Per-submesh geometry range. Populated by `extractModelGeometry` when an
+/// output list is provided. Each entry maps a contiguous slice of the global
+/// triangle array back to its source (model name + submesh index inside that
+/// model). Used for sub-mesh-granularity PVS so aggregate world geometry
+/// doesn't all share one PVS bit.
+pub const SubmeshRange = struct {
+    tri_start: u32,
+    tri_end: u32,
+    model_name: []const u8, // borrowed (lives as long as the caller's name buffer)
+    submesh_idx: u32,
+};
+
 fn extractModelGeometry(
     allocator: Allocator,
     data: []const u8,
     positions: *std.ArrayList(Vec3),
     indices: *std.ArrayList(u32),
+    submesh_ranges: ?*std.ArrayList(SubmeshRange),
+    model_name: []const u8,
 ) !void {
     var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena_state.deinit();
@@ -1085,6 +1242,29 @@ fn extractModelGeometry(
     resource.resource_type = .model;
     resource.read(data) catch return error.ParseFailed;
 
+    // Helper: record one sub-mesh boundary, given the tri count before/after.
+    const Helper = struct {
+        fn record(
+            list: ?*std.ArrayList(SubmeshRange),
+            mname: []const u8,
+            sidx: *u32,
+            tri_before: u32,
+            tri_after: u32,
+        ) void {
+            if (tri_after <= tri_before) return;
+            if (list) |l| {
+                l.append(.{
+                    .tri_start = tri_before,
+                    .tri_end = tri_after,
+                    .model_name = mname,
+                    .submesh_idx = sidx.*,
+                }) catch {};
+            }
+            sidx.* += 1;
+        }
+    };
+    var submesh_idx: u32 = 0;
+
     // Try legacy VBIB/MBUF first
     for (resource.blocks.items) |blk| {
         if (blk.block_type == .vbib or blk.block_type == .mbuf) {
@@ -1093,7 +1273,10 @@ fn extractModelGeometry(
                 var vbib = vrf.VBIB.readFromBinaryBlock(arena, block_bytes) catch return error.ParseFailed;
                 defer vbib.deinit();
                 if (vbib.vertex_buffers.len > 0 and vbib.index_buffers.len > 0) {
+                    const tri_before: u32 = @intCast(indices.items.len / 3);
                     try appendVbibGeometry(allocator, &vbib, positions, indices, null);
+                    const tri_after: u32 = @intCast(indices.items.len / 3);
+                    Helper.record(submesh_ranges, model_name, &submesh_idx, tri_before, tri_after);
                     return;
                 }
             }
@@ -1146,7 +1329,10 @@ fn extractModelGeometry(
                                             .start_index = start_index,
                                             .index_count = index_count,
                                         };
+                                        const tri_before: u32 = @intCast(indices.items.len / 3);
                                         appendVbibGeometry(allocator, &vbib, positions, indices, dc_info) catch continue;
+                                        const tri_after: u32 = @intCast(indices.items.len / 3);
+                                        Helper.record(submesh_ranges, model_name, &submesh_idx, tri_before, tri_after);
                                         has_draw_calls = true;
                                     }
                                 }
@@ -1160,7 +1346,12 @@ fn extractModelGeometry(
     }
 
     // Fallback: whole buffer as a single draw call
-    try appendVbibGeometry(allocator, &vbib, positions, indices, null);
+    {
+        const tri_before: u32 = @intCast(indices.items.len / 3);
+        try appendVbibGeometry(allocator, &vbib, positions, indices, null);
+        const tri_after: u32 = @intCast(indices.items.len / 3);
+        Helper.record(submesh_ranges, model_name, &submesh_idx, tri_before, tri_after);
+    }
 }
 
 const DrawCallRange = struct {
@@ -1212,6 +1403,234 @@ fn appendVbibGeometry(
         const raw = ib.getIndex(start_idx + @as(u32, @intCast(i)));
         indices.appendAssumeCapacity(base_vertex + (raw - min_vert));
     }
+}
+
+/// Build per-submesh PVS units, apply the oversize-skip filter, and write
+/// the `_pvs_submeshes.bin` sidecar that the runtime needs to map each
+/// (model, submesh) pair to its PVS bit.
+///
+/// Inputs:
+///   submesh_ranges — one entry per (model, submesh) tagged with tri range
+///   positions/indices — global geometry arrays
+///   world_min/max — for the size threshold
+///   base_name — for the sidecar filename
+///   tri_count — total triangles (size of the output tri_to_unit array)
+///
+/// Outputs:
+///   *out_tri_to_unit — allocated u32 slice of length tri_count, mapping
+///                      original triangle index → PVS unit ID. Triangles
+///                      from skipped submeshes get sentinel (max u32).
+///   *out_num_units — number of PVS bits actually assigned
+fn buildSubmeshPvsUnits(
+    allocator: Allocator,
+    submesh_ranges: []const SubmeshRange,
+    positions: []const Vec3,
+    indices: []const u32,
+    world_min: Vec3,
+    world_max: Vec3,
+    base_name: []const u8,
+    tri_count: u32,
+    out_tri_to_unit: *?[]u32,
+    out_num_units: *u32,
+    stdout: anytype,
+) !void {
+    const stderr = std.io.getStdErr().writer();
+
+    // Threshold for "oversized" submesh: any submesh whose AABB diagonal
+    // exceeds this fraction of the world diagonal is skipped from PVS.
+    // Default 0.25 catches the worst aggregate offenders without losing
+    // legitimate large props. Override via SUBMESH_MAX_FRACTION env var.
+    var max_fraction: f32 = 0.25;
+    if (std.process.getEnvVarOwned(allocator, "SUBMESH_MAX_FRACTION") catch null) |s| {
+        defer allocator.free(s);
+        if (std.fmt.parseFloat(f32, s)) |v| max_fraction = v else |_| {}
+    }
+
+    const world_dx = world_max[0] - world_min[0];
+    const world_dy = world_max[1] - world_min[1];
+    const world_dz = world_max[2] - world_min[2];
+    const world_diag = @sqrt(world_dx * world_dx + world_dy * world_dy + world_dz * world_dz);
+    const max_diag = world_diag * max_fraction;
+
+    try stdout.print("\n  ╔═══════════════════════════════╗\n", .{});
+    try stdout.print("  ║  Per-Submesh PVS Units        ║\n", .{});
+    try stdout.print("  ╚═══════════════════════════════╝\n", .{});
+    try stdout.print("  Total submeshes:    {d}\n", .{submesh_ranges.len});
+    try stdout.print("  Skip threshold:     {d:.2}× world diag = {d:.1}m\n", .{ max_fraction, max_diag });
+
+    // Compute per-submesh AABBs and decide skip/keep.
+    const SubmeshInfo = struct {
+        aabb_min: [3]f32,
+        aabb_max: [3]f32,
+        diag: f32,
+        skipped: bool,
+        pvs_id: u32, // sentinel = max u32 if skipped
+    };
+    const infos = try allocator.alloc(SubmeshInfo, submesh_ranges.len);
+    defer allocator.free(infos);
+
+    var skipped_count: u32 = 0;
+    var assigned: u32 = 0;
+    for (submesh_ranges, 0..) |sr, si| {
+        var lo = [3]f32{ std.math.floatMax(f32), std.math.floatMax(f32), std.math.floatMax(f32) };
+        var hi = [3]f32{ -std.math.floatMax(f32), -std.math.floatMax(f32), -std.math.floatMax(f32) };
+        for (sr.tri_start..sr.tri_end) |ti| {
+            const base = ti * 3;
+            for (0..3) |vi| {
+                const v = positions[indices[base + vi]];
+                if (v[0] < lo[0]) lo[0] = v[0];
+                if (v[1] < lo[1]) lo[1] = v[1];
+                if (v[2] < lo[2]) lo[2] = v[2];
+                if (v[0] > hi[0]) hi[0] = v[0];
+                if (v[1] > hi[1]) hi[1] = v[1];
+                if (v[2] > hi[2]) hi[2] = v[2];
+            }
+        }
+        const dx = hi[0] - lo[0];
+        const dy = hi[1] - lo[1];
+        const dz = hi[2] - lo[2];
+        const diag = @sqrt(dx * dx + dy * dy + dz * dz);
+        const skipped = diag > max_diag;
+        infos[si] = .{
+            .aabb_min = lo,
+            .aabb_max = hi,
+            .diag = diag,
+            .skipped = skipped,
+            .pvs_id = if (skipped) std.math.maxInt(u32) else blk: {
+                const id = assigned;
+                assigned += 1;
+                break :blk id;
+            },
+        };
+        if (skipped) skipped_count += 1;
+    }
+
+    try stdout.print("  Skipped (oversized): {d}\n", .{skipped_count});
+    try stdout.print("  PVS units assigned:  {d}\n", .{assigned});
+
+    // Print the largest skipped offenders so we can verify the threshold.
+    if (skipped_count > 0) {
+        try stdout.print("  Largest skipped:\n", .{});
+        // Find top-5 by diagonal
+        const top_n: usize = @min(5, submesh_ranges.len);
+        var top_idx: [5]usize = .{ 0, 0, 0, 0, 0 };
+        var top_diag: [5]f32 = .{ 0, 0, 0, 0, 0 };
+        var top_filled: usize = 0;
+        for (infos, 0..) |info, si| {
+            if (!info.skipped) continue;
+            if (top_filled < top_n) {
+                top_idx[top_filled] = si;
+                top_diag[top_filled] = info.diag;
+                top_filled += 1;
+            } else {
+                // Find smallest in top, replace if bigger
+                var min_i: usize = 0;
+                for (1..top_n) |k| if (top_diag[k] < top_diag[min_i]) {
+                    min_i = k;
+                };
+                if (info.diag > top_diag[min_i]) {
+                    top_idx[min_i] = si;
+                    top_diag[min_i] = info.diag;
+                }
+            }
+        }
+        // Sort top descending
+        for (0..top_filled) |i| {
+            for (i + 1..top_filled) |j| {
+                if (top_diag[j] > top_diag[i]) {
+                    std.mem.swap(usize, &top_idx[i], &top_idx[j]);
+                    std.mem.swap(f32, &top_diag[i], &top_diag[j]);
+                }
+            }
+        }
+        for (0..top_filled) |i| {
+            const si = top_idx[i];
+            const sr = submesh_ranges[si];
+            try stdout.print("    {d:6.1}m  [submesh {d}/{s}]\n", .{
+                top_diag[i], sr.submesh_idx, sr.model_name,
+            });
+        }
+    }
+
+    // Build the tri→unit mapping. Skipped submeshes get the sentinel.
+    const tri_to_unit = try allocator.alloc(u32, tri_count);
+    @memset(tri_to_unit, std.math.maxInt(u32));
+    for (submesh_ranges, infos) |sr, info| {
+        const id = info.pvs_id;
+        for (sr.tri_start..sr.tri_end) |ti| {
+            tri_to_unit[ti] = id;
+        }
+    }
+
+    // Write the sidecar: per-(model,submesh) → pvs_id (or sentinel).
+    // Format: PVSM v1
+    //   magic "PVSM"
+    //   version u32
+    //   num_units u32
+    //   num_models u32
+    //   For each model: u16 name_len, u8[name_len] name, u32 num_submeshes,
+    //                   u32[num_submeshes] pvs_id (sentinel = max u32 if skipped)
+    {
+        const sidecar_path = try std.fmt.allocPrint(allocator, "{s}_pvs_submeshes.bin", .{base_name});
+        defer allocator.free(sidecar_path);
+        var f = try std.fs.cwd().createFile(sidecar_path, .{});
+        defer f.close();
+        var bw = std.io.bufferedWriter(f.writer());
+        const w = bw.writer();
+
+        try w.writeAll("PVSM");
+        try w.writeInt(u32, 1, .little);
+        try w.writeInt(u32, assigned, .little);
+
+        // Group submeshes by model. Submeshes for one model are contiguous in
+        // submesh_ranges (we build them in order during phase 1) and share the
+        // same model_name pointer, so we can just walk and break on changes.
+        var num_models_in_sidecar: u32 = 0;
+        var i: usize = 0;
+        while (i < submesh_ranges.len) {
+            num_models_in_sidecar += 1;
+            const name = submesh_ranges[i].model_name;
+            i += 1;
+            while (i < submesh_ranges.len and std.mem.eql(u8, submesh_ranges[i].model_name, name)) : (i += 1) {}
+        }
+        try w.writeInt(u32, num_models_in_sidecar, .little);
+
+        i = 0;
+        while (i < submesh_ranges.len) {
+            const start = i;
+            const name = submesh_ranges[start].model_name;
+            i += 1;
+            while (i < submesh_ranges.len and std.mem.eql(u8, submesh_ranges[i].model_name, name)) : (i += 1) {}
+            const num_sub: u32 = @intCast(i - start);
+            try w.writeInt(u16, @intCast(name.len), .little);
+            try w.writeAll(name);
+            try w.writeInt(u32, num_sub, .little);
+            for (start..i) |j| {
+                try w.writeInt(u32, infos[j].pvs_id, .little);
+            }
+        }
+
+        try bw.flush();
+        try stdout.print("  → {s} ({d} models, {d} units)\n", .{ sidecar_path, num_models_in_sidecar, assigned });
+    }
+
+    out_tri_to_unit.* = tri_to_unit;
+    out_num_units.* = assigned;
+    stderr.print("[Submesh PVS] {d} units, {d} skipped\n", .{ assigned, skipped_count }) catch {};
+}
+
+/// Check if a model name indicates non-renderable proxy geometry.
+fn isProxyModel(name: []const u8) bool {
+    const filters = [_][]const u8{
+        "_occluder",      "_proxy",     "_shadow",
+        "_clip",          "_cb_",       "_mesh_overlay",
+        "occluder",       "shadowproxy", "navmesh",
+        "_lod0_noao",
+    };
+    for (filters) |f| {
+        if (std.mem.indexOf(u8, name, f) != null) return true;
+    }
+    return false;
 }
 
 // (Visualization functions moved to pvs_viz.zig)

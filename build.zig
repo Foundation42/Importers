@@ -191,11 +191,18 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseFast,
     });
 
+    const pvs_exemplar_module = b.addModule("pvs_exemplar", .{
+        .root_source_file = b.path("src/pvs_exemplar.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+
     pvs_baker.root_module.addImport("valve-resource-format", vrf_fast);
     pvs_baker.root_module.addImport("bivh", bivh_mod);
     pvs_baker.root_module.addImport("pvs", pvs_module);
     pvs_baker.root_module.addImport("pvs_viz", pvs_viz_module);
     pvs_baker.root_module.addImport("pvs_neural", pvs_neural_module);
+    pvs_baker.root_module.addImport("pvs_exemplar", pvs_exemplar_module);
     pvs_baker.root_module.addImport("minball", minball_module);
     b.installArtifact(pvs_baker);
 
