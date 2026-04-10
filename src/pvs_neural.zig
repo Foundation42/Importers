@@ -156,6 +156,10 @@ pub const TrainingConfig = struct {
     max_vfov: f32 = MAX_VFOV,
     min_aspect: f32 = MIN_ASPECT,
     max_aspect: f32 = MAX_ASPECT,
+    // From-region stability (Wang et al. 2025): jitter positions within radius
+    // to teach stable predictions across small camera movements
+    jitter_radius: f32 = 0.3, // meters — viewcell radius
+    jitter_count: u32 = 3, // extra jittered samples per primary sample
 };
 
 pub const TrainingData = struct {
@@ -176,7 +180,181 @@ pub const TrainingData = struct {
     }
 };
 
-/// Generate frustum-aware training data via ray bundles.
+/// Per-thread results from parallel data generation.
+const ThreadResult = struct {
+    positions: std.ArrayList(Vec3),
+    params: std.ArrayList([6]f32),
+    labels: std.ArrayList([]u8),
+    sample_count: u32,
+    total_rays: u64,
+    attempts: u64,
+};
+
+/// Generate a single training sample. Returns true if sample was valid (found visible models).
+fn generateOneSample(
+    bivh: *const bivh_mod.Bivh,
+    mesh_set: *const bivh_mod.TriangleMeshSet,
+    world_perm: []const u32,
+    tri_to_model: []const u32,
+    num_models: u32,
+    pos_min: Vec3,
+    pos_max: Vec3,
+    config: TrainingConfig,
+    result: *ThreadResult,
+    thread_alloc: Allocator,
+) bool {
+    const rng = std.crypto.random;
+    const bitset_stride: u32 = (num_models + 7) / 8;
+
+    const pos = Vec3{
+        pos_min[0] + rng.float(f32) * (pos_max[0] - pos_min[0]),
+        pos_min[1] + rng.float(f32) * (pos_max[1] - pos_min[1]),
+        pos_min[2] + rng.float(f32) * (pos_max[2] - pos_min[2]),
+    };
+
+    const yaw = rng.float(f32) * 2.0 * std.math.pi;
+    const pitch = config.min_pitch + rng.float(f32) * (config.max_pitch - config.min_pitch);
+    const vfov = config.min_vfov + rng.float(f32) * (config.max_vfov - config.min_vfov);
+    const aspect = config.min_aspect + rng.float(f32) * (config.max_aspect - config.min_aspect);
+
+    const sin_yaw = @sin(yaw);
+    const cos_yaw = @cos(yaw);
+    const sin_pitch = @sin(pitch);
+    const cos_pitch = @cos(pitch);
+    const look_dir = lookDirFromAngles(sin_yaw, cos_yaw, sin_pitch, cos_pitch);
+
+    const bitset = thread_alloc.alloc(u8, bitset_stride) catch return false;
+    @memset(bitset, 0);
+    var found_any = false;
+    var rays: u64 = 0;
+
+    for (0..config.rays_per_sample) |_| {
+        const dir = randomInFrustum(look_dir, vfov, aspect, rng);
+        var ray = bivh_mod.TraceRay.make(pos[0], pos[1], pos[2], dir[0], dir[1], dir[2], config.max_ray_dist);
+        const hit = bivh.trace(mesh_set, &ray, 0.0001, config.max_ray_dist);
+        rays += 1;
+
+        if (hit and ray.hit_primitive >= 0) {
+            const sorted_idx: u32 = @intCast(ray.hit_primitive);
+            if (sorted_idx >= world_perm.len) continue;
+            const orig_idx = world_perm[sorted_idx];
+            if (orig_idx >= tri_to_model.len) continue;
+            const model_id = tri_to_model[orig_idx];
+
+            if (model_id != std.math.maxInt(u32) and model_id < num_models) {
+                const was_new = !bitsetGet(bitset, model_id);
+                bitsetSet(bitset, model_id);
+                found_any = true;
+
+                if (was_new) {
+                    const tri_base = @as(usize, sorted_idx) * 3;
+                    if (tri_base + 2 >= mesh_set.indices.len) continue;
+                    const v0 = mesh_set.positions[mesh_set.indices[tri_base]];
+                    const v1 = mesh_set.positions[mesh_set.indices[tri_base + 1]];
+                    const v2 = mesh_set.positions[mesh_set.indices[tri_base + 2]];
+
+                    const probes_arr = [6]Vec3{
+                        v0,              v1,              v2,
+                        midpoint(v0, v1), midpoint(v0, v2), midpoint(v1, v2),
+                    };
+
+                    for (probes_arr) |probe| {
+                        const to_cam = sub3(pos, probe);
+                        const dist = length3(to_cam);
+                        if (dist < 0.01) continue;
+                        const dir_to_cam = scale3(to_cam, 1.0 / dist);
+                        const offset_probe = add3(probe, scale3(dir_to_cam, config.bundle_offset));
+
+                        var bundle_ray = bivh_mod.TraceRay.make(
+                            offset_probe[0], offset_probe[1], offset_probe[2],
+                            dir_to_cam[0],   dir_to_cam[1],   dir_to_cam[2],
+                            dist,
+                        );
+                        const bundle_hit = bivh.trace(mesh_set, &bundle_ray, 0.0001, dist);
+                        rays += 1;
+
+                        if (bundle_hit and bundle_ray.hit_primitive >= 0) {
+                            const b_sorted: u32 = @intCast(bundle_ray.hit_primitive);
+                            if (b_sorted < world_perm.len) {
+                                const b_orig = world_perm[b_sorted];
+                                if (b_orig < tri_to_model.len) {
+                                    const b_model = tri_to_model[b_orig];
+                                    if (b_model != std.math.maxInt(u32) and b_model < num_models) {
+                                        bitsetSet(bitset, b_model);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    result.total_rays += rays;
+    result.attempts += 1;
+
+    if (found_any) {
+        const param = [6]f32{ sin_yaw, cos_yaw, sin_pitch, cos_pitch, normVfov(vfov), normAspect(aspect) };
+        result.positions.append(pos) catch return false;
+        result.params.append(param) catch return false;
+        result.labels.append(bitset) catch return false;
+        result.sample_count += 1;
+
+        // From-region jitter
+        for (0..config.jitter_count) |_| {
+            const jx = (rng.float(f32) * 2.0 - 1.0) * config.jitter_radius;
+            const jy = (rng.float(f32) * 2.0 - 1.0) * config.jitter_radius;
+            const jz = (rng.float(f32) * 2.0 - 1.0) * config.jitter_radius;
+            const jittered_pos = Vec3{
+                std.math.clamp(pos[0] + jx, pos_min[0], pos_max[0]),
+                std.math.clamp(pos[1] + jy, pos_min[1], pos_max[1]),
+                std.math.clamp(pos[2] + jz, pos_min[2], pos_max[2]),
+            };
+
+            const jittered_label = thread_alloc.alloc(u8, bitset_stride) catch continue;
+            @memcpy(jittered_label, bitset);
+            result.positions.append(jittered_pos) catch continue;
+            result.params.append(param) catch continue;
+            result.labels.append(jittered_label) catch continue;
+        }
+
+        return true;
+    } else {
+        thread_alloc.free(bitset);
+        return false;
+    }
+}
+
+/// Worker function for parallel data generation.
+fn dataGenWorker(
+    bivh: *const bivh_mod.Bivh,
+    mesh_set: *const bivh_mod.TriangleMeshSet,
+    world_perm: []const u32,
+    tri_to_model: []const u32,
+    num_models: u32,
+    pos_min: Vec3,
+    pos_max: Vec3,
+    config: TrainingConfig,
+    target_samples: u32,
+    result: *ThreadResult,
+) void {
+    const thread_alloc = result.positions.allocator;
+    var generated: u32 = 0;
+    var att: u64 = 0;
+    const max_att: u64 = @as(u64, target_samples) * 10;
+
+    while (generated < target_samples and att < max_att) : (att += 1) {
+        if (generateOneSample(
+            bivh, mesh_set, world_perm, tri_to_model,
+            num_models, pos_min, pos_max, config, result, thread_alloc,
+        )) {
+            generated += 1;
+        }
+    }
+}
+
+/// Generate frustum-aware training data via ray bundles (parallelized).
 /// Each sample: random (position, yaw, pitch, vfov, aspect) → cast rays within frustum →
 /// record which models are visible. Bundle refinement on hit.
 pub fn generateTrainingData(
@@ -191,137 +369,84 @@ pub fn generateTrainingData(
     config: TrainingConfig,
     stdout: anytype,
 ) !TrainingData {
-    const rng = std.crypto.random;
-    const bitset_stride: u32 = (num_models + 7) / 8;
+    const num_threads = @max(1, std.Thread.getCpuCount() catch 4);
+    const samples_per_thread = (config.num_samples + @as(u32, @intCast(num_threads)) - 1) / @as(u32, @intCast(num_threads));
 
-    var positions = std.ArrayList(Vec3).init(allocator);
-    defer positions.deinit();
-    var params = std.ArrayList([6]f32).init(allocator);
-    defer params.deinit();
-    var labels = std.ArrayList([]u8).init(allocator);
-    defer labels.deinit();
-
-    var sample: u32 = 0;
-    var total_rays: u64 = 0;
-    var attempts: u64 = 0;
-    const max_attempts: u64 = @as(u64, config.num_samples) * 10;
-
-    try stdout.print("  Generating {d} frustum-aware samples ({d} rays/sample)...\n", .{
-        config.num_samples, config.rays_per_sample,
+    try stdout.print("  Generating {d} frustum-aware samples ({d} rays/sample, {d} threads)...\n", .{
+        config.num_samples, config.rays_per_sample, num_threads,
     });
 
-    while (sample < config.num_samples and attempts < max_attempts) : (attempts += 1) {
-        // Random position within map bounds
-        const pos = Vec3{
-            pos_min[0] + rng.float(f32) * (pos_max[0] - pos_min[0]),
-            pos_min[1] + rng.float(f32) * (pos_max[1] - pos_min[1]),
-            pos_min[2] + rng.float(f32) * (pos_max[2] - pos_min[2]),
+    // Per-thread arenas to avoid GPA mutex contention
+    const thread_arenas = try allocator.alloc(std.heap.ArenaAllocator, num_threads);
+    defer allocator.free(thread_arenas);
+    for (thread_arenas) |*arena| arena.* = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer for (thread_arenas) |*arena| arena.deinit();
+
+    // Per-thread results using thread-local arenas
+    const thread_results = try allocator.alloc(ThreadResult, num_threads);
+    defer allocator.free(thread_results);
+    for (thread_results, thread_arenas) |*tr, *arena| {
+        const ta = arena.allocator();
+        tr.* = .{
+            .positions = std.ArrayList(Vec3).init(ta),
+            .params = std.ArrayList([6]f32).init(ta),
+            .labels = std.ArrayList([]u8).init(ta),
+            .sample_count = 0,
+            .total_rays = 0,
+            .attempts = 0,
         };
-
-        // Random camera parameters
-        const yaw = rng.float(f32) * 2.0 * std.math.pi;
-        const pitch = config.min_pitch + rng.float(f32) * (config.max_pitch - config.min_pitch);
-        const vfov = config.min_vfov + rng.float(f32) * (config.max_vfov - config.min_vfov);
-        const aspect = config.min_aspect + rng.float(f32) * (config.max_aspect - config.min_aspect);
-
-        const sin_yaw = @sin(yaw);
-        const cos_yaw = @cos(yaw);
-        const sin_pitch = @sin(pitch);
-        const cos_pitch = @cos(pitch);
-        const look_dir = lookDirFromAngles(sin_yaw, cos_yaw, sin_pitch, cos_pitch);
-
-        const bitset = try allocator.alloc(u8, bitset_stride);
-        @memset(bitset, 0);
-        var found_any = false;
-
-        // Cast rays within frustum
-        for (0..config.rays_per_sample) |_| {
-            const dir = randomInFrustum(look_dir, vfov, aspect, rng);
-
-            var ray = bivh_mod.TraceRay.make(pos[0], pos[1], pos[2], dir[0], dir[1], dir[2], config.max_ray_dist);
-            const hit = bivh.trace(mesh_set, &ray, 0.0001, config.max_ray_dist);
-            total_rays += 1;
-
-            if (hit and ray.hit_primitive >= 0) {
-                const sorted_idx: u32 = @intCast(ray.hit_primitive);
-                if (sorted_idx >= world_perm.len) continue;
-                const orig_idx = world_perm[sorted_idx];
-                if (orig_idx >= tri_to_model.len) continue;
-                const model_id = tri_to_model[orig_idx];
-
-                if (model_id != std.math.maxInt(u32) and model_id < num_models) {
-                    const was_new = !bitsetGet(bitset, model_id);
-                    bitsetSet(bitset, model_id);
-                    found_any = true;
-
-                    // Bundle refinement: 6 child rays on NEW discovery
-                    if (was_new) {
-                        const tri_base = @as(usize, sorted_idx) * 3;
-                        if (tri_base + 2 >= mesh_set.indices.len) continue;
-                        const v0 = mesh_set.positions[mesh_set.indices[tri_base]];
-                        const v1 = mesh_set.positions[mesh_set.indices[tri_base + 1]];
-                        const v2 = mesh_set.positions[mesh_set.indices[tri_base + 2]];
-
-                        const probes = [6]Vec3{
-                            v0,              v1,              v2,
-                            midpoint(v0, v1), midpoint(v0, v2), midpoint(v1, v2),
-                        };
-
-                        for (probes) |probe| {
-                            const to_cam = sub3(pos, probe);
-                            const dist = length3(to_cam);
-                            if (dist < 0.01) continue;
-                            const dir_to_cam = scale3(to_cam, 1.0 / dist);
-                            const offset_probe = add3(probe, scale3(dir_to_cam, config.bundle_offset));
-
-                            var bundle_ray = bivh_mod.TraceRay.make(
-                                offset_probe[0], offset_probe[1], offset_probe[2],
-                                dir_to_cam[0],   dir_to_cam[1],   dir_to_cam[2],
-                                dist,
-                            );
-                            const bundle_hit = bivh.trace(mesh_set, &bundle_ray, 0.0001, dist);
-                            total_rays += 1;
-
-                            if (bundle_hit and bundle_ray.hit_primitive >= 0) {
-                                const b_sorted: u32 = @intCast(bundle_ray.hit_primitive);
-                                if (b_sorted < world_perm.len) {
-                                    const b_orig = world_perm[b_sorted];
-                                    if (b_orig < tri_to_model.len) {
-                                        const b_model = tri_to_model[b_orig];
-                                        if (b_model != std.math.maxInt(u32) and b_model < num_models) {
-                                            bitsetSet(bitset, b_model);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if (found_any) {
-            try positions.append(pos);
-            try params.append(.{
-                sin_yaw,
-                cos_yaw,
-                sin_pitch,
-                cos_pitch,
-                normVfov(vfov),
-                normAspect(aspect),
-            });
-            try labels.append(bitset);
-            sample += 1;
-            if (sample % 2000 == 0) {
-                try stdout.print("    {d}/{d} samples, {d}M rays\n", .{ sample, config.num_samples, total_rays / 1_000_000 });
-            }
-        } else {
-            allocator.free(bitset);
-        }
     }
 
-    try stdout.print("  Generated {d} samples, {d}M rays total ({d} attempts)\n", .{
-        sample, total_rays / 1_000_000, attempts,
+    // Spawn threads
+    const threads = try allocator.alloc(std.Thread, num_threads);
+    defer allocator.free(threads);
+
+    for (thread_results, threads) |*tr, *t| {
+        t.* = try std.Thread.spawn(.{}, dataGenWorker, .{
+            bivh, mesh_set, world_perm, tri_to_model,
+            num_models, pos_min, pos_max, config,
+            samples_per_thread, tr,
+        });
+    }
+
+    for (threads) |t| t.join();
+
+    // Merge results
+    var total_primary: u32 = 0;
+    var total_rays: u64 = 0;
+    var total_attempts: u64 = 0;
+    for (thread_results) |tr| {
+        total_primary += tr.sample_count;
+        total_rays += tr.total_rays;
+        total_attempts += tr.attempts;
+    }
+
+    // Count total samples including jitter
+    var total_samples: usize = 0;
+    for (thread_results) |tr| total_samples += tr.positions.items.len;
+
+    // Merge into single arrays (copy from thread arenas to main allocator)
+    const bitset_stride: u32 = (num_models + 7) / 8;
+    var positions = try allocator.alloc(Vec3, total_samples);
+    var params = try allocator.alloc([6]f32, total_samples);
+    var labels_arr = try allocator.alloc([]u8, total_samples);
+    var offset: usize = 0;
+    for (thread_results) |tr| {
+        const n = tr.positions.items.len;
+        @memcpy(positions[offset..][0..n], tr.positions.items);
+        @memcpy(params[offset..][0..n], tr.params.items);
+        // Deep-copy label bitsets from thread arena to main allocator
+        for (tr.labels.items, 0..) |arena_label, li| {
+            const label = try allocator.alloc(u8, bitset_stride);
+            @memcpy(label, arena_label);
+            labels_arr[offset + li] = label;
+        }
+        offset += n;
+    }
+
+    try stdout.print("  Generated {d} primary + {d} jittered = {d} total, {d}M rays ({d} threads, {d} attempts)\n", .{
+        total_primary, total_samples - total_primary, total_samples,
+        total_rays / 1_000_000, num_threads, total_attempts,
     });
 
     // Stats on label density
@@ -329,26 +454,26 @@ pub fn generateTrainingData(
         var min_vis: u32 = std.math.maxInt(u32);
         var max_vis: u32 = 0;
         var total_vis: u64 = 0;
-        for (labels.items) |l| {
+        for (labels_arr) |l| {
             const c = bitsetCount(l);
             min_vis = @min(min_vis, c);
             max_vis = @max(max_vis, c);
             total_vis += c;
         }
-        if (sample > 0) {
+        if (total_samples > 0) {
             try stdout.print("  Models/sample: min={d}, max={d}, avg={d}\n", .{
-                min_vis, max_vis, @as(u32, @intCast(total_vis / sample)),
+                min_vis, max_vis, @as(u32, @intCast(total_vis / total_samples)),
             });
         }
     }
 
     return .{
-        .positions = try positions.toOwnedSlice(),
-        .params = try params.toOwnedSlice(),
-        .labels = try labels.toOwnedSlice(),
+        .positions = positions,
+        .params = params,
+        .labels = labels_arr,
         .num_models = num_models,
-        .bitset_stride = bitset_stride,
-        .num_samples = sample,
+        .bitset_stride = (num_models + 7) / 8,
+        .num_samples = @intCast(total_samples),
         .total_rays = total_rays,
         .allocator = allocator,
     };
@@ -540,22 +665,40 @@ pub const MLP = struct {
         return self.out;
     }
 
-    /// Accumulate gradients with per-model spatial weights.
+    /// Accumulate gradients with per-model spatial weights + Repulsive Visibility Loss.
     /// model_weights[j] is the FN penalty for model j (higher = more important).
-    pub fn accumulateGradients(self: *MLP, pos: Vec3, p: [6]f32, target: []const u8, model_weights: []const f32) f32 {
+    /// rvl_lambda blends BCE (λ) with RVL (1-λ). RVL pushes FPs down proportional to 1/GTP.
+    /// Reference: Wang et al. "NeuralPVS: Learned Estimation of Potentially Visible Sets" (2025)
+    pub fn accumulateGradients(self: *MLP, pos: Vec3, p: [6]f32, target: []const u8, model_weights: []const f32, rvl_lambda: f32) f32 {
         const input = self.buildInput(pos, p);
         const h = self.hidden_size;
         const o = self.output_size;
 
-        // Output deltas with per-model weighting
+        // Count ground truth positives for RVL normalization
+        const gtp: f32 = @floatFromInt(@max(bitsetCount(target), 1));
+        const inv_gtp = 1.0 / gtp;
+
+        // Output deltas: blend BCE + RVL
         var loss: f32 = 0;
         for (0..o) |j| {
             const t: f32 = if (bitsetGet(target, j)) 1.0 else 0.0;
             const pred = self.out[j];
-            const w = if (t > 0.5) model_weights[j] else 1.0;
-            self.d3[j] = w * (pred - t);
             const cp = std.math.clamp(pred, 1e-7, 1.0 - 1e-7);
+
+            // BCE gradient (weighted: FN penalty for visible models)
+            const w = if (t > 0.5) model_weights[j] else 1.0;
+            const bce_grad = w * (pred - t);
             loss -= w * (t * @log(cp) + (1.0 - t) * @log(1.0 - cp));
+
+            // RVL gradient: attract toward visible GT, repel from non-visible
+            // L_attr derivative: if target=1, push pred up (grad = -pred·inv_gtp)
+            // L_rep derivative:  if target=0, push pred down (grad = +pred·inv_gtp)
+            const rvl_grad = if (t > 0.5)
+                -pred * inv_gtp * model_weights[j] // attract: strengthen with spatial weight
+            else
+                pred * inv_gtp; // repel: push FPs down
+
+            self.d3[j] = rvl_lambda * bce_grad + (1.0 - rvl_lambda) * rvl_grad;
         }
 
         // Hidden deltas
@@ -694,6 +837,8 @@ pub const TrainConfig = struct {
     center_boost: f32 = 2.0, // extra FN penalty for center-of-view models
     near_boost: f32 = 2.0, // extra FN penalty for nearby models
     ref_dist: f32 = 5.0, // distance reference (meters in world coords)
+    // Repulsive Visibility Loss (Wang et al. 2025)
+    rvl_lambda: f32 = 0.85, // blend: λ·BCE + (1-λ)·RVL (paper uses 0.99 for Dice+RVL)
 };
 
 /// Train MLP on frustum-aware training data with spatial loss weighting.
@@ -741,14 +886,18 @@ pub fn train(
     try stdout.print("  Samples: {d}, Epochs: {d}, lr={d:.4}, batch={d}, params={d}\n", .{
         n, config.epochs, config.learning_rate, config.batch_size, num_params,
     });
-    try stdout.print("  base_weight={d:.1}, center_boost={d:.1}, near_boost={d:.1}, ref_dist={d:.1}\n", .{
-        base_weight, config.center_boost, config.near_boost, config.ref_dist,
+    try stdout.print("  base_weight={d:.1}, center_boost={d:.1}, near_boost={d:.1}, ref_dist={d:.1}, rvl_λ={d:.2}\n", .{
+        base_weight, config.center_boost, config.near_boost, config.ref_dist, config.rvl_lambda,
     });
 
     const bs = config.batch_size;
 
     for (0..config.epochs) |epoch| {
         shuffle(indices, std.crypto.random);
+
+        // Cosine LR decay: lr * 0.5 * (1 + cos(π * epoch / epochs))
+        const progress = @as(f32, @floatFromInt(epoch)) / @as(f32, @floatFromInt(@max(config.epochs, 1)));
+        const lr = config.learning_rate * 0.5 * (1.0 + @cos(progress * std.math.pi));
 
         var epoch_loss: f64 = 0;
         var batch_count: u32 = 0;
@@ -770,23 +919,30 @@ pub fn train(
             );
 
             _ = mlp.forward(data.positions[idx], p);
-            const loss = mlp.accumulateGradients(data.positions[idx], p, data.labels[idx], model_weights);
+            const loss = mlp.accumulateGradients(data.positions[idx], p, data.labels[idx], model_weights, config.rvl_lambda);
             epoch_loss += loss;
             batch_count += 1;
 
             if (batch_count >= bs or si == indices.len - 1) {
-                mlp.applyAdam(config.learning_rate, @floatFromInt(batch_count));
+                mlp.applyAdam(lr, @floatFromInt(batch_count));
                 batch_count = 0;
             }
         }
 
-        if (epoch % 10 == 0 or epoch == config.epochs - 1) {
+        if (epoch < 5 or epoch % 5 == 0 or epoch == config.epochs - 1) {
+            // Progress to stderr (unbuffered, visible in piped output)
+            std.io.getStdErr().writer().print("[NPVS] Epoch {d}/{d}\n", .{ epoch, config.epochs }) catch {};
             var eval_fn: u64 = 0;
             var eval_fp: u64 = 0;
             var eval_pos: u64 = 0;
             var eval_neg: u64 = 0;
 
-            for (0..n) |i| {
+            // Subsample eval to avoid expensive full pass
+            const eval_n = @min(n, 10_000);
+            const eval_step = n / eval_n;
+            var ei: u32 = 0;
+            while (ei < n) : (ei += @intCast(eval_step)) {
+                const i = ei;
                 _ = mlp.forward(data.positions[i], data.params[i]);
                 for (0..data.num_models) |j| {
                     const actual = bitsetGet(data.labels[i], j);
@@ -804,11 +960,12 @@ pub fn train(
             const fn_rate = if (eval_pos > 0) @as(f32, @floatFromInt(eval_fn)) / @as(f32, @floatFromInt(eval_pos)) else 0;
             const fp_rate = if (eval_neg > 0) @as(f32, @floatFromInt(eval_fp)) / @as(f32, @floatFromInt(eval_neg)) else 0;
 
-            try stdout.print("  Epoch {d:>4}: loss={d:.2}, FN={d:.2}%, FP={d:.1}%\n", .{
+            try stdout.print("  Epoch {d:>4}: loss={d:.2}, FN={d:.2}%, FP={d:.1}%, lr={d:.6}\n", .{
                 epoch,
                 epoch_loss / @as(f64, @floatFromInt(n)),
                 fn_rate * 100,
                 fp_rate * 100,
+                lr,
             });
         }
     }

@@ -41,6 +41,7 @@ pub fn main() !void {
     const content_vpk_path: ?[]const u8 = if (args.len >= 3) args[2] else null;
 
     const stdout = std.io.getStdOut().writer();
+    const stderr = std.io.getStdErr().writer();
     try stdout.print("PVS Baker — Loading {s}\n", .{map_vpk_path});
 
     const t0 = std.time.nanoTimestamp();
@@ -881,6 +882,8 @@ pub fn main() !void {
 
             const t_neural0 = std.time.nanoTimestamp();
 
+            stderr.print("[NPVS] Computing model centroids + MinBalls...\n", .{}) catch {};
+
             // Compute model centroids (for spatial loss weighting)
             const model_centroids = try allocator.alloc([3]f32, num_models);
             defer allocator.free(model_centroids);
@@ -910,7 +913,55 @@ pub fn main() !void {
                 }
             }
 
+            // Compute minimum enclosing spheres per model (Welzl's algorithm)
+            const BoundingSphere = struct { center: [3]f32, radius: f32 };
+            const model_bounds = try allocator.alloc(BoundingSphere, num_models);
+            defer allocator.free(model_bounds);
+            {
+                // Centroid + extremal point: tighter than AABB, O(n), guaranteed termination
+                for (model_ranges.items, 0..) |mr, mi| {
+                    const c = model_centroids[mi];
+                    var max_dist_sq: f32 = 0;
+                    for (mr.tri_start..mr.tri_end) |ti| {
+                        const base = ti * 3;
+                        for (0..3) |vi| {
+                            if (base + vi < mesh_set.indices.len) {
+                                const v = all_positions.items[mesh_set.indices[base + vi]];
+                                const dx = v[0] - c[0];
+                                const dy = v[1] - c[1];
+                                const dz = v[2] - c[2];
+                                max_dist_sq = @max(max_dist_sq, dx * dx + dy * dy + dz * dz);
+                            }
+                        }
+                    }
+                    model_bounds[mi] = .{ .center = c, .radius = @sqrt(max_dist_sq) };
+                }
+                try stdout.print("  Computed {d} bounding spheres\n", .{num_models});
+                stderr.print("[NPVS] Bounding spheres done\n", .{}) catch {};
+            }
+
+            // Write _model_bounds.bin sidecar
+            {
+                const bounds_path = try std.fmt.allocPrint(allocator, "{s}_model_bounds.bin", .{base_name});
+                defer allocator.free(bounds_path);
+                var bf = try std.fs.cwd().createFile(bounds_path, .{});
+                defer bf.close();
+                var bw = std.io.bufferedWriter(bf.writer());
+                const bwr = bw.writer();
+
+                try bwr.writeAll("MBND"); // magic
+                try bwr.writeInt(u32, 1, .little); // version
+                try bwr.writeInt(u32, num_models, .little);
+                for (model_bounds) |mb| {
+                    for (mb.center) |v| try bwr.writeInt(u32, @bitCast(v), .little);
+                    try bwr.writeInt(u32, @bitCast(mb.radius), .little);
+                }
+                try bw.flush();
+                try stdout.print("  → {s}\n", .{bounds_path});
+            }
+
             // Generate frustum-aware training data
+            stderr.print("[NPVS] Starting parallel data generation...\n", .{}) catch {};
             var train_data = try pvs_neural.generateTrainingData(
                 allocator,
                 &world_bivh,
@@ -930,7 +981,9 @@ pub fn main() !void {
             defer train_data.deinit();
 
             const t_data = std.time.nanoTimestamp();
-            try stdout.print("  Data gen: {d}ms\n", .{@divTrunc(t_data - t_neural0, 1_000_000)});
+            const data_gen_ms = @divTrunc(t_data - t_neural0, 1_000_000);
+            try stdout.print("  Data gen: {d}ms\n", .{data_gen_ms});
+            stderr.print("[NPVS] Data gen: {d}ms, starting training...\n", .{data_gen_ms}) catch {};
 
             // Train MLP with spatial + distance weighted loss
             var mlp = try pvs_neural.train(
@@ -940,8 +993,8 @@ pub fn main() !void {
                 world_min,
                 world_max,
                 .{
-                    .epochs = 100,
-                    .learning_rate = 0.001,
+                    .epochs = 30,
+                    .learning_rate = 0.0005,
                     .batch_size = 32,
                     .hidden_size = 256,
                     .eval_threshold = 0.3,
@@ -961,6 +1014,7 @@ pub fn main() !void {
             defer allocator.free(npvs_path);
             try mlp.save(npvs_path);
             try stdout.print("  → {s}\n", .{npvs_path});
+            stderr.print("[NPVS] Done! Saved to {s}\n", .{npvs_path}) catch {};
         }
     }
 
