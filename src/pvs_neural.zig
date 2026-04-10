@@ -150,8 +150,8 @@ pub const TrainingConfig = struct {
     max_ray_dist: f32 = 2000.0,
     bundle_offset: f32 = 0.001,
     // Frustum parameter ranges for random sampling
-    min_pitch: f32 = -0.785, // -45 degrees
-    max_pitch: f32 = 0.785, // +45 degrees
+    min_pitch: f32 = -1.536, // -88 degrees
+    max_pitch: f32 = 1.536, // +88 degrees
     min_vfov: f32 = MIN_VFOV,
     max_vfov: f32 = MAX_VFOV,
     min_aspect: f32 = MIN_ASPECT,
