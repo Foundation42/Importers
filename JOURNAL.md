@@ -391,10 +391,101 @@ The transport graph and probes remain for GI.
 - **Sound transport** — same omnidirectional graph, audio impulse responses instead of SH
 - **Baked GI probes** — load probe SH into ProbeManager SSBO/shader pipeline
 
-## Next Steps
+---
 
-- **Probability-based rendering**: expose raw MLP outputs for LOD, priority, streaming
+## Session 5: Neural PVS v3 — RVL, Parallel Training, Runtime Polish (2026-04-09/10)
+
+### Motivation
+
+Research into Wang et al. "NeuralPVS: Learned Estimation of Potentially Visible Sets"
+(Stuttgart/Graz, Sep 2025). Their system uses sparse 3D CNNs on voxelized geometry — very
+different architecture from ours — but three techniques transfer directly to our MLP approach.
+
+### Key Changes
+
+#### 1. Repulsive Visibility Loss (RVL)
+
+From the paper: standard loss lets the network get lazy and overpredict. RVL adds an
+explicit repulsive gradient that pushes false positive predictions down:
+
+```
+L_attr: if target=1, pull prediction up (weighted by spatial importance)
+L_rep:  if target=0, push prediction down (proportional to 1/GTP)
+Combined: λ·BCE + (1-λ)·RVL
+```
+
+**Tuning journey:** λ=0.5 (paper-inspired) caused divergence — FN went from 14% to 36%
+by epoch 20. The paper used λ=0.99 for Dice+RVL. We settled on λ=0.85 which gives the
+repulsive benefit without overwhelming the BCE attract signal.
+
+#### 2. From-Region Stability (Jitter)
+
+For each training sample, generate 3 additional jittered positions within a 0.3m radius
+viewcell, sharing the same visibility label. Teaches the MLP that predictions should be
+stable across small camera movements. 20K primary → 80K total training samples.
+
+#### 3. Cosine LR Decay
+
+Critical fix. Without decay, lr=0.0005 caused divergence after epoch 20:
+
+| Epoch | Loss (no decay) | Loss (cosine) |
+|-------|-----------------|---------------|
+| 0     | 207.61          | 200.35        |
+| 10    | 1608.46 (!)     | 130.12        |
+| 20    | 1750.08         | 124.42        |
+| 29    | —               | 122.97        |
+
+Cosine decay: `lr * 0.5 * (1 + cos(π * epoch/epochs))`. Smoothly reduces LR to near-zero
+by final epoch. Loss monotonically decreased across all 30 epochs.
+
+#### 4. Parallel Data Generation
+
+Data gen was 63s single-threaded. The bottleneck: GPA mutex contention — all threads
+sharing one allocator serialized on every ArrayList append and bitset allocation.
+
+**Fix:** Per-thread arena allocators from page_allocator. Deep-copy labels to main allocator
+during merge. Result: **5.5s with 16 threads — 11.4x speedup.**
+
+#### 5. Runtime Enhancements
+
+- **Raw probabilities**: `model_probabilities[]` with temporal EMA smoothing (α=0.3)
+- **ModelBounds sidecar**: bounding spheres (centroid + extremal radius) for front-to-back sort
+- **Front-to-back sorting**: insertion sort on visible models by `dot(center-cam, forward)-radius`
+- **Frustum fallback**: models beyond MLP range get traditional AABB frustum culling
+- **Frozen frustum**: captured with PVS freeze for complete debug fly-around
+- **Debug AABB wireframes**: green=visible+confident, yellow=uncertain, red=culled
+- **HUD**: probability stats (avg%, min%) alongside draw counts
+
+### Baseline Results (Dust II, 30 epochs, H=256)
+
+```
+Samples: 80K (20K primary + 60K jittered, 16 threads)
+Data gen: 5.5s (was 63s)
+Training: 14 min (30 epochs with subsampled eval)
+Final: FN=4.88%, FP=9.7%, loss=122.97
+Runtime: ~90% models culled, O(1) draw list + front-to-back sort
+```
+
+### MinBall Incident
+
+Welzl's minimum enclosing ball algorithm has a classic floating-point non-termination bug.
+The iterative restart loop can cycle forever when epsilon-expanded spheres still don't
+contain all points due to accumulated error. Replaced with centroid + extremal point
+(max distance from centroid to any vertex) — O(n) single-pass, guaranteed termination,
+tight enough for sorting.
+
+### Architecture Discussion
+
+For further capacity improvements, discussed:
+- **MoE (Mixture of Experts)**: router picks 1-2 spatial experts, each specializes in a
+  map region. Same total params but much better specialization.
+- **Hierarchical**: broad-phase gate network → per-cluster experts with fewer outputs
+- **Functional decomposition**: position expert + frustum expert + distance expert
+
+### Next Steps
+
+- **384 hidden experiment**: baking now — will show if capacity is the popping bottleneck
+- **MoE/hierarchical architecture**: if 384 doesn't solve it, route to specialized experts
 - **CSM shadow cascades**: separate network per cascade
-- **Temporal smoothing**: EMA across frames to eliminate popping artifacts
 - **Baked GI probes into ProbeManager**: load `_probes_sh.bin` into existing SSBO/shader pipeline
 - **Compute shader port**: SH propagation on GPU for real-time dynamic GI
