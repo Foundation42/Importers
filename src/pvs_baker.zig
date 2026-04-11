@@ -395,12 +395,95 @@ pub fn main() !void {
             }
         }
 
-        // ── Coherent ray set: shoot in contiguous batches from the same
-        // source centroid.  Models the real PVS solver workload where a
-        // source cell fires many rays before moving on.  Nearby rays
-        // share most of their BIVH traversal and Tri cache lines.
-        const cluster_size: u32 = 1024;
+        // Cluster sizes to sweep (BENCH_CLUSTER=comma-separated, default
+        // doubles from 16 up to 16384 — spans sub-L1 to well past L2).
+        var cluster_sizes: [32]u32 = undefined;
+        var cluster_n: usize = 0;
+        const cluster_env = std.process.getEnvVarOwned(allocator, "BENCH_CLUSTER") catch null;
+        defer if (cluster_env) |s| allocator.free(s);
+        const cluster_spec = cluster_env orelse "16,32,64,128,256,512,1024,2048,4096,8192,16384";
         {
+            var cs_it = std.mem.splitScalar(u8, cluster_spec, ',');
+            while (cs_it.next()) |tok| {
+                if (cluster_n >= cluster_sizes.len) break;
+                const t = std.mem.trim(u8, tok, " \t");
+                if (t.len == 0) continue;
+                const n = std.fmt.parseInt(u32, t, 10) catch continue;
+                if (n == 0) continue;
+                cluster_sizes[cluster_n] = n;
+                cluster_n += 1;
+            }
+        }
+
+        try stdout.print("  Ray sets:   incoherent (baseline) + coherent sweep ({d} sizes)\n", .{cluster_n});
+
+        // Warmup — sink result so it can't be elided.
+        var warm_sink: f64 = 0;
+        const warm: u32 = @min(num_rays, num_rays / 10 + 1);
+        {
+            var i: u32 = 0;
+            while (i < warm) : (i += 1) {
+                const r = rays_incoh[i];
+                var tray = bivh_mod.TraceRay.make(r.origin[0], r.origin[1], r.origin[2], r.dir[0], r.dir[1], r.dir[2], r.max_dist);
+                _ = world_bivh.trace(&mesh_set, &tray, 0.0001, r.max_dist);
+                warm_sink += tray.hit_distance;
+            }
+        }
+        try stdout.print("  Warmup:     {d} rays (sink={d:.0})\n", .{ warm, warm_sink });
+
+        // Helper: run one pass over a ray set and report timing + stats.
+        const PassStats = struct {
+            elapsed_ns: f64,
+            hits: u64,
+            sum_dist: f64,
+            nodes: u64,
+            leaves: u64,
+            tris: u64,
+        };
+        const runPass = struct {
+            fn go(bivh_p: *const bivh_mod.Bivh, mesh_p: *const bivh_mod.TriangleMeshSet, ray_slice: []const BenchRay) PassStats {
+                var hits: u64 = 0;
+                var sum: f64 = 0;
+                bivh_mod.resetStats();
+                const pt0 = std.time.nanoTimestamp();
+                for (ray_slice) |r| {
+                    var tray = bivh_mod.TraceRay.make(r.origin[0], r.origin[1], r.origin[2], r.dir[0], r.dir[1], r.dir[2], r.max_dist);
+                    if (bivh_p.trace(mesh_p, &tray, 0.0001, r.max_dist)) {
+                        hits += 1;
+                        sum += tray.hit_distance;
+                    }
+                }
+                const pt1 = std.time.nanoTimestamp();
+                return .{
+                    .elapsed_ns = @floatFromInt(@as(i64, @intCast(pt1 - pt0))),
+                    .hits = hits,
+                    .sum_dist = sum,
+                    .nodes = bivh_mod.stat_nodes_visited,
+                    .leaves = bivh_mod.stat_leaves_visited,
+                    .tris = bivh_mod.stat_tris_tested,
+                };
+            }
+        }.go;
+
+        const nr_f: f64 = @floatFromInt(num_rays);
+
+        // ── Baseline: incoherent ────────────────────────────────────
+        const incoh = runPass(&world_bivh, &mesh_set, rays_incoh);
+        try stdout.print("\n  {s:<32}   ns/ray    rays/s     nodes  leaves   tri-tests   speedup\n", .{"cluster"});
+        try stdout.print("  {s:<32}  {d:>8.1}  {d:>7.3}M   {d:>5.1}  {d:>6.1}   {d:>9.1}    1.00×\n", .{
+            "incoherent (baseline)",
+            incoh.elapsed_ns / nr_f,
+            (nr_f / (incoh.elapsed_ns / 1e9)) / 1e6,
+            @as(f64, @floatFromInt(incoh.nodes)) / nr_f,
+            @as(f64, @floatFromInt(incoh.leaves)) / nr_f,
+            @as(f64, @floatFromInt(incoh.tris)) / nr_f,
+        });
+
+        // ── Coherent sweep ──────────────────────────────────────────
+        var best_speedup: f64 = 1.0;
+        var best_cluster: u32 = 0;
+        for (cluster_sizes[0..cluster_n]) |cluster_size| {
+            // Regenerate rays_coh for this cluster size (fixed seed → reproducible).
             var prng = std.Random.DefaultPrng.init(0xDEADBEEF);
             const rng = prng.random();
             var filled: u32 = 0;
@@ -428,85 +511,27 @@ pub fn main() !void {
                     filled += 1;
                 }
             }
-        }
 
-        try stdout.print("  Ray sets:   incoherent (random src/tgt) + coherent (batches of {d})\n", .{cluster_size});
-
-        // Warmup — sink result so it can't be elided.
-        var warm_sink: f64 = 0;
-        const warm: u32 = @min(num_rays, num_rays / 10 + 1);
-        {
-            var i: u32 = 0;
-            while (i < warm) : (i += 1) {
-                const r = rays_incoh[i];
-                var tray = bivh_mod.TraceRay.make(r.origin[0], r.origin[1], r.origin[2], r.dir[0], r.dir[1], r.dir[2], r.max_dist);
-                _ = world_bivh.trace(&mesh_set, &tray, 0.0001, r.max_dist);
-                warm_sink += tray.hit_distance;
+            const coh = runPass(&world_bivh, &mesh_set, rays_coh);
+            const speedup = incoh.elapsed_ns / coh.elapsed_ns;
+            if (speedup > best_speedup) {
+                best_speedup = speedup;
+                best_cluster = cluster_size;
             }
-        }
-        try stdout.print("  Warmup:     {d} rays (sink={d:.0})\n", .{ warm, warm_sink });
-
-        const BenchResult = struct {
-            name: []const u8,
-            elapsed_ns: f64,
-            hits: u64,
-            sum_dist: f64,
-            nodes: u64,
-            leaves: u64,
-            tris: u64,
-        };
-        var results: [2]BenchResult = undefined;
-
-        const ray_sets = [_]struct { name: []const u8, rays: []BenchRay }{
-            .{ .name = "Pass A — incoherent (random src/tgt)", .rays = rays_incoh },
-            .{ .name = "Pass B — coherent (batched from source)", .rays = rays_coh },
-        };
-
-        for (ray_sets, 0..) |set, idx| {
-            var hits: u64 = 0;
-            var sum: f64 = 0;
-            bivh_mod.resetStats();
-            const pass_t0 = std.time.nanoTimestamp();
-            for (set.rays) |r| {
-                var tray = bivh_mod.TraceRay.make(r.origin[0], r.origin[1], r.origin[2], r.dir[0], r.dir[1], r.dir[2], r.max_dist);
-                if (world_bivh.trace(&mesh_set, &tray, 0.0001, r.max_dist)) {
-                    hits += 1;
-                    sum += tray.hit_distance;
-                }
-            }
-            const pass_t1 = std.time.nanoTimestamp();
-            results[idx] = .{
-                .name = set.name,
-                .elapsed_ns = @floatFromInt(@as(i64, @intCast(pass_t1 - pass_t0))),
-                .hits = hits,
-                .sum_dist = sum,
-                .nodes = bivh_mod.stat_nodes_visited,
-                .leaves = bivh_mod.stat_leaves_visited,
-                .tris = bivh_mod.stat_tris_tested,
-            };
-        }
-
-        const nr_f: f64 = @floatFromInt(num_rays);
-        for (results) |r| {
-            try stdout.print("\n  {s}\n", .{r.name});
-            try stdout.print("    elapsed: {d:.3}s   rays/s: {d:.3}M   ns/ray: {d:.1}\n", .{
-                r.elapsed_ns / 1e9,
-                (nr_f / (r.elapsed_ns / 1e9)) / 1e6,
-                r.elapsed_ns / nr_f,
-            });
-            try stdout.print("    hit rate: {d:.1}%   avg hit dist: {d:.2}\n", .{
-                @as(f64, @floatFromInt(r.hits)) * 100.0 / nr_f,
-                if (r.hits > 0) r.sum_dist / @as(f64, @floatFromInt(r.hits)) else 0,
-            });
-            try stdout.print("    per ray: {d:.1} nodes, {d:.1} leaves, {d:.1} tri tests\n", .{
-                @as(f64, @floatFromInt(r.nodes)) / nr_f,
-                @as(f64, @floatFromInt(r.leaves)) / nr_f,
-                @as(f64, @floatFromInt(r.tris)) / nr_f,
+            var name_buf: [32]u8 = undefined;
+            const name = std.fmt.bufPrint(&name_buf, "coherent (cluster={d})", .{cluster_size}) catch "coherent";
+            try stdout.print("  {s:<32}  {d:>8.1}  {d:>7.3}M   {d:>5.1}  {d:>6.1}   {d:>9.1}    {d:>4.2}×\n", .{
+                name,
+                coh.elapsed_ns / nr_f,
+                (nr_f / (coh.elapsed_ns / 1e9)) / 1e6,
+                @as(f64, @floatFromInt(coh.nodes)) / nr_f,
+                @as(f64, @floatFromInt(coh.leaves)) / nr_f,
+                @as(f64, @floatFromInt(coh.tris)) / nr_f,
+                speedup,
             });
         }
 
-        const speedup = results[0].elapsed_ns / results[1].elapsed_ns;
-        try stdout.print("\n  Coherence speedup (B vs A): {d:.2}×\n", .{speedup});
+        try stdout.print("\n  Best: cluster={d} at {d:.2}× speedup\n", .{ best_cluster, best_speedup });
 
         return;
     }
