@@ -524,7 +524,7 @@ pub const TriangleMeshSet = struct {
 // ── BIVH ─────────────────────────────────────────────────────────────
 
 pub const Bivh = struct {
-    const max_depth: u32 = 18;
+    const max_depth: u32 = 32;
     const max_prims: u32 = 8;
 
     nodes: []BihNode,
