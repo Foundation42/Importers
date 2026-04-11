@@ -22,24 +22,135 @@ const Vec3 = [3]f32;
 // Source 2 → Y-up scale factor (1 unit ≈ 0.0254m)
 const S2_SCALE: f32 = 0.0254;
 
+/// Baker configuration. Parsed from CLI args (with `--flag value` style),
+/// with sensible defaults so a bare `pvs-baker map.vpk` still works.
+const Config = struct {
+    map_vpk: []const u8,
+    content_vpk: ?[]const u8 = null,
+
+    /// Skip geometry load + walker + probes; rerun exemplar selection from
+    /// the cached `_train.bin`. About 5–10 s on Dust II vs ~10 min full bake.
+    fast: bool = false,
+
+    /// Sub-mesh AABB diagonal threshold as a fraction of world diagonal.
+    /// Submeshes larger than this are excluded from PVS entirely (still
+    /// kept in the BIVH for ray occlusion, always drawn at runtime). Catches
+    /// the world-spanning aggregate models that pollute PVS data.
+    submesh_max_fraction: f32 = 0.25,
+
+    /// Number of training samples to generate (probe-seeded).
+    num_samples: u32 = 20_000,
+    /// Rays per sample over the unit sphere.
+    rays_per_sample: u32 = 1024,
+
+    /// Walker progressive-refinement epoch settings.
+    /// Epoch 0 is a low-ray-budget scout pass that discovers gross topology.
+    /// Epochs 1+ refine high-uncertainty edges with targeted extra rays.
+    walker_epochs: u32 = 1,
+    walker_scout_rays: u32 = 16, // rays_per_pair on the scout pass
+    walker_refine_target: u32 = 64, // target casts per uncertain edge in refine pass
+};
+
+const USAGE =
+    \\Usage: pvs-baker [options] <map.vpk> [content.vpk]
+    \\
+    \\Computes PVS data for a Source 2 map. Writes:
+    \\  <map>_pvs_cells.bin       — graph-propagated per-cell visibility (the main one)
+    \\  <map>_epvs.bin            — sparse exemplar PVS for hybrid refinement
+    \\  <map>_pvs_submeshes.bin   — model→submesh PVS bit mapping (sidecar)
+    \\  <map>_train.bin           — training-data cache for `--fast` iteration
+    \\  <map>_probe_assign.bin    — GI probe assignments
+    \\  <map>_probes_sh.bin       — GI probe SH coefficients
+    \\
+    \\Options:
+    \\  --fast                    Skip geometry load + walker, rerun exemplar selection
+    \\                            from cached _train.bin (much faster iteration)
+    \\  --submesh-max-fraction F  AABB skip threshold as fraction of world diag (default 0.25)
+    \\  --num-samples N           Number of training samples (default 20000)
+    \\  --rays-per-sample N       Sphere rays per sample (default 1024)
+    \\  --walker-epochs N         Number of walker epochs (default 1, max 2)
+    \\  --walker-scout-rays N     Epoch-0 rays per cell pair (default 16)
+    \\  --walker-refine-target N  Epoch-1 target casts per uncertain edge (default 64)
+    \\  --help                    Show this help
+    \\
+    \\Positional:
+    \\  <map.vpk>                 Source 2 map VPK (required)
+    \\  [content.vpk]             Optional shared content VPK (pak01_dir.vpk)
+    \\
+;
+
+fn parseArgs(allocator: std.mem.Allocator) !Config {
+    const args = try std.process.argsAlloc(allocator);
+    // Note: caller must keep config.map_vpk / content_vpk alive — we leak the
+    // args buffer intentionally for the lifetime of the program. main() is fine.
+
+    var cfg = Config{ .map_vpk = "" };
+    var positional_count: u32 = 0;
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
+            try std.io.getStdOut().writeAll(USAGE);
+            std.process.exit(0);
+        } else if (std.mem.eql(u8, a, "--fast")) {
+            cfg.fast = true;
+        } else if (std.mem.eql(u8, a, "--submesh-max-fraction")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            cfg.submesh_max_fraction = try std.fmt.parseFloat(f32, args[i]);
+        } else if (std.mem.eql(u8, a, "--num-samples")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            cfg.num_samples = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, a, "--rays-per-sample")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            cfg.rays_per_sample = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, a, "--walker-epochs")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            cfg.walker_epochs = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, a, "--walker-scout-rays")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            cfg.walker_scout_rays = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, a, "--walker-refine-target")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            cfg.walker_refine_target = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.startsWith(u8, a, "--")) {
+            try std.io.getStdErr().writer().print("Unknown option: {s}\n\n{s}", .{ a, USAGE });
+            std.process.exit(1);
+        } else {
+            // Positional
+            if (positional_count == 0) {
+                cfg.map_vpk = a;
+            } else if (positional_count == 1) {
+                cfg.content_vpk = a;
+            } else {
+                try std.io.getStdErr().writer().print("Too many positional args: {s}\n\n{s}", .{ a, USAGE });
+                std.process.exit(1);
+            }
+            positional_count += 1;
+        }
+    }
+
+    if (cfg.map_vpk.len == 0) {
+        try std.io.getStdErr().writeAll(USAGE);
+        std.process.exit(1);
+    }
+    return cfg;
+}
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    const cfg = try parseArgs(allocator);
 
-    if (args.len < 2) {
-        const stderr = std.io.getStdErr().writer();
-        try stderr.writeAll("Usage: pvs-baker <map.vpk> [content.vpk]\n\n");
-        try stderr.writeAll("Computes PVS (Potentially Visible Sets) for a Source 2 map.\n");
-        try stderr.writeAll("Outputs visibility data to <map>_pvs.bin\n");
-        std.process.exit(1);
-    }
-
-    const map_vpk_path = args[1];
-    const content_vpk_path: ?[]const u8 = if (args.len >= 3) args[2] else null;
+    const map_vpk_path = cfg.map_vpk;
+    const content_vpk_path: ?[]const u8 = cfg.content_vpk;
 
     const stdout = std.io.getStdOut().writer();
     const stderr = std.io.getStdErr().writer();
@@ -47,22 +158,17 @@ pub fn main() !void {
 
     const t0 = std.time.nanoTimestamp();
 
-    // ── FAST_EPVS fast path: skip walker/probes/datagen, rerun exemplar
-    // selection AND MLP training from the cached training data. The cache
-    // is self-contained (TDAT v2 includes per-PVS-unit centroids) so no
-    // geometry re-load is needed.
-    const fast_epvs = std.process.getEnvVarOwned(allocator, "FAST_EPVS") catch null;
-    defer if (fast_epvs) |s| allocator.free(s);
-
-    if (fast_epvs != null) {
+    // ── --fast path: skip walker/probes/datagen, rerun exemplar
+    // selection from the cached training data. ──
+    if (cfg.fast) {
         const base_name = std.fs.path.stem(map_vpk_path);
         const train_path = try std.fmt.allocPrint(allocator, "{s}_train.bin", .{base_name});
         defer allocator.free(train_path);
 
-        try stderr.print("[FastEPVS] Loading cached training data from {s}\n", .{train_path});
+        try stderr.print("[Fast] Loading cached training data from {s}\n", .{train_path});
         var train_data = pvs_neural.TrainingData.load(allocator, train_path) catch |err| {
-            try stderr.print("[FastEPVS] Failed to load training cache: {}\n", .{err});
-            try stderr.print("[FastEPVS] Run baker without FAST_EPVS once to generate the cache.\n", .{});
+            try stderr.print("[Fast] Failed to load training cache: {}\n", .{err});
+            try stderr.print("[Fast] Run baker without --fast once to generate the cache.\n", .{});
             std.process.exit(1);
         };
         defer train_data.deinit();
@@ -99,43 +205,6 @@ pub fn main() !void {
         defer allocator.free(epvs_path);
         try epvs.save(epvs_path);
         try stdout.print("  → {s}\n", .{epvs_path});
-
-        // ── MLP training (skippable via SKIP_MLP) ──
-        const skip_mlp = std.process.getEnvVarOwned(allocator, "SKIP_MLP") catch null;
-        defer if (skip_mlp) |s| allocator.free(s);
-
-        if (skip_mlp == null) {
-            try stderr.print("[FastEPVS] Training MLP from cached data...\n", .{});
-            const t_mlp0 = std.time.nanoTimestamp();
-            var mlp = try pvs_neural.train(
-                allocator,
-                &train_data,
-                train_data.centroids,
-                train_data.world_min,
-                train_data.world_max,
-                .{
-                    .epochs = 30,
-                    .learning_rate = 0.0005,
-                    .batch_size = 32,
-                    .hidden_size = 384,
-                    .eval_threshold = 0.3,
-                    .near_boost = 2.0,
-                    .ref_dist = 5.0,
-                },
-                stdout,
-            );
-            defer mlp.deinit();
-
-            const t_mlp1 = std.time.nanoTimestamp();
-            try stdout.print("  MLP training: {d}ms\n", .{@divTrunc(t_mlp1 - t_mlp0, 1_000_000)});
-
-            const npvs_path = try std.fmt.allocPrint(allocator, "{s}_npvs.bin", .{base_name});
-            defer allocator.free(npvs_path);
-            try mlp.save(npvs_path);
-            try stdout.print("  → {s}\n", .{npvs_path});
-        } else {
-            try stderr.print("[FastEPVS] SKIP_MLP set — skipping MLP training\n", .{});
-        }
 
         const t_total = std.time.nanoTimestamp();
         try stdout.print("\n  ═══ Total time: {d}ms ═══\n", .{@divTrunc(t_total - t0, 1_000_000)});
@@ -699,21 +768,44 @@ pub fn main() !void {
             .max_depth = 50,
             .neighbor_gap = 2.0,
             .cluster_shift = cluster_shift,
+            .scout_rays_per_pair = cfg.walker_scout_rays,
+            .refine_target_casts = cfg.walker_refine_target,
             .progress_fn = &walkerProgress,
         },
     );
     defer walker.deinit();
 
+    // ── Epoch 0: Scout pass ─────────────────────────────────────────
+    try stdout.print("  Epoch 0 (scout): {d} rays/pair\n", .{cfg.walker_scout_rays});
     const t_solve0 = std.time.nanoTimestamp();
     try walker.solve();
     const t_solve1 = std.time.nanoTimestamp();
 
-    const ws = walker.stats();
-    try stdout.print("\n  ── Results ──\n", .{});
-    try stdout.print("  Cells walked: {d}\n", .{ws.passes});
-    try stdout.print("  Connections:  {d} per cell avg, min={d}, max={d}\n", .{ ws.avg_visible, ws.min_visible, ws.max_visible });
-    try stdout.print("  Transport:    {d} rays cast, {d} edges connected\n", .{ ws.transport_casts, ws.transport_edges });
-    try stdout.print("  Solve time:   {d}ms\n", .{@divTrunc(t_solve1 - t_solve0, 1_000_000)});
+    const ws_scout = walker.stats();
+    try stdout.print("\n  ── Scout results ──\n", .{});
+    try stdout.print("  Cells walked: {d}\n", .{ws_scout.passes});
+    try stdout.print("  Connections:  {d} per cell avg, min={d}, max={d}\n", .{ ws_scout.avg_visible, ws_scout.min_visible, ws_scout.max_visible });
+    try stdout.print("  Transport:    {d} rays cast, {d} edges connected\n", .{ ws_scout.transport_casts, ws_scout.transport_edges });
+    try stdout.print("  Scout time:   {d}ms\n", .{@divTrunc(t_solve1 - t_solve0, 1_000_000)});
+
+    // ── Epoch 1+: Refinement passes ─────────────────────────────────
+    // Each refine pass tops up "tested but no hits" pairs with extra rays.
+    // Catches grazing-angle connections the scout missed in long thin
+    // corridors. Subsequent passes diminish in returns since the target
+    // casts cap is the same — pairs hit it after the first refine.
+    var refine_epoch: u32 = 1;
+    while (refine_epoch < cfg.walker_epochs) : (refine_epoch += 1) {
+        try stdout.print("\n  Epoch {d} (refine): topping up uncertain edges to {d} casts\n", .{ refine_epoch, cfg.walker_refine_target });
+        const t_ref0 = std.time.nanoTimestamp();
+        const new_edges = try walker.refineEdges();
+        const t_ref1 = std.time.nanoTimestamp();
+        const ws_ref = walker.stats();
+        try stdout.print("  ── Refine results ──\n", .{});
+        try stdout.print("  New edges discovered: {d}\n", .{new_edges});
+        try stdout.print("  Connections:  {d} per cell avg, min={d}, max={d}\n", .{ ws_ref.avg_visible, ws_ref.min_visible, ws_ref.max_visible });
+        try stdout.print("  Transport:    {d} rays cast, {d} edges connected\n", .{ ws_ref.transport_casts, ws_ref.transport_edges });
+        try stdout.print("  Refine time:  {d}ms\n", .{@divTrunc(t_ref1 - t_ref0, 1_000_000)});
+    }
 
     // WALKER_ONLY=1 short-circuits the rest of the pipeline (probe
     // placement, datagen, MLP training) so we can iterate on walker
@@ -1165,7 +1257,7 @@ pub fn main() !void {
         const t_map1 = std.time.nanoTimestamp();
         try stdout.print("  Mapping time: {d}ms\n", .{@divTrunc(t_map1 - t_map0, 1_000_000)});
 
-        // ── Per-submesh Cell PVS (omni mode, written as _pvs_cells.bin) ──
+        // ── Per-submesh Cell PVS (writes _pvs_cells.bin) ─────────────
         //
         // Repurposes the same transport-graph-propagated cell visibility
         // structure from above, but at sub-mesh granularity. The runtime
@@ -1175,18 +1267,15 @@ pub fn main() !void {
         //
         // We compute it here (after the legacy per-model pass) because we
         // need `pt` (transport graph) and `cell_cluster_ids` which are both
-        // local to this block. The per-submesh PVS units we'll build below
-        // are also reused later by the Neural PVS Training phase.
-        const omni_for_cells = std.process.getEnvVarOwned(allocator, "OMNI_EPVS") catch null;
-        defer if (omni_for_cells) |s| allocator.free(s);
-
+        // local to this block. The per-submesh PVS units we build are reused
+        // later by the Data Gen + Exemplar phase.
         var cell_pvs_tri_to_unit: ?[]u32 = null;
         defer if (cell_pvs_tri_to_unit) |slice| allocator.free(slice);
         var cell_pvs_units_count: u32 = 0;
         var cell_pvs_centroids: ?[][3]f32 = null;
         defer if (cell_pvs_centroids) |c| allocator.free(c);
 
-        if (omni_for_cells != null) {
+        {
             try buildSubmeshPvsUnits(
                 allocator,
                 submesh_ranges.items,
@@ -1196,6 +1285,7 @@ pub fn main() !void {
                 world_max,
                 base_name,
                 tri_count,
+                cfg.submesh_max_fraction,
                 &cell_pvs_tri_to_unit,
                 &cell_pvs_units_count,
                 &cell_pvs_centroids,
@@ -1384,76 +1474,29 @@ pub fn main() !void {
             try stdout.print("  → {s}\n", .{assign_bin});
         }
 
-        // ── Phase: Neural PVS Training (frustum-integrated) ────────────
+        // ── Phase: Data Gen + Exemplar PVS ─────────────────────────────
+        // (The MLP training phase used to live here. It was retired now that
+        // the cell-graph PVS does the same job better and cheaper. This phase
+        // just samples omnidirectional ray bundles from probe-seeded positions
+        // and feeds the result to the exemplar selector.)
         {
             try stdout.print("\n  ╔═══════════════════════════╗\n", .{});
-            try stdout.print("  ║  Neural PVS Training v2   ║\n", .{});
+            try stdout.print("  ║  Data Gen + Exemplar      ║\n", .{});
             try stdout.print("  ╚═══════════════════════════╝\n", .{});
 
-            const t_neural0 = std.time.nanoTimestamp();
+            const t_data0 = std.time.nanoTimestamp();
 
-            stderr.print("[NPVS] Computing model centroids + MinBalls...\n", .{}) catch {};
-
-            // Compute model centroids (for spatial loss weighting)
-            const model_centroids = try allocator.alloc([3]f32, num_models);
-            defer allocator.free(model_centroids);
-            for (model_ranges.items, 0..) |mr, mi| {
-                var cx: f64 = 0;
-                var cy: f64 = 0;
-                var cz: f64 = 0;
-                var count: f64 = 0;
-                for (mr.tri_start..mr.tri_end) |ti| {
-                    const base = ti * 3;
-                    for (0..3) |vi| {
-                        const pos = all_positions.items[mesh_set.indices[base + vi]];
-                        cx += pos[0];
-                        cy += pos[1];
-                        cz += pos[2];
-                        count += 1;
-                    }
-                }
-                if (count > 0) {
-                    model_centroids[mi] = .{
-                        @floatCast(cx / count),
-                        @floatCast(cy / count),
-                        @floatCast(cz / count),
-                    };
-                } else {
-                    model_centroids[mi] = .{ 0, 0, 0 };
-                }
-            }
-
-            // (Used to write a _model_bounds.bin sidecar with MinBall spheres
-            // per model. Removed: the baker's coordinate space didn't match the
-            // runtime's instance transforms, so the spheres ended up in the wrong
-            // place and frustum culling dropped half the geometry. The runtime
-            // now computes spheres from its own AABBs at load time.)
+            // Per-submesh PVS units were already built up in the Cell PVS
+            // section above. Reuse them so we don't redo the work.
+            const data_tri_to_unit: []const u32 = cell_pvs_tri_to_unit orelse tri_to_model;
+            const data_num_units: u32 = if (cell_pvs_tri_to_unit != null) cell_pvs_units_count else num_models;
 
             // Extract probe positions for surprise-distributed sampling
             const probe_pos_array = try allocator.alloc([3]f32, probes.len);
             defer allocator.free(probe_pos_array);
             for (probes, 0..) |probe, pi| probe_pos_array[pi] = probe.position;
 
-            // OMNI_EPVS: omnidirectional sampling for the exemplar baker.
-            // Each sample fires rays over the full sphere from a position and
-            // stores ALL visible models — orientation is dropped entirely.
-            // The exemplar baker selects in position-only space and the runtime
-            // does standard frustum culling on top of the kNN result.
-            const omni_epvs = std.process.getEnvVarOwned(allocator, "OMNI_EPVS") catch null;
-            defer if (omni_epvs) |s| allocator.free(s);
-            if (omni_epvs != null) {
-                stderr.print("[NPVS] OMNI_EPVS set — omnidirectional sampling enabled\n", .{}) catch {};
-            }
-
-            // Per-submesh PVS units were already built up in the Cell PVS
-            // section above (when omni mode is on) — reuse them here so the
-            // sidecar isn't computed twice.
-            const data_tri_to_unit: []const u32 = if (cell_pvs_tri_to_unit) |t| t else tri_to_model;
-            const data_num_units: u32 = if (omni_epvs != null) cell_pvs_units_count else num_models;
-            const data_centroids: []const Vec3 = if (cell_pvs_centroids) |c| c else model_centroids;
-
-            // Generate training data, seeded from GI probes
-            stderr.print("[NPVS] Starting probe-seeded data generation...\n", .{}) catch {};
+            stderr.print("[Bake] Starting probe-seeded data generation...\n", .{}) catch {};
             var train_data = try pvs_neural.generateTrainingData(
                 allocator,
                 &world_bivh,
@@ -1464,29 +1507,17 @@ pub fn main() !void {
                 world_min,
                 world_max,
                 .{
-                    .num_samples = 20_000,
-                    // Sphere covers ~6× the solid angle of a typical frustum,
-                    // so bump rays per sample in omni mode to keep per-direction
-                    // density similar.
-                    .rays_per_sample = if (omni_epvs != null) @as(u32, 1024) else @as(u32, 256),
+                    .num_samples = cfg.num_samples,
+                    .rays_per_sample = cfg.rays_per_sample,
                     .max_ray_dist = 2000.0,
-                    .omni_mode = omni_epvs != null,
                 },
                 probe_pos_array,
                 stdout,
             );
             defer train_data.deinit();
 
-            const t_data = std.time.nanoTimestamp();
-            const data_gen_ms = @divTrunc(t_data - t_neural0, 1_000_000);
-            try stdout.print("  Data gen: {d}ms\n", .{data_gen_ms});
-
-            // Copy the per-PVS-unit centroids into the training data so the
-            // cache file is self-contained — FAST_EPVS can then re-run BOTH
-            // exemplar selection AND MLP training without re-loading geometry.
-            if (train_data.centroids.len == data_centroids.len) {
-                @memcpy(train_data.centroids, data_centroids);
-            }
+            const t_data1 = std.time.nanoTimestamp();
+            try stdout.print("  Data gen: {d}ms\n", .{@divTrunc(t_data1 - t_data0, 1_000_000)});
 
             // Save training data cache for fast iteration (FAST_EPVS path)
             {
@@ -1496,51 +1527,7 @@ pub fn main() !void {
                 try stdout.print("  → {s} (training cache)\n", .{train_path});
             }
 
-            // Skip MLP training when SKIP_MLP env var is set (faster iteration on exemplars).
-            // In OMNI_EPVS mode the MLP still trains, just with all-zero orientation
-            // dimensions in the input (those weights will train to zero) and a much
-            // larger output layer (one neuron per PVS unit / sub-mesh instead of one
-            // per model). Worth seeing what the MLP learns from the richer signal.
-            const skip_mlp = std.process.getEnvVarOwned(allocator, "SKIP_MLP") catch null;
-            defer if (skip_mlp) |s| allocator.free(s);
-
-            if (skip_mlp == null) {
-                stderr.print("[NPVS] Data gen: {d}ms, starting training...\n", .{data_gen_ms}) catch {};
-
-                // Train MLP with distance-weighted loss (position-only input).
-                var mlp = try pvs_neural.train(
-                    allocator,
-                    &train_data,
-                    data_centroids,
-                    world_min,
-                    world_max,
-                    .{
-                        .epochs = 30,
-                        .learning_rate = 0.0005,
-                        .batch_size = 32,
-                        .hidden_size = 384,
-                        .eval_threshold = 0.3,
-                        .near_boost = 2.0,
-                        .ref_dist = 5.0,
-                    },
-                    stdout,
-                );
-                defer mlp.deinit();
-
-                const t_train = std.time.nanoTimestamp();
-                try stdout.print("  Training: {d}ms\n", .{@divTrunc(t_train - t_data, 1_000_000)});
-
-                // Save weights
-                const npvs_path = try std.fmt.allocPrint(allocator, "{s}_npvs.bin", .{base_name});
-                defer allocator.free(npvs_path);
-                try mlp.save(npvs_path);
-                try stdout.print("  → {s}\n", .{npvs_path});
-                stderr.print("[NPVS] Done! Saved to {s}\n", .{npvs_path}) catch {};
-            } else {
-                stderr.print("[NPVS] SKIP_MLP set — skipping MLP training\n", .{}) catch {};
-            }
-
-            // ── Exemplar PVS (alternative model) ──
+            // ── Exemplar selection ──
             stderr.print("[Exemplar] Building exemplar model...\n", .{}) catch {};
             const t_exemplar0 = std.time.nanoTimestamp();
             var epvs = try pvs_exemplar.selectExemplars(
@@ -1561,7 +1548,6 @@ pub fn main() !void {
             const t_exemplar1 = std.time.nanoTimestamp();
             try stdout.print("  Exemplar build: {d}ms\n", .{@divTrunc(t_exemplar1 - t_exemplar0, 1_000_000)});
 
-            // Evaluate
             try pvs_exemplar.evaluate(&epvs, &train_data, 0.3, stdout);
 
             const epvs_path = try std.fmt.allocPrint(allocator, "{s}_epvs.bin", .{base_name});
@@ -1847,22 +1833,13 @@ fn buildSubmeshPvsUnits(
     world_max: Vec3,
     base_name: []const u8,
     tri_count: u32,
+    max_fraction: f32,
     out_tri_to_unit: *?[]u32,
     out_num_units: *u32,
     out_centroids: *?[][3]f32,
     stdout: anytype,
 ) !void {
     const stderr = std.io.getStdErr().writer();
-
-    // Threshold for "oversized" submesh: any submesh whose AABB diagonal
-    // exceeds this fraction of the world diagonal is skipped from PVS.
-    // Default 0.25 catches the worst aggregate offenders without losing
-    // legitimate large props. Override via SUBMESH_MAX_FRACTION env var.
-    var max_fraction: f32 = 0.25;
-    if (std.process.getEnvVarOwned(allocator, "SUBMESH_MAX_FRACTION") catch null) |s| {
-        defer allocator.free(s);
-        if (std.fmt.parseFloat(f32, s)) |v| max_fraction = v else |_| {}
-    }
 
     const world_dx = world_max[0] - world_min[0];
     const world_dy = world_max[1] - world_min[1];

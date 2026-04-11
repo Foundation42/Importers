@@ -981,6 +981,14 @@ pub const WalkerConfig = struct {
     neighbor_gap: f32 = 2.0,
     /// Cluster size as power-of-2 shift (for visibility bitmap granularity).
     cluster_shift: u5 = 0,
+    /// Rays cast per cell pair during the scout (epoch 0) BFS pass. Higher
+    /// values improve scout coverage but cost wall time linearly.
+    scout_rays_per_pair: u32 = 16,
+    /// Target total casts per uncertain edge during the refine (epoch 1+)
+    /// pass. Edges with `0 < hits == 0` (tested but no connection found)
+    /// get topped up to this many casts to catch grazing-angle connections
+    /// the scout missed.
+    refine_target_casts: u32 = 64,
     /// Progress callback.
     progress_fn: ?*const fn (cells_done: u32, total_cells: u32, connections: u64) void = null,
 };
@@ -1172,14 +1180,15 @@ pub const WalkerSolver = struct {
     }
 
     /// Shoot a few rays between two cells. Returns true if ANY ray connects.
+    /// `rays_per_pair` is the budget; the scout pass uses `config.scout_rays_per_pair`,
+    /// the refine pass tops up to `config.refine_target_casts`.
     fn testConnectivity(self: *WalkerSolver, cell_a: u32, cell_b: u32, rng: std.Random) bool {
         const range_a = self.cell_ranges[cell_a];
         const range_b = self.cell_ranges[cell_b];
         if (range_a.start_tri >= range_a.end_tri) return false;
         if (range_b.start_tri >= range_b.end_tri) return false;
 
-        // Random K=16 — control test for the stratified 4×4 comparison.
-        const rays_per_pair: u32 = 16;
+        const rays_per_pair: u32 = self.config.scout_rays_per_pair;
         for (0..rays_per_pair) |_| {
             const tri_a = rng.intRangeLessThan(u32, range_a.start_tri, range_a.end_tri);
             const tri_b = rng.intRangeLessThan(u32, range_b.start_tri, range_b.end_tri);
@@ -1208,6 +1217,121 @@ pub const WalkerSolver = struct {
         }
 
         return false;
+    }
+
+    /// Refinement pass — for every cell pair the scout tested but found
+    /// no connection (`casts > 0`, `hits == 0`), top up the casts with
+    /// extra rays. This catches grazing-angle pairs the scout missed by
+    /// chance: long thin corridors where 16 random rays often all hit
+    /// walls but a 17th would have threaded through.
+    ///
+    /// Pairs that the scout never tested at all (`casts == 0`) are skipped
+    /// — those are unreachable per BFS pruning, and re-testing them would
+    /// be O(N²) without a topology hint to guide which to retry.
+    ///
+    /// Returns the number of new edges discovered (pairs that went from
+    /// 0 hits to > 0 hits during this pass).
+    pub fn refineEdges(self: *WalkerSolver) !u64 {
+        const num_threads = if (self.config.thread_count > 0)
+            self.config.thread_count
+        else
+            @as(u32, @intCast(Thread.getCpuCount() catch 4));
+
+        const target = self.config.refine_target_casts;
+        const new_edges = try self.allocator.alloc(std.atomic.Value(u64), num_threads);
+        defer self.allocator.free(new_edges);
+        for (new_edges) |*ne| ne.* = std.atomic.Value(u64).init(0);
+
+        const threads = try self.allocator.alloc(Thread, num_threads);
+        defer self.allocator.free(threads);
+
+        const RefineCtx = struct {
+            solver: *WalkerSolver,
+            new_edges: *std.atomic.Value(u64),
+            target: u32,
+            thread_id: u32,
+            num_threads: u32,
+
+            fn run(ctx: @This()) void {
+                var seed: u64 = @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())));
+                seed ^= @as(u64, ctx.thread_id) * 0xBF58476D1CE4E5B9;
+                var prng = std.Random.DefaultPrng.init(seed);
+                const rng = prng.random();
+
+                // Strided over cell A. Each thread handles {tid, tid+N, ...}.
+                var a: u32 = ctx.thread_id;
+                while (a < ctx.solver.num_cells) : (a += ctx.num_threads) {
+                    var b: u32 = a + 1;
+                    while (b < ctx.solver.num_cells) : (b += 1) {
+                        const edge = ctx.solver.transport.getEdge(a, b);
+                        const casts = edge.casts.load(.monotonic);
+                        const hits = edge.hits.load(.monotonic);
+                        // Skip pairs the scout never tested AND pairs already
+                        // confirmed (any hit). We only refine ambiguous ones.
+                        if (casts == 0) continue;
+                        if (hits > 0) continue;
+                        if (casts >= ctx.target) continue;
+
+                        const found = ctx.solver.castExtraRays(a, b, ctx.target - casts, rng);
+                        if (found) _ = ctx.new_edges.fetchAdd(1, .monotonic);
+                    }
+                }
+            }
+        };
+
+        for (threads, 0..) |*t, i| {
+            const ctx = RefineCtx{
+                .solver = self,
+                .new_edges = &new_edges[i],
+                .target = target,
+                .thread_id = @intCast(i),
+                .num_threads = num_threads,
+            };
+            t.* = try Thread.spawn(.{}, RefineCtx.run, .{ctx});
+        }
+        for (threads) |t| t.join();
+
+        var total_new: u64 = 0;
+        for (new_edges) |*ne| total_new += ne.load(.monotonic);
+        return total_new;
+    }
+
+    /// Helper for refineEdges — cast `n` extra rays between two cells,
+    /// return true if any landed.
+    fn castExtraRays(self: *WalkerSolver, cell_a: u32, cell_b: u32, n: u32, rng: std.Random) bool {
+        const range_a = self.cell_ranges[cell_a];
+        const range_b = self.cell_ranges[cell_b];
+        if (range_a.start_tri >= range_a.end_tri) return false;
+        if (range_b.start_tri >= range_b.end_tri) return false;
+
+        var any_hit = false;
+        for (0..n) |_| {
+            const tri_a = rng.intRangeLessThan(u32, range_a.start_tri, range_a.end_tri);
+            const tri_b = rng.intRangeLessThan(u32, range_b.start_tri, range_b.end_tri);
+
+            const p1 = randomPointOnTriangle(self.positions, self.indices, tri_a, rng);
+            const p2 = randomPointOnTriangle(self.positions, self.indices, tri_b, rng);
+
+            const dir = vec3Sub(p2, p1);
+            const dist = vec3Length(dir);
+            if (dist < 1e-6 or dist > self.config.max_ray_distance) continue;
+            const norm_dir = vec3Scale(dir, 1.0 / dist);
+
+            self.transport.recordCast(cell_a, cell_b);
+            const result = self.trace_fn(self.trace_ctx, p1, norm_dir, dist + 0.01);
+            const reached = !result.hit or
+                result.primitive == @as(i32, @intCast(tri_b)) or
+                result.distance >= dist - 0.01;
+
+            if (reached) {
+                self.transport.recordHit(cell_a, cell_b);
+                any_hit = true;
+                // Don't early-out — keep casting to converge the casts counter
+                // toward `target`. This lets future refine passes know how
+                // many rays we've already spent.
+            }
+        }
+        return any_hit;
     }
 
     pub fn stats(self: *const WalkerSolver) SolveStats {
