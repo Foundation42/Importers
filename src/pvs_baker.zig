@@ -302,6 +302,167 @@ pub fn main() !void {
     try stdout.print("  BIVH depth:  {d}\n", .{world_bivh.tree_depth});
     try stdout.print("  Build time:  {d}ms\n", .{@divTrunc(t_bivh1 - t_bivh0, 1_000_000)});
 
+    // ── Optional: BIVH micro-benchmark (BENCH_BIVH=<n> env var) ──────
+    //
+    // Runs a single-threaded trace benchmark against the freshly built
+    // BIVH, then exits.  Generates a deterministic ray set by pairing
+    // random triangle centroids (fixed seed), then runs two passes:
+    // (A) direct bivh.trace call, (B) via the TraceFn function-pointer
+    // indirection used by the production solver.  The delta between
+    // A and B isolates the cost of the indirection.
+    if (std.process.getEnvVarOwned(allocator, "BENCH_BIVH") catch null) |bench_str| {
+        defer allocator.free(bench_str);
+        const num_rays: u32 = std.fmt.parseInt(u32, bench_str, 10) catch 1_000_000;
+
+        try stdout.print("\n  ═══ BIVH Benchmark ═══\n", .{});
+        try stdout.print("  Ray count:  {d} (single-threaded, fixed seed)\n", .{num_rays});
+
+        // Leaf distribution — a fat-leaf tree quintuples Möller-Trumbore work per leaf.
+        {
+            var leaf_n: u32 = 0;
+            var leaf_sum: u64 = 0;
+            var leaf_max: u32 = 0;
+            var hist = [_]u32{0} ** 8; // buckets: 1-8, 9-16, 17-32, 33-64, 65-128, 129-256, 257-512, 513+
+            for (0..world_bivh.node_count) |i| {
+                const n = world_bivh.nodes[i];
+                if (!n.isLeaf()) continue;
+                const np: u32 = @intCast(n.end_prim - n.startPrim() + 1);
+                leaf_n += 1;
+                leaf_sum += np;
+                if (np > leaf_max) leaf_max = np;
+                const b: usize = if (np <= 8) 0 else if (np <= 16) 1 else if (np <= 32) 2 else if (np <= 64) 3 else if (np <= 128) 4 else if (np <= 256) 5 else if (np <= 512) 6 else 7;
+                hist[b] += 1;
+            }
+            const avg = @as(f64, @floatFromInt(leaf_sum)) / @as(f64, @floatFromInt(leaf_n));
+            try stdout.print("  Leaf stats: {d} leaves, avg {d:.1} tris, max {d}\n", .{ leaf_n, avg, leaf_max });
+            try stdout.print("    bucket  1-8:{d}  9-16:{d}  17-32:{d}  33-64:{d}  65-128:{d}  129-256:{d}  257-512:{d}  513+:{d}\n", .{
+                hist[0], hist[1], hist[2], hist[3], hist[4], hist[5], hist[6], hist[7],
+            });
+        }
+
+        const BenchRay = struct { origin: [3]f32, dir: [3]f32, max_dist: f32 };
+        const rays = try allocator.alloc(BenchRay, num_rays);
+        defer allocator.free(rays);
+
+        // Compute centroids of (possibly reordered) triangles once.
+        const tc: u32 = mesh_set.tri_count;
+        const centroids = try allocator.alloc([3]f32, tc);
+        defer allocator.free(centroids);
+        {
+            var mn: [3]f32 = undefined;
+            var mx: [3]f32 = undefined;
+            var ct: [3]f32 = undefined;
+            for (0..tc) |i| {
+                mesh_set.getBounds(@intCast(i), &mn, &mx, &ct);
+                centroids[i] = ct;
+            }
+        }
+
+        // Build ray set: pair random distinct centroids, offset origin
+        // a few cm along the ray so we don't self-hit the source tri.
+        var prng = std.Random.DefaultPrng.init(0xDEADBEEF);
+        const rng = prng.random();
+        var filled: u32 = 0;
+        while (filled < num_rays) {
+            const ia = rng.intRangeLessThan(u32, 0, tc);
+            const ib = rng.intRangeLessThan(u32, 0, tc);
+            if (ia == ib) continue;
+            const p0 = centroids[ia];
+            const p1 = centroids[ib];
+            const dx = p1[0] - p0[0];
+            const dy = p1[1] - p0[1];
+            const dz = p1[2] - p0[2];
+            const len2 = dx * dx + dy * dy + dz * dz;
+            if (len2 < 1e-6) continue;
+            const len = @sqrt(len2);
+            const inv = 1.0 / len;
+            const off: f32 = 0.05;
+            rays[filled] = .{
+                .origin = .{ p0[0] + dx * inv * off, p0[1] + dy * inv * off, p0[2] + dz * inv * off },
+                .dir = .{ dx * inv, dy * inv, dz * inv },
+                .max_dist = len + 1.0,
+            };
+            filled += 1;
+        }
+
+        // Warmup — cache/clock warmup. Sink the result so it can't be
+        // elided. Use ~10% of the main ray set.
+        var warm_sink: f64 = 0;
+        const warm: u32 = @min(num_rays, num_rays / 10 + 1);
+        {
+            var i: u32 = 0;
+            while (i < warm) : (i += 1) {
+                const r = rays[i];
+                var tray = bivh_mod.TraceRay.make(r.origin[0], r.origin[1], r.origin[2], r.dir[0], r.dir[1], r.dir[2], r.max_dist);
+                _ = world_bivh.trace(&mesh_set, &tray, 0.0001, r.max_dist);
+                warm_sink += tray.hit_distance;
+            }
+        }
+        try stdout.print("  Warmup:     {d} rays (sink={d:.0})\n", .{ warm, warm_sink });
+
+        // ── Pass A: direct bivh.trace ───────────────────────────────
+        var hits_a: u64 = 0;
+        var sum_a: f64 = 0;
+        const tA0 = std.time.nanoTimestamp();
+        for (rays) |r| {
+            var tray = bivh_mod.TraceRay.make(r.origin[0], r.origin[1], r.origin[2], r.dir[0], r.dir[1], r.dir[2], r.max_dist);
+            if (world_bivh.trace(&mesh_set, &tray, 0.0001, r.max_dist)) {
+                hits_a += 1;
+                sum_a += tray.hit_distance;
+            }
+        }
+        const tA1 = std.time.nanoTimestamp();
+
+        // ── Pass B: via TraceFn indirection (production hot path) ──
+        // Force a real function-pointer call by routing through a
+        // volatile-ish global so LLVM can't devirtualize.
+        var bench_ctx = TraceContext{ .bivh = &world_bivh, .mesh_set = &mesh_set };
+        bench_trace_fn = &traceWorld;
+        const trace_fn_local: pvs_mod.TraceFn = bench_trace_fn.?;
+        var hits_b: u64 = 0;
+        var sum_b: f64 = 0;
+        const tB0 = std.time.nanoTimestamp();
+        for (rays) |r| {
+            const res = trace_fn_local(@ptrCast(&bench_ctx), r.origin, r.dir, r.max_dist);
+            if (res.hit) {
+                hits_b += 1;
+                sum_b += res.distance;
+            }
+        }
+        const tB1 = std.time.nanoTimestamp();
+
+        const nr_f: f64 = @floatFromInt(num_rays);
+        const elA_ns: f64 = @floatFromInt(@as(i64, @intCast(tA1 - tA0)));
+        const elB_ns: f64 = @floatFromInt(@as(i64, @intCast(tB1 - tB0)));
+
+        try stdout.print("\n  Pass A — direct bivh.trace:\n", .{});
+        try stdout.print("    elapsed: {d:.3}s   rays/s: {d:.3}M   ns/ray: {d:.1}\n", .{
+            elA_ns / 1e9,
+            (nr_f / (elA_ns / 1e9)) / 1e6,
+            elA_ns / nr_f,
+        });
+        try stdout.print("    hit rate: {d:.1}%   avg hit dist: {d:.2}\n", .{
+            @as(f64, @floatFromInt(hits_a)) * 100.0 / nr_f,
+            if (hits_a > 0) sum_a / @as(f64, @floatFromInt(hits_a)) else 0,
+        });
+
+        try stdout.print("\n  Pass B — via TraceFn indirection:\n", .{});
+        try stdout.print("    elapsed: {d:.3}s   rays/s: {d:.3}M   ns/ray: {d:.1}\n", .{
+            elB_ns / 1e9,
+            (nr_f / (elB_ns / 1e9)) / 1e6,
+            elB_ns / nr_f,
+        });
+        try stdout.print("    hit rate: {d:.1}%   avg hit dist: {d:.2}\n", .{
+            @as(f64, @floatFromInt(hits_b)) * 100.0 / nr_f,
+            if (hits_b > 0) sum_b / @as(f64, @floatFromInt(hits_b)) else 0,
+        });
+
+        const overhead_pct = (elB_ns - elA_ns) * 100.0 / elA_ns;
+        try stdout.print("\n  Indirection overhead (B vs A): {d:.1}%\n", .{overhead_pct});
+
+        return;
+    }
+
     // ── BFS Walker Solve ─────────────────────────────────────────────
     //
     // Single-pass BFS walker: expand from each cell through spatial
@@ -1335,6 +1496,12 @@ pub fn main() !void {
 }
 
 // ── BIVH adapter for PVS function pointers ──────────────────────────
+
+// File-scope holder for the trace fn pointer used by the BIVH bench.
+// Stored as a mutable global so LLVM treats it as opaque and can't
+// devirtualize the call back to `traceWorld`, matching how the real
+// solver receives its TraceFn through the pvs_mod API.
+var bench_trace_fn: ?pvs_mod.TraceFn = null;
 
 const TraceContext = struct {
     bivh: *const bivh_mod.Bivh,
