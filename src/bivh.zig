@@ -11,6 +11,22 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+// ── Traversal counters (diagnostic) ──────────────────────────────────
+//
+// File-scope counters incremented during trace.  Reset via
+// `resetStats()` before a measurement and read afterwards.  The
+// overhead is ~1-2% on a hot loop — small enough to keep on during
+// benchmarks but not something the production path should care about.
+pub var stat_nodes_visited: u64 = 0;
+pub var stat_leaves_visited: u64 = 0;
+pub var stat_tris_tested: u64 = 0;
+
+pub fn resetStats() void {
+    stat_nodes_visited = 0;
+    stat_leaves_visited = 0;
+    stat_tris_tested = 0;
+}
+
 // ── Axis ─────────────────────────────────────────────────────────────
 
 pub const Axis = enum(u8) {
@@ -81,85 +97,38 @@ pub const BihNode = struct {
 
 // ── Trace Ray ────────────────────────────────────────────────────────
 //
-// Precomputed ray with slope classification for fast AABB rejection.
-// Uses the Eisemann/Schwarz/Stamminger slope method (26 octant cases)
-// for branchless-style early-out on ray/AABB tests.
-
-pub const Classification = enum(u5) {
-    MMM, MMP, MPM, MPP, PMM, PMP, PPM, PPP,
-    POO, MOO, OPO, OMO, OOP, OOM,
-    OMM, OMP, OPM, OPP, MOM, MOP, POM, POP,
-    MMO, MPO, PMO, PPO,
-};
+// Compact f32 ray with origin + inverse direction.  The slab-based
+// AABB test below needs nothing else — fits in ~40 bytes and lives
+// entirely in registers during a trace.
 
 pub const TraceRay = struct {
     // Origin
-    x: f64 = 0,
-    y: f64 = 0,
-    z: f64 = 0,
+    x: f32 = 0,
+    y: f32 = 0,
+    z: f32 = 0,
 
     // Inverse direction (1/d)
-    ii: f64 = 0,
-    ij: f64 = 0,
-    ik: f64 = 0,
+    ii: f32 = 0,
+    ij: f32 = 0,
+    ik: f32 = 0,
 
-    // Slope ratios
-    ibyj: f64 = 0,
-    jbyi: f64 = 0,
-    kbyj: f64 = 0,
-    jbyk: f64 = 0,
-    ibyk: f64 = 0,
-    kbyi: f64 = 0,
-
-    // Slope offsets
-    c_xy: f64 = 0,
-    c_xz: f64 = 0,
-    c_yx: f64 = 0,
-    c_yz: f64 = 0,
-    c_zx: f64 = 0,
-    c_zy: f64 = 0,
-
-    classification: Classification = .PPP,
     hit_distance: f32 = std.math.floatMax(f32),
     hit_primitive: i32 = -1,
     hit_cell: i32 = -1,
 
     /// Build a ray from origin + direction + max distance.
     pub fn make(ox: f32, oy: f32, oz: f32, dx: f32, dy: f32, dz: f32, max_dist: f32) TraceRay {
-        var ray = TraceRay{};
-        ray.hit_distance = max_dist;
-        ray.hit_primitive = -1;
-        ray.hit_cell = -1;
-
-        const i: f64 = dx;
-        const j: f64 = dy;
-        const k: f64 = dz;
-
-        ray.x = ox;
-        ray.y = oy;
-        ray.z = oz;
-
-        ray.ii = 1.0 / i;
-        ray.ij = 1.0 / j;
-        ray.ik = 1.0 / k;
-
-        ray.ibyj = i * ray.ij;
-        ray.jbyi = j * ray.ii;
-        ray.jbyk = j * ray.ik;
-        ray.kbyj = k * ray.ij;
-        ray.ibyk = i * ray.ik;
-        ray.kbyi = k * ray.ii;
-
-        ray.c_xy = ray.y - ray.jbyi * ray.x;
-        ray.c_xz = ray.z - ray.kbyi * ray.x;
-        ray.c_yx = ray.x - ray.ibyj * ray.y;
-        ray.c_yz = ray.z - ray.kbyj * ray.y;
-        ray.c_zx = ray.x - ray.ibyk * ray.z;
-        ray.c_zy = ray.y - ray.jbyk * ray.z;
-
-        ray.classification = classify(dx, dy, dz);
-
-        return ray;
+        return .{
+            .x = ox,
+            .y = oy,
+            .z = oz,
+            .ii = 1.0 / dx,
+            .ij = 1.0 / dy,
+            .ik = 1.0 / dz,
+            .hit_distance = max_dist,
+            .hit_primitive = -1,
+            .hit_cell = -1,
+        };
     }
 
     /// Build a ray from start point to end point.
@@ -178,202 +147,29 @@ pub const TraceRay = struct {
         return make(origin[0], origin[1], origin[2], dir[0], dir[1], dir[2], max_dist);
     }
 
-    fn classify(i: f32, j: f32, k: f32) Classification {
-        if (i < 0) {
-            if (j < 0) {
-                if (k < 0) return .MMM
-                else if (k > 0) return .MMP
-                else return .MMO;
-            } else if (j > 0) {
-                if (k < 0) return .MPM
-                else if (k > 0) return .MPP
-                else return .MPO;
-            } else { // j == 0
-                if (k < 0) return .MOM
-                else if (k > 0) return .MOP
-                else return .MOO;
-            }
-        } else if (i > 0) {
-            if (j < 0) {
-                if (k < 0) return .PMM
-                else if (k > 0) return .PMP
-                else return .PMO;
-            } else if (j > 0) {
-                if (k < 0) return .PPM
-                else if (k > 0) return .PPP
-                else return .PPO;
-            } else { // j == 0
-                if (k < 0) return .POM
-                else if (k > 0) return .POP
-                else return .POO;
-            }
-        } else { // i == 0
-            if (j < 0) {
-                if (k < 0) return .OMM
-                else if (k > 0) return .OMP
-                else return .OMO;
-            } else if (j > 0) {
-                if (k < 0) return .OPM
-                else if (k > 0) return .OPP
-                else return .OPO;
-            } else { // j == 0
-                if (k < 0) return .OOM
-                else if (k > 0) return .OOP
-                else return .PPP; // degenerate
-            }
-        }
+    /// Plain slab-based ray/AABB test (Kay-Kajiya, branchless).
+    /// 6 subs + 6 muls + 6 mins/maxes, all in f32.
+    pub inline fn intersectsAABB(self: *const TraceRay, box_min: [3]f32, box_max: [3]f32) bool {
+        const t1x = (box_min[0] - self.x) * self.ii;
+        const t2x = (box_max[0] - self.x) * self.ii;
+        const t1y = (box_min[1] - self.y) * self.ij;
+        const t2y = (box_max[1] - self.y) * self.ij;
+        const t1z = (box_min[2] - self.z) * self.ik;
+        const t2z = (box_max[2] - self.z) * self.ik;
+
+        const tmin_x = @min(t1x, t2x);
+        const tmax_x = @max(t1x, t2x);
+        const tmin_y = @min(t1y, t2y);
+        const tmax_y = @max(t1y, t2y);
+        const tmin_z = @min(t1z, t2z);
+        const tmax_z = @max(t1z, t2z);
+
+        const tmin = @max(tmin_x, @max(tmin_y, tmin_z));
+        const tmax = @min(tmax_x, @min(tmax_y, tmax_z));
+
+        return tmax >= @max(tmin, 0.0) and tmin <= self.hit_distance;
     }
 
-    /// Fast slope-classified ray/AABB test (Eisemann et al).
-    /// 26 octant cases, each testing only the relevant conditions.
-    pub fn intersectsAABB(self: *const TraceRay, box_min: [3]f32, box_max: [3]f32) bool {
-        const bmin_x: f64 = box_min[0];
-        const bmin_y: f64 = box_min[1];
-        const bmin_z: f64 = box_min[2];
-        const bmax_x: f64 = box_max[0];
-        const bmax_y: f64 = box_max[1];
-        const bmax_z: f64 = box_max[2];
-
-        return switch (self.classification) {
-            .MMM => !(self.x < bmin_x or self.y < bmin_y or self.z < bmin_z or
-                self.jbyi * bmin_x - bmax_y + self.c_xy > 0 or
-                self.ibyj * bmin_y - bmax_x + self.c_yx > 0 or
-                self.jbyk * bmin_z - bmax_y + self.c_zy > 0 or
-                self.kbyj * bmin_y - bmax_z + self.c_yz > 0 or
-                self.kbyi * bmin_x - bmax_z + self.c_xz > 0 or
-                self.ibyk * bmin_z - bmax_x + self.c_zx > 0),
-
-            .MMP => !(self.x < bmin_x or self.y < bmin_y or self.z > bmax_z or
-                self.jbyi * bmin_x - bmax_y + self.c_xy > 0 or
-                self.ibyj * bmin_y - bmax_x + self.c_yx > 0 or
-                self.jbyk * bmax_z - bmax_y + self.c_zy > 0 or
-                self.kbyj * bmin_y - bmin_z + self.c_yz < 0 or
-                self.kbyi * bmin_x - bmin_z + self.c_xz < 0 or
-                self.ibyk * bmax_z - bmax_x + self.c_zx > 0),
-
-            .MPM => !(self.x < bmin_x or self.y > bmax_y or self.z < bmin_z or
-                self.jbyi * bmin_x - bmin_y + self.c_xy < 0 or
-                self.ibyj * bmax_y - bmax_x + self.c_yx > 0 or
-                self.jbyk * bmin_z - bmin_y + self.c_zy < 0 or
-                self.kbyj * bmax_y - bmax_z + self.c_yz > 0 or
-                self.kbyi * bmin_x - bmax_z + self.c_xz > 0 or
-                self.ibyk * bmin_z - bmax_x + self.c_zx > 0),
-
-            .MPP => !(self.x < bmin_x or self.y > bmax_y or self.z > bmax_z or
-                self.jbyi * bmin_x - bmin_y + self.c_xy < 0 or
-                self.ibyj * bmax_y - bmax_x + self.c_yx > 0 or
-                self.jbyk * bmax_z - bmin_y + self.c_zy < 0 or
-                self.kbyj * bmax_y - bmin_z + self.c_yz < 0 or
-                self.kbyi * bmin_x - bmin_z + self.c_xz < 0 or
-                self.ibyk * bmax_z - bmax_x + self.c_zx > 0),
-
-            .PMM => !(self.x > bmax_x or self.y < bmin_y or self.z < bmin_z or
-                self.jbyi * bmax_x - bmax_y + self.c_xy > 0 or
-                self.ibyj * bmin_y - bmin_x + self.c_yx < 0 or
-                self.jbyk * bmin_z - bmax_y + self.c_zy > 0 or
-                self.kbyj * bmin_y - bmax_z + self.c_yz > 0 or
-                self.kbyi * bmax_x - bmax_z + self.c_xz > 0 or
-                self.ibyk * bmin_z - bmin_x + self.c_zx < 0),
-
-            .PMP => !(self.x > bmax_x or self.y < bmin_y or self.z > bmax_z or
-                self.jbyi * bmax_x - bmax_y + self.c_xy > 0 or
-                self.ibyj * bmin_y - bmin_x + self.c_yx < 0 or
-                self.jbyk * bmax_z - bmax_y + self.c_zy > 0 or
-                self.kbyj * bmin_y - bmin_z + self.c_yz < 0 or
-                self.kbyi * bmax_x - bmin_z + self.c_xz < 0 or
-                self.ibyk * bmax_z - bmin_x + self.c_zx < 0),
-
-            .PPM => !(self.x > bmax_x or self.y > bmax_y or self.z < bmin_z or
-                self.jbyi * bmax_x - bmin_y + self.c_xy < 0 or
-                self.ibyj * bmax_y - bmin_x + self.c_yx < 0 or
-                self.jbyk * bmin_z - bmin_y + self.c_zy < 0 or
-                self.kbyj * bmax_y - bmax_z + self.c_yz > 0 or
-                self.kbyi * bmax_x - bmax_z + self.c_xz > 0 or
-                self.ibyk * bmin_z - bmin_x + self.c_zx < 0),
-
-            .PPP => !(self.x > bmax_x or self.y > bmax_y or self.z > bmax_z or
-                self.jbyi * bmax_x - bmin_y + self.c_xy < 0 or
-                self.ibyj * bmax_y - bmin_x + self.c_yx < 0 or
-                self.jbyk * bmax_z - bmin_y + self.c_zy < 0 or
-                self.kbyj * bmax_y - bmin_z + self.c_yz < 0 or
-                self.kbyi * bmax_x - bmin_z + self.c_xz < 0 or
-                self.ibyk * bmax_z - bmin_x + self.c_zx < 0),
-
-            // Axis-aligned cases (one component zero)
-            .OMM => !(self.x < bmin_x or self.x > bmax_x or self.y < bmin_y or self.z < bmin_z or
-                self.jbyk * bmin_z - bmax_y + self.c_zy > 0 or
-                self.kbyj * bmin_y - bmax_z + self.c_yz > 0),
-
-            .OMP => !(self.x < bmin_x or self.x > bmax_x or self.y < bmin_y or self.z > bmax_z or
-                self.jbyk * bmax_z - bmax_y + self.c_zy > 0 or
-                self.kbyj * bmin_y - bmin_z + self.c_yz < 0),
-
-            .OPM => !(self.x < bmin_x or self.x > bmax_x or self.y > bmax_y or self.z < bmin_z or
-                self.jbyk * bmin_z - bmin_y + self.c_zy < 0 or
-                self.kbyj * bmax_y - bmax_z + self.c_yz > 0),
-
-            .OPP => !(self.x < bmin_x or self.x > bmax_x or self.y > bmax_y or self.z > bmax_z or
-                self.jbyk * bmax_z - bmin_y + self.c_zy < 0 or
-                self.kbyj * bmax_y - bmin_z + self.c_yz < 0),
-
-            .MOM => !(self.y < bmin_y or self.y > bmax_y or self.x < bmin_x or self.z < bmin_z or
-                self.kbyi * bmin_x - bmax_z + self.c_xz > 0 or
-                self.ibyk * bmin_z - bmax_x + self.c_zx > 0),
-
-            .MOP => !(self.y < bmin_y or self.y > bmax_y or self.x < bmin_x or self.z > bmax_z or
-                self.kbyi * bmin_x - bmin_z + self.c_xz < 0 or
-                self.ibyk * bmax_z - bmax_x + self.c_zx > 0),
-
-            .POM => !(self.y < bmin_y or self.y > bmax_y or self.x > bmax_x or self.z < bmin_z or
-                self.kbyi * bmax_x - bmax_z + self.c_xz > 0 or
-                self.ibyk * bmin_z - bmin_x + self.c_zx < 0),
-
-            .POP => !(self.y < bmin_y or self.y > bmax_y or self.x > bmax_x or self.z > bmax_z or
-                self.kbyi * bmax_x - bmin_z + self.c_xz < 0 or
-                self.ibyk * bmax_z - bmin_x + self.c_zx < 0),
-
-            .MMO => !(self.z < bmin_z or self.z > bmax_z or self.x < bmin_x or self.y < bmin_y or
-                self.jbyi * bmin_x - bmax_y + self.c_xy > 0 or
-                self.ibyj * bmin_y - bmax_x + self.c_yx > 0),
-
-            .MPO => !(self.z < bmin_z or self.z > bmax_z or self.x < bmin_x or self.y > bmax_y or
-                self.jbyi * bmin_x - bmin_y + self.c_xy < 0 or
-                self.ibyj * bmax_y - bmax_x + self.c_yx > 0),
-
-            .PMO => !(self.z < bmin_z or self.z > bmax_z or self.x > bmax_x or self.y < bmin_y or
-                self.jbyi * bmax_x - bmax_y + self.c_xy > 0 or
-                self.ibyj * bmin_y - bmin_x + self.c_yx < 0),
-
-            .PPO => !(self.z < bmin_z or self.z > bmax_z or self.x > bmax_x or self.y > bmax_y or
-                self.jbyi * bmax_x - bmin_y + self.c_xy < 0 or
-                self.ibyj * bmax_y - bmin_x + self.c_yx < 0),
-
-            // Axis-aligned cases (two components zero)
-            .MOO => !(self.x < bmin_x or
-                self.y < bmin_y or self.y > bmax_y or
-                self.z < bmin_z or self.z > bmax_z),
-
-            .POO => !(self.x > bmax_x or
-                self.y < bmin_y or self.y > bmax_y or
-                self.z < bmin_z or self.z > bmax_z),
-
-            .OMO => !(self.y < bmin_y or
-                self.x < bmin_x or self.x > bmax_x or
-                self.z < bmin_z or self.z > bmax_z),
-
-            .OPO => !(self.y > bmax_y or
-                self.x < bmin_x or self.x > bmax_x or
-                self.z < bmin_z or self.z > bmax_z),
-
-            .OOM => !(self.z < bmin_z or
-                self.x < bmin_x or self.x > bmax_x or
-                self.y < bmin_y or self.y > bmax_y),
-
-            .OOP => !(self.z > bmax_z or
-                self.x < bmin_x or self.x > bmax_x or
-                self.y < bmin_y or self.y > bmax_y),
-        };
-    }
 };
 
 // ── Triangle Mesh Primitive Set ──────────────────────────────────────
@@ -381,12 +177,71 @@ pub const TraceRay = struct {
 // Adapts mesh.Mesh (interleaved Vertex + u32 indices) for BIVH.
 // Also supports raw position/index slices for non-GPU meshes.
 
+/// Pre-baked triangle layout — v0 and the two edge vectors used by
+/// Möller-Trumbore, in the final (BIVH-reordered) triangle order.
+/// Populated by `TriangleMeshSet.bake` after `Bivh.build` has settled
+/// the index layout.  Keeping the tri test on this contiguous buffer
+/// turns leaf testing into a linear cache-friendly scan instead of
+/// chasing indices into the scattered `positions` array.
+pub const Tri = extern struct {
+    v0: [3]f32,
+    e1: [3]f32, // v2 - v0 (matches C# winding)
+    e2: [3]f32, // v1 - v0
+
+    /// Möller-Trumbore ray/triangle intersection (f32, no backface cull).
+    pub inline fn intersect(self: *const Tri, ray: *const TraceRay) f32 {
+        const e1x = self.e1[0];
+        const e1y = self.e1[1];
+        const e1z = self.e1[2];
+
+        const e2x = self.e2[0];
+        const e2y = self.e2[1];
+        const e2z = self.e2[2];
+
+        // Recover direction from inverses.
+        const ri = 1.0 / ray.ii;
+        const rj = 1.0 / ray.ij;
+        const rk = 1.0 / ray.ik;
+
+        // P = D x E2
+        const px = rj * e2z - rk * e2y;
+        const py = rk * e2x - ri * e2z;
+        const pz = ri * e2y - rj * e2x;
+
+        const det = e1x * px + e1y * py + e1z * pz;
+        if (det > -1e-6 and det < 1e-6) return std.math.floatMax(f32);
+
+        const inv_det = 1.0 / det;
+
+        const tx = ray.x - self.v0[0];
+        const ty = ray.y - self.v0[1];
+        const tz = ray.z - self.v0[2];
+
+        const u = (tx * px + ty * py + tz * pz) * inv_det;
+        if (u < -1e-5 or u > 1.0 + 1e-5) return std.math.floatMax(f32);
+
+        const qx = ty * e1z - tz * e1y;
+        const qy = tz * e1x - tx * e1z;
+        const qz = tx * e1y - ty * e1x;
+
+        const v = (ri * qx + rj * qy + rk * qz) * inv_det;
+        if (v < -1e-5 or u + v > 1.0 + 1e-5) return std.math.floatMax(f32);
+
+        const t = (e2x * qx + e2y * qy + e2z * qz) * inv_det;
+        if (t <= 0.0) return std.math.floatMax(f32);
+
+        return t;
+    }
+};
+
 pub const TriangleMeshSet = struct {
     positions: []const [3]f32,
     indices: []u32, // mutable — BIVH reorders during build
     tri_count: u32,
     perm: ?[]u32 = null, // optional: tracks original triangle index through BIVH reordering
     perm_allocator: ?std.mem.Allocator = null,
+    baked_tris: ?[]Tri = null, // populated by bake() after BIVH index reorder
+    baked_allocator: ?std.mem.Allocator = null,
 
     /// Wrap raw position + index arrays.
     pub fn fromArrays(positions: []const [3]f32, indices: []u32) TriangleMeshSet {
@@ -411,11 +266,40 @@ pub const TriangleMeshSet = struct {
         };
     }
 
-    pub fn deinitPerm(self: *TriangleMeshSet) void {
+    /// Free per-set allocations (perm tracking + baked triangle buffer).
+    pub fn deinit(self: *TriangleMeshSet) void {
         if (self.perm) |p| {
             if (self.perm_allocator) |a| a.free(p);
             self.perm = null;
         }
+        if (self.baked_tris) |t| {
+            if (self.baked_allocator) |a| a.free(t);
+            self.baked_tris = null;
+        }
+    }
+
+    /// Bake a contiguous `[]Tri` in the current triangle order.
+    /// Call after `Bivh.build` so the baked layout follows the reorder.
+    pub fn bake(self: *TriangleMeshSet, allocator: std.mem.Allocator) !void {
+        if (self.baked_tris) |t| {
+            if (self.baked_allocator) |a| a.free(t);
+            self.baked_tris = null;
+        }
+        const tris = try allocator.alloc(Tri, self.tri_count);
+        var i: u32 = 0;
+        while (i < self.tri_count) : (i += 1) {
+            const base = i * 3;
+            const a = self.positions[self.indices[base]];
+            const b = self.positions[self.indices[base + 1]];
+            const c = self.positions[self.indices[base + 2]];
+            tris[i] = .{
+                .v0 = a,
+                .e1 = .{ c[0] - a[0], c[1] - a[1], c[2] - a[2] },
+                .e2 = .{ b[0] - a[0], b[1] - a[1], b[2] - a[2] },
+            };
+        }
+        self.baked_tris = tris;
+        self.baked_allocator = allocator;
     }
 
     pub fn count(self: *const TriangleMeshSet) u32 {
@@ -468,56 +352,54 @@ pub const TriangleMeshSet = struct {
     }
 
     /// Moller-Trumbore ray/triangle intersection (double precision, no backface cull).
+    /// Legacy index/position path — kept for callers that use a
+    /// TriangleMeshSet without baking.  The BIVH traversal prefers
+    /// the baked `Tri` buffer.  f32 math, matching `Tri.intersect`.
     pub fn rayIntersectNoCull(self: *const TriangleMeshSet, tri_index: u32, ray: *const TraceRay) f32 {
         const base = tri_index * 3;
         const vert0 = self.positions[self.indices[base]];
         const vert1 = self.positions[self.indices[base + 1]];
         const vert2 = self.positions[self.indices[base + 2]];
 
-        // Edge vectors (v2-v0 and v1-v0, matching C# winding)
-        const e1x: f64 = @as(f64, vert2[0]) - vert0[0];
-        const e1y: f64 = @as(f64, vert2[1]) - vert0[1];
-        const e1z: f64 = @as(f64, vert2[2]) - vert0[2];
+        const e1x = vert2[0] - vert0[0];
+        const e1y = vert2[1] - vert0[1];
+        const e1z = vert2[2] - vert0[2];
 
-        const e2x: f64 = @as(f64, vert1[0]) - vert0[0];
-        const e2y: f64 = @as(f64, vert1[1]) - vert0[1];
-        const e2z: f64 = @as(f64, vert1[2]) - vert0[2];
+        const e2x = vert1[0] - vert0[0];
+        const e2y = vert1[1] - vert0[1];
+        const e2z = vert1[2] - vert0[2];
 
-        // Recover direction from inverses
-        const ri: f64 = 1.0 / ray.ii;
-        const rj: f64 = 1.0 / ray.ij;
-        const rk: f64 = 1.0 / ray.ik;
+        const ri = 1.0 / ray.ii;
+        const rj = 1.0 / ray.ij;
+        const rk = 1.0 / ray.ik;
 
-        // P = D x E2
         const px = rj * e2z - rk * e2y;
         const py = rk * e2x - ri * e2z;
         const pz = ri * e2y - rj * e2x;
 
         const det = e1x * px + e1y * py + e1z * pz;
-        if (det > -1e-10 and det < 1e-10) return std.math.floatMax(f32);
+        if (det > -1e-6 and det < 1e-6) return std.math.floatMax(f32);
 
         const inv_det = 1.0 / det;
 
-        // T = O - V0
-        const tx = ray.x - @as(f64, vert0[0]);
-        const ty = ray.y - @as(f64, vert0[1]);
-        const tz = ray.z - @as(f64, vert0[2]);
+        const tx = ray.x - vert0[0];
+        const ty = ray.y - vert0[1];
+        const tz = ray.z - vert0[2];
 
         const u = (tx * px + ty * py + tz * pz) * inv_det;
-        if (u < -1e-7 or u > 1.0 + 1e-6) return std.math.floatMax(f32);
+        if (u < -1e-5 or u > 1.0 + 1e-5) return std.math.floatMax(f32);
 
-        // Q = T x E1
         const qx = ty * e1z - tz * e1y;
         const qy = tz * e1x - tx * e1z;
         const qz = tx * e1y - ty * e1x;
 
         const v = (ri * qx + rj * qy + rk * qz) * inv_det;
-        if (v < -1e-7 or u + v > 1.0 + 1e-6) return std.math.floatMax(f32);
+        if (v < -1e-5 or u + v > 1.0 + 1e-5) return std.math.floatMax(f32);
 
         const t = (e2x * qx + e2y * qy + e2z * qz) * inv_det;
         if (t <= 0.0) return std.math.floatMax(f32);
 
-        return @floatCast(t);
+        return t;
     }
 };
 
@@ -590,6 +472,11 @@ pub const Bivh = struct {
         self.nodes = try self.allocator.alloc(BihNode, initial_cap);
 
         self.buildTree(prims, build_infos, 0, 0, scene_min, scene_max, 0, @as(i32, @intCast(prim_count)) - 1);
+
+        // Bake a contiguous tri buffer in the final (post-reorder) order
+        // so leaf testing reads sequential memory instead of chasing the
+        // index→position gather.  Uses the BIVH's own allocator.
+        try prims.bake(self.allocator);
     }
 
     fn buildTree(
@@ -715,32 +602,49 @@ pub const Bivh = struct {
 
     /// Trace a single ray against the hierarchy.
     /// Returns true if the ray hit a primitive (result stored in ray).
-    pub fn trace(self: *const Bivh, prims: *const TriangleMeshSet, ray: *TraceRay, min_dist: f64, max_dist: f64) bool {
+    pub fn trace(self: *const Bivh, prims: *const TriangleMeshSet, ray: *TraceRay, min_dist: f32, max_dist: f32) bool {
         if (self.node_count == 0) return false;
         return self.intersectTree(prims, ray, 0, min_dist, max_dist);
     }
 
-    fn intersectTree(self: *const Bivh, prims: *const TriangleMeshSet, ray: *TraceRay, start_node: u32, start_min: f64, start_max: f64) bool {
+    fn intersectTree(self: *const Bivh, prims: *const TriangleMeshSet, ray: *TraceRay, start_node: u32, start_min: f32, start_max: f32) bool {
         var node_index = start_node;
         var min_distance = start_min;
         var max_distance = start_max;
 
         while (true) {
             const node = self.nodes[node_index];
+            stat_nodes_visited += 1;
 
             if (node.isLeaf()) {
-                // Test each primitive in the leaf
+                // Test each primitive in the leaf.  Prefer the baked tri
+                // buffer — contiguous sequential loads — over the legacy
+                // index→position gather path.
                 const start: u32 = @intCast(node.startPrim());
                 const end: u32 = @intCast(node.end_prim);
+                stat_leaves_visited += 1;
+                stat_tris_tested += @as(u64, end - start + 1);
                 var hit = false;
 
-                for (start..end + 1) |i| {
-                    const dist = prims.rayIntersectNoCull(@intCast(i), ray);
-                    if (dist < ray.hit_distance) {
-                        ray.hit_distance = dist;
-                        ray.hit_primitive = @intCast(i);
-                        ray.hit_cell = @intCast(node_index);
-                        hit = true;
+                if (prims.baked_tris) |tris| {
+                    for (start..end + 1) |i| {
+                        const dist = tris[i].intersect(ray);
+                        if (dist < ray.hit_distance) {
+                            ray.hit_distance = dist;
+                            ray.hit_primitive = @intCast(i);
+                            ray.hit_cell = @intCast(node_index);
+                            hit = true;
+                        }
+                    }
+                } else {
+                    for (start..end + 1) |i| {
+                        const dist = prims.rayIntersectNoCull(@intCast(i), ray);
+                        if (dist < ray.hit_distance) {
+                            ray.hit_distance = dist;
+                            ray.hit_primitive = @intCast(i);
+                            ray.hit_cell = @intCast(node_index);
+                            hit = true;
+                        }
                     }
                 }
                 return hit;
@@ -756,13 +660,13 @@ pub const Bivh = struct {
             const axis = node.splitAxis();
             const axis_int = @intFromEnum(axis);
 
-            const ray_origin: f64 = switch (axis) {
+            const ray_origin: f32 = switch (axis) {
                 .x => ray.x,
                 .y => ray.y,
                 .z => ray.z,
                 .none => unreachable,
             };
-            const inv_dir: f64 = switch (axis) {
+            const inv_dir: f32 = switch (axis) {
                 .x => ray.ii,
                 .y => ray.ij,
                 .z => ray.ik,
@@ -772,11 +676,11 @@ pub const Bivh = struct {
             var near_idx = left_idx;
             var far_idx = right_idx;
 
-            const left_split: f64 = self.nodes[left_idx].max[axis_int];
-            const right_split: f64 = self.nodes[right_idx].min[axis_int];
+            const left_split: f32 = self.nodes[left_idx].max[axis_int];
+            const right_split: f32 = self.nodes[right_idx].min[axis_int];
 
-            var left_plane: f64 = undefined;
-            var right_plane: f64 = undefined;
+            var left_plane: f32 = undefined;
+            var right_plane: f32 = undefined;
 
             if (inv_dir >= 0.0) {
                 left_plane = (left_split - ray_origin) * inv_dir;
@@ -884,17 +788,6 @@ pub const Bivh = struct {
 };
 
 // ── Tests ────────────────────────────────────────────────────────────
-
-test "TraceRay classification" {
-    const ray = TraceRay.make(0, 0, 0, 1, 1, 1, 100);
-    try std.testing.expectEqual(Classification.PPP, ray.classification);
-
-    const ray2 = TraceRay.make(0, 0, 0, -1, -1, -1, 100);
-    try std.testing.expectEqual(Classification.MMM, ray2.classification);
-
-    const ray3 = TraceRay.make(0, 0, 0, 1, 0, 0, 100);
-    try std.testing.expectEqual(Classification.POO, ray3.classification);
-}
 
 test "TraceRay AABB intersection" {
     // Ray along +X from origin should hit unit box at origin

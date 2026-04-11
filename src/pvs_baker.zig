@@ -290,7 +290,7 @@ pub fn main() !void {
     const t_bivh0 = std.time.nanoTimestamp();
 
     var mesh_set = try bivh_mod.TriangleMeshSet.fromArraysWithPerm(all_positions.items, all_indices.items, allocator);
-    defer mesh_set.deinitPerm();
+    defer mesh_set.deinit();
     var world_bivh = bivh_mod.Bivh.init(allocator);
     defer world_bivh.deinit();
     try world_bivh.build(&mesh_set);
@@ -316,6 +316,11 @@ pub fn main() !void {
 
         try stdout.print("\n  ═══ BIVH Benchmark ═══\n", .{});
         try stdout.print("  Ray count:  {d} (single-threaded, fixed seed)\n", .{num_rays});
+        try stdout.print("  Struct sizes: TraceRay={d}B (align {d}), Tri={d}B (align {d}), BihNode={d}B (align {d})\n", .{
+            @sizeOf(bivh_mod.TraceRay), @alignOf(bivh_mod.TraceRay),
+            @sizeOf(bivh_mod.Tri),      @alignOf(bivh_mod.Tri),
+            @sizeOf(bivh_mod.BihNode),  @alignOf(bivh_mod.BihNode),
+        });
 
         // Leaf distribution — a fat-leaf tree quintuples Möller-Trumbore work per leaf.
         {
@@ -403,6 +408,7 @@ pub fn main() !void {
         // ── Pass A: direct bivh.trace ───────────────────────────────
         var hits_a: u64 = 0;
         var sum_a: f64 = 0;
+        bivh_mod.resetStats();
         const tA0 = std.time.nanoTimestamp();
         for (rays) |r| {
             var tray = bivh_mod.TraceRay.make(r.origin[0], r.origin[1], r.origin[2], r.dir[0], r.dir[1], r.dir[2], r.max_dist);
@@ -412,6 +418,9 @@ pub fn main() !void {
             }
         }
         const tA1 = std.time.nanoTimestamp();
+        const a_nodes = bivh_mod.stat_nodes_visited;
+        const a_leaves = bivh_mod.stat_leaves_visited;
+        const a_tris = bivh_mod.stat_tris_tested;
 
         // ── Pass B: via TraceFn indirection (production hot path) ──
         // Force a real function-pointer call by routing through a
@@ -444,6 +453,11 @@ pub fn main() !void {
         try stdout.print("    hit rate: {d:.1}%   avg hit dist: {d:.2}\n", .{
             @as(f64, @floatFromInt(hits_a)) * 100.0 / nr_f,
             if (hits_a > 0) sum_a / @as(f64, @floatFromInt(hits_a)) else 0,
+        });
+        try stdout.print("    per ray: {d:.1} nodes, {d:.1} leaves, {d:.1} tri tests\n", .{
+            @as(f64, @floatFromInt(a_nodes)) / nr_f,
+            @as(f64, @floatFromInt(a_leaves)) / nr_f,
+            @as(f64, @floatFromInt(a_tris)) / nr_f,
         });
 
         try stdout.print("\n  Pass B — via TraceFn indirection:\n", .{});
@@ -537,7 +551,7 @@ pub fn main() !void {
     }
 
     var cluster_mesh = try bivh_mod.TriangleMeshSet.fromArraysWithPerm(cluster_positions, cluster_indices_buf, allocator);
-    defer cluster_mesh.deinitPerm();
+    defer cluster_mesh.deinit();
     var cluster_bivh = bivh_mod.Bivh.init(allocator);
     defer cluster_bivh.deinit();
     try cluster_bivh.build(&cluster_mesh);
