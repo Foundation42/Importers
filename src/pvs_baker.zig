@@ -681,7 +681,7 @@ pub fn main() !void {
     try stdout.print("\n  ╔═══════════════════════════════════╗\n", .{});
     try stdout.print("  ║  BFS Walker Solve                 ║\n", .{});
     try stdout.print("  ╚═══════════════════════════════════╝\n", .{});
-    try stdout.print("  Threads: {d}, Rays/pair: 8\n", .{thread_count});
+    try stdout.print("  Threads: {d}\n", .{thread_count});
 
     var walker = try pvs_mod.WalkerSolver.init(
         allocator,
@@ -697,7 +697,6 @@ pub fn main() !void {
             .thread_count = thread_count,
             .max_ray_distance = 2000.0,
             .max_depth = 50,
-            .rays_per_pair = 8,
             .neighbor_gap = 2.0,
             .cluster_shift = cluster_shift,
             .progress_fn = &walkerProgress,
@@ -715,6 +714,15 @@ pub fn main() !void {
     try stdout.print("  Connections:  {d} per cell avg, min={d}, max={d}\n", .{ ws.avg_visible, ws.min_visible, ws.max_visible });
     try stdout.print("  Transport:    {d} rays cast, {d} edges connected\n", .{ ws.transport_casts, ws.transport_edges });
     try stdout.print("  Solve time:   {d}ms\n", .{@divTrunc(t_solve1 - t_solve0, 1_000_000)});
+
+    // WALKER_ONLY=1 short-circuits the rest of the pipeline (probe
+    // placement, datagen, MLP training) so we can iterate on walker
+    // changes in ~solver seconds instead of full-pipeline minutes.
+    if (std.process.getEnvVarOwned(allocator, "WALKER_ONLY") catch null) |walker_only| {
+        defer allocator.free(walker_only);
+        try stdout.print("\n  WALKER_ONLY set — exiting after walker solve.\n", .{});
+        return;
+    }
 
     // Visualization
     {

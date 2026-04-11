@@ -977,9 +977,6 @@ pub const WalkerConfig = struct {
     max_ray_distance: f32 = 2000.0,
     /// Maximum BFS depth (graph hops from source cell).
     max_depth: u32 = 50,
-    /// Number of rays to shoot per candidate cell pair.
-    /// One hit = confirmed connected, stop early.
-    rays_per_pair: u32 = 8,
     /// Maximum gap between cell AABBs to be considered spatial neighbors.
     neighbor_gap: f32 = 2.0,
     /// Cluster size as power-of-2 shift (for visibility bitmap granularity).
@@ -1093,7 +1090,11 @@ pub const WalkerSolver = struct {
     }
 
     fn workerThread(self: *WalkerSolver, thread_id: u32, num_threads: u32) void {
-        // Each thread walks a strided subset of cells
+        // Strided partition — each thread walks cells {tid, tid+N, ...}.
+        // Threads intermix through the scene by construction, which
+        // maximises cross-thread backward-prune coverage: by the time
+        // one thread needs edge (a,b), a neighbouring thread has often
+        // already confirmed it, skipping the ray test entirely.
         var seed: u64 = @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())));
         seed ^= @as(u64, thread_id) * 0x9E3779B97F4A7C15;
         var prng = std.Random.DefaultPrng.init(seed);
@@ -1177,7 +1178,9 @@ pub const WalkerSolver = struct {
         if (range_a.start_tri >= range_a.end_tri) return false;
         if (range_b.start_tri >= range_b.end_tri) return false;
 
-        for (0..self.config.rays_per_pair) |_| {
+        // Random K=16 — control test for the stratified 4×4 comparison.
+        const rays_per_pair: u32 = 16;
+        for (0..rays_per_pair) |_| {
             const tri_a = rng.intRangeLessThan(u32, range_a.start_tri, range_a.end_tri);
             const tri_b = rng.intRangeLessThan(u32, range_b.start_tri, range_b.end_tri);
 
@@ -1190,19 +1193,17 @@ pub const WalkerSolver = struct {
 
             const norm_dir = vec3Scale(dir, 1.0 / dist);
 
-            // Record the cast
             self.transport.recordCast(cell_a, cell_b);
 
             const result = self.trace_fn(self.trace_ctx, p1, norm_dir, dist + 0.01);
 
-            // Check if ray reached cell_b's triangle (or close to it)
             const reached = !result.hit or
                 result.primitive == @as(i32, @intCast(tri_b)) or
                 result.distance >= dist - 0.01;
 
             if (reached) {
                 self.transport.recordHit(cell_a, cell_b);
-                return true; // One hit is enough!
+                return true;
             }
         }
 
