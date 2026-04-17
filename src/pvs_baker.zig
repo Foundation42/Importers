@@ -1709,6 +1709,97 @@ pub fn main() !void {
             try stdout.print("  → {s}\n", .{rt_path});
         }
 
+        // Write _gi.bin — probe-level sparse transport graph + outdoor mask.
+        // Lets matryoshka rebuild probe SH from scratch whenever the sun
+        // moves at runtime: zero → inject sun+sky on outdoor probes + small
+        // ambient on indoor → bounce through this graph N times. Probe-level
+        // CSR (not cell-level) so runtime skips the per-probe pair lookup
+        // the baker does during its own propagation.
+        {
+            const gi_path = try std.fmt.allocPrint(allocator, "{s}_gi.bin", .{base_name});
+            defer allocator.free(gi_path);
+            var gf = try std.fs.cwd().createFile(gi_path, .{});
+            defer gf.close();
+            var gbw = std.io.bufferedWriter(gf.writer());
+            const gw = gbw.writer();
+
+            // Recompute the outdoor classification used during injection
+            // (median-Y heuristic in the light-propagation phase).
+            var gi_median_y: f32 = 0;
+            for (probes) |p| gi_median_y += p.position[1];
+            gi_median_y /= @floatFromInt(probes.len);
+            const outdoor_mask = try allocator.alloc(u8, probes.len);
+            defer allocator.free(outdoor_mask);
+            for (probes, 0..) |p, pi| {
+                outdoor_mask[pi] = if (p.position[1] >= gi_median_y - 1.0) 1 else 0;
+            }
+
+            // Build probe-level CSR. Edge weights are the same hits/casts
+            // probabilities the baker's propagateLight() reads.
+            const row_offsets = try allocator.alloc(u32, probes.len + 1);
+            defer allocator.free(row_offsets);
+            var edge_targets = std.ArrayList(u32).init(allocator);
+            defer edge_targets.deinit();
+            var edge_weights = std.ArrayList(f32).init(allocator);
+            defer edge_weights.deinit();
+
+            row_offsets[0] = 0;
+            for (0..probes.len) |i| {
+                const my_cell = probe_cells[i];
+                if (my_cell < pt.cell_count) {
+                    for (0..probes.len) |j| {
+                        if (i == j) continue;
+                        const other_cell = probe_cells[j];
+                        if (other_cell >= pt.cell_count) continue;
+                        if (my_cell == other_cell) continue;
+                        const edge = pt.getEdge(my_cell, other_cell);
+                        const casts = edge.casts.load(.monotonic);
+                        const hits = edge.hits.load(.monotonic);
+                        if (casts == 0 or hits == 0) continue;
+                        const w = @as(f32, @floatFromInt(hits)) / @as(f32, @floatFromInt(casts));
+                        try edge_targets.append(@intCast(j));
+                        try edge_weights.append(w);
+                    }
+                }
+                row_offsets[i + 1] = @intCast(edge_targets.items.len);
+            }
+
+            // Header
+            try gw.writeAll("GI01");
+            try gw.writeInt(u32, 1, .little); // version
+            try gw.writeInt(u32, @intCast(probes.len), .little);
+            try gw.writeInt(u32, @intCast(edge_targets.items.len), .little);
+            try gw.writeInt(u32, num_bounces, .little);
+            try gw.writeInt(u32, @bitCast(bounce_falloff), .little);
+            // Sun color (warm) — matches injection in phase 4.
+            try gw.writeInt(u32, @bitCast(@as(f32, 1.0)), .little);
+            try gw.writeInt(u32, @bitCast(@as(f32, 0.9)), .little);
+            try gw.writeInt(u32, @bitCast(@as(f32, 0.7)), .little);
+            // Sky ambient (cool blue).
+            try gw.writeInt(u32, @bitCast(@as(f32, 0.15)), .little);
+            try gw.writeInt(u32, @bitCast(@as(f32, 0.2)), .little);
+            try gw.writeInt(u32, @bitCast(@as(f32, 0.35)), .little);
+            // Indoor ambient.
+            try gw.writeInt(u32, @bitCast(@as(f32, 0.05)), .little);
+            try gw.writeInt(u32, @bitCast(@as(f32, 0.05)), .little);
+            try gw.writeInt(u32, @bitCast(@as(f32, 0.08)), .little);
+
+            // Payload
+            try gw.writeAll(outdoor_mask);
+            for (row_offsets) |v| try gw.writeInt(u32, v, .little);
+            for (edge_targets.items, edge_weights.items) |t, w| {
+                try gw.writeInt(u32, t, .little);
+                try gw.writeInt(u32, @bitCast(w), .little);
+            }
+
+            try gbw.flush();
+            try stdout.print("  → {s} ({d} edges, avg {d:.1}/probe)\n", .{
+                gi_path,
+                edge_targets.items.len,
+                @as(f32, @floatFromInt(edge_targets.items.len)) / @as(f32, @floatFromInt(probes.len)),
+            });
+        }
+
         // Write _models.txt (for runtime name matching)
         {
             const mn_txt = try std.fmt.allocPrint(allocator, "{s}_models.txt", .{base_name});
