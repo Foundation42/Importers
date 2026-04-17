@@ -204,6 +204,10 @@ pub fn build(b: *std.Build) void {
     pvs_baker.root_module.addImport("pvs_neural", pvs_neural_module);
     pvs_baker.root_module.addImport("pvs_exemplar", pvs_exemplar_module);
     pvs_baker.root_module.addImport("minball", minball_module);
+    // cgltf (glTF 2.0 parser) — C source compiled in, headers in libs/
+    pvs_baker.addCSourceFile(.{ .file = b.path("libs/cgltf.c"), .flags = &.{"-std=c99"} });
+    pvs_baker.addIncludePath(b.path("libs"));
+    pvs_baker.linkLibC();
     b.installArtifact(pvs_baker);
 
     const pvs_run = b.addRunArtifact(pvs_baker);

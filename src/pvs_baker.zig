@@ -16,6 +16,9 @@ const pvs_mod = @import("pvs");
 const pvs_viz = @import("pvs_viz");
 const pvs_neural = @import("pvs_neural");
 const pvs_exemplar = @import("pvs_exemplar");
+const baker_types = @import("baker_types.zig");
+const gltf_loader = @import("gltf_loader.zig");
+const ModelRange = baker_types.ModelRange;
 
 const Vec3 = [3]f32;
 
@@ -34,9 +37,13 @@ const Config = struct {
 
     /// Sub-mesh AABB diagonal threshold as a fraction of world diagonal.
     /// Submeshes larger than this are excluded from PVS entirely (still
-    /// kept in the BIVH for ray occlusion, always drawn at runtime). Catches
-    /// the world-spanning aggregate models that pollute PVS data.
-    submesh_max_fraction: f32 = 0.25,
+    /// kept in the BIVH for ray occlusion, always drawn at runtime).
+    ///
+    /// Default is effectively disabled (100× world diagonal): spatial splitting
+    /// already bounds submesh extents to the bin size, so the filter never
+    /// triggers in practice. Renumbering by skip-count would otherwise break
+    /// the bin-index↔bit-index contract with Matryoshka's runtime.
+    submesh_max_fraction: f32 = 100.0,
 
     /// Number of training samples to generate (probe-seeded).
     num_samples: u32 = 20_000,
@@ -49,6 +56,32 @@ const Config = struct {
     walker_epochs: u32 = 1,
     walker_scout_rays: u32 = 16, // rays_per_pair on the scout pass
     walker_refine_target: u32 = 64, // target casts per uncertain edge in refine pass
+
+    /// Grid probe drop. Spaces XZ samples on a grid, raycasts straight
+    /// down at each, and drops a probe `eye_height` meters above any
+    /// walkable hit. Catches floor regions where the smart probe placer
+    /// (island centroids + gradient transitions) leaves blind spots.
+    /// 0 = disabled.
+    grid_spacing: f32 = 0.0,
+    /// Height above the hit point at which to drop grid probes.
+    grid_eye_height: f32 = 1.5,
+    /// Minimum surface normal Y for a hit to count as "walkable" (drops
+    /// probes only on roughly-horizontal surfaces). 0.7 = ~45° max slope.
+    grid_min_normal_y: f32 = 0.7,
+    /// Adaptive cell PVS propagation. After the initial 1-hop pass, each
+    /// cell's visibility set is measured (popcount). Cells whose popcount
+    /// is anomalously low relative to the median (the "tunnel" / "courtyard"
+    /// case where the BFS connectivity hangs by a thread) get extra hops of
+    /// propagation until they catch up or hit the cap.
+    ///
+    /// `cell_pvs_target_fraction` = the multiple of the median that each
+    /// cell must reach. 0.5 means "bring weak cells up to half the median
+    /// visibility set size". 1.0 = full equality (most aggressive). 0.0
+    /// disables adaptive expansion entirely (pure 1-hop).
+    cell_pvs_target_fraction: f32 = 0.5,
+    /// Cap on adaptive expansion. A cell will be expanded at most this many
+    /// extra hops past the initial 1-hop pass.
+    cell_pvs_max_hops: u32 = 4,
 };
 
 const USAGE =
@@ -71,6 +104,13 @@ const USAGE =
     \\  --walker-epochs N         Number of walker epochs (default 1, max 2)
     \\  --walker-scout-rays N     Epoch-0 rays per cell pair (default 16)
     \\  --walker-refine-target N  Epoch-1 target casts per uncertain edge (default 64)
+    \\  --cell-target-fraction F  Target visibility per cell as a fraction of
+    \\                            median (default 0.5; 0 = disable adaptive)
+    \\  --cell-max-hops N         Cap on adaptive expansion past 1-hop (default 4)
+    \\  --grid-spacing M          Drop a grid of "support probes" raycast from
+    \\                            above on a MxM XZ grid; 0 = disabled (default)
+    \\  --grid-eye-height M       Probe height above floor (default 1.5m)
+    \\  --grid-min-normal-y F     Walkable filter (default 0.7, ~45° max slope)
     \\  --help                    Show this help
     \\
     \\Positional:
@@ -118,6 +158,26 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
             i += 1;
             if (i >= args.len) return error.MissingValue;
             cfg.walker_refine_target = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, a, "--cell-target-fraction")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            cfg.cell_pvs_target_fraction = try std.fmt.parseFloat(f32, args[i]);
+        } else if (std.mem.eql(u8, a, "--cell-max-hops")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            cfg.cell_pvs_max_hops = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, a, "--grid-spacing")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            cfg.grid_spacing = try std.fmt.parseFloat(f32, args[i]);
+        } else if (std.mem.eql(u8, a, "--grid-eye-height")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            cfg.grid_eye_height = try std.fmt.parseFloat(f32, args[i]);
+        } else if (std.mem.eql(u8, a, "--grid-min-normal-y")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            cfg.grid_min_normal_y = try std.fmt.parseFloat(f32, args[i]);
         } else if (std.mem.startsWith(u8, a, "--")) {
             try std.io.getStdErr().writer().print("Unknown option: {s}\n\n{s}", .{ a, USAGE });
             std.process.exit(1);
@@ -192,6 +252,7 @@ pub fn main() !void {
                 .surprise_threshold = 0.05,
                 .seed_count = 200,
             },
+            &.{}, // FAST_EPVS path: no grid forced seeds (geometry isn't loaded)
             stdout,
         );
         defer epvs.deinit();
@@ -218,12 +279,7 @@ pub fn main() !void {
     var all_indices = std.ArrayList(u32).init(allocator);
     defer all_indices.deinit();
 
-    // Track model triangle ranges for cluster→model mapping
-    const ModelRange = struct {
-        tri_start: u32,
-        tri_end: u32,
-        name: []const u8,
-    };
+    // Model triangle ranges (shared type — see baker_types.zig)
     var model_ranges = std.ArrayList(ModelRange).init(allocator);
     defer {
         for (model_ranges.items) |mr| allocator.free(mr.name);
@@ -239,27 +295,32 @@ pub fn main() !void {
     var model_count: u32 = 0;
     var failed_count: u32 = 0;
 
+    // glTF branch — dispatch on extension. glTF files go through the cgltf-based
+    // loader in gltf_loader.zig, which writes into the same flat arrays so the
+    // rest of the baker pipeline is oblivious to the source format.
+    const is_gltf = std.mem.endsWith(u8, map_vpk_path, ".gltf") or std.mem.endsWith(u8, map_vpk_path, ".glb");
+    if (is_gltf) {
+        try stdout.print("  Input: glTF {s}\n", .{map_vpk_path});
+        gltf_loader.loadGltf(allocator, map_vpk_path, &all_positions, &all_indices, &model_ranges, &submesh_ranges) catch |err| {
+            try stdout.print("  glTF load failed: {}\n", .{err});
+            return err;
+        };
+        model_count = @intCast(model_ranges.items.len);
+    } else {
+        // ── Source 2 VPK branch (original path) ──
+
     // Load map VPK
     var map_pkg = vrf.vpk.Package.init(allocator);
     defer map_pkg.deinit();
     try map_pkg.readFile(map_vpk_path);
     try stdout.print("  Map VPK: {d} entries\n", .{map_pkg.entryCount()});
 
-    // Optionally load content VPK
-    var content_pkg: ?vrf.vpk.Package = null;
-    defer if (content_pkg) |*cp| cp.deinit();
+    // Content VPK is no longer iterated. The previous behavior (scan every
+    // vmdl_c in the content pack) pulled in thousands of unrelated CS2 assets,
+    // diverging from the Matryoshka runtime which loads map-VPK models only.
+    // Accept the arg for CLI compatibility but ignore it.
     if (content_vpk_path) |cp| {
-        var pkg = vrf.vpk.Package.init(allocator);
-        pkg.readFile(cp) catch |err| {
-            try stdout.print("  Warning: content VPK: {}\n", .{err});
-            pkg.deinit();
-        };
-        if (pkg.entryCount() > 0) {
-            try stdout.print("  Content VPK: {d} entries\n", .{pkg.entryCount()});
-            content_pkg = pkg;
-        } else {
-            pkg.deinit();
-        }
+        try stdout.print("  Content VPK: {s} (provided — not used; map VPK is authoritative)\n", .{cp});
     }
 
     // Iterate all vmdl_c entries
@@ -299,45 +360,10 @@ pub fn main() !void {
         model_count += 1;
     }
 
-    // Also check content VPK for models referenced by the world
-    // (aggregate scene objects can reference models from content)
-    if (content_pkg) |*cpkg| {
-        var cit = cpkg.iterateAll();
-        while (cit.next()) |entry| {
-            if (!std.mem.eql(u8, entry.type_name, "vmdl_c")) continue;
-
-            if (isProxyModel(entry.file_name)) {
-                proxy_count += 1;
-                continue;
-            }
-
-            const entry_data = cpkg.readEntry(entry) catch continue;
-            defer allocator.free(entry_data);
-
-            const name = allocator.dupe(u8, entry.file_name) catch continue;
-
-            const tri_start = @as(u32, @intCast(all_indices.items.len / 3));
-            extractModelGeometry(allocator, entry_data, &all_positions, &all_indices, &submesh_ranges, name) catch {
-                allocator.free(name);
-                failed_count += 1;
-                continue;
-            };
-            const tri_end = @as(u32, @intCast(all_indices.items.len / 3));
-
-            model_ranges.append(.{
-                .tri_start = tri_start,
-                .tri_end = tri_end,
-                .name = name,
-            }) catch {
-                allocator.free(name);
-                continue;
-            };
-            model_count += 1;
-        }
-    }
     if (proxy_count > 0) {
         try stderr.print("[Baker] Filtered {d} proxy models (clip brushes, occluders)\n", .{proxy_count});
     }
+    } // end VPK branch
 
     const tri_count = @as(u32, @intCast(all_indices.items.len / 3));
     const t_load = std.time.nanoTimestamp();
@@ -346,12 +372,53 @@ pub fn main() !void {
     try stdout.print("  Models:     {d} ({d} failed)\n", .{ model_count, failed_count });
     try stdout.print("  Vertices:   {d}\n", .{all_positions.items.len});
     try stdout.print("  Triangles:  {d}\n", .{tri_count});
+    try stdout.print("  Submeshes:  {d} (pre-split)\n", .{submesh_ranges.items.len});
     try stdout.print("  Load time:  {d}ms\n", .{@divTrunc(t_load - t0, 1_000_000)});
 
     if (tri_count == 0) {
         try stdout.writeAll("\nNo geometry found. Exiting.\n");
         return;
     }
+
+    // ── Spatial split + Morton sort ───────────────────────────────────
+    // Matches matryoshka's source2_loader.zig: 4m threshold, triangle-centroid
+    // binning, Morton sort. Makes the baker's submesh indices bit-identical to
+    // Matryoshka's LEAF_MESH indices at runtime.
+    const split_threshold: f32 = 4.0;
+    const t_split0 = std.time.nanoTimestamp();
+    var split_ranges = try baker_types.spatialSplitAll(
+        allocator,
+        all_positions.items,
+        all_indices.items,
+        submesh_ranges.items,
+        split_threshold,
+    );
+    defer split_ranges.deinit();
+
+    // Morton sort (same quantizer as matryoshka). Run after split so we sort
+    // over the final bins. The in-place index reorder inside spatialSplitAll
+    // has already made each output range contiguous, so sorting the range list
+    // itself is enough — triangle positions stay where they are.
+    const SortCtx = struct {
+        positions: []const Vec3,
+        indices: []const u32,
+        pub fn lessThan(self: @This(), a: SubmeshRange, b: SubmeshRange) bool {
+            return baker_types.rangeMortonCode(self.positions, self.indices, a) <
+                baker_types.rangeMortonCode(self.positions, self.indices, b);
+        }
+    };
+    std.sort.pdq(SubmeshRange, split_ranges.items, SortCtx{ .positions = all_positions.items, .indices = all_indices.items }, SortCtx.lessThan);
+
+    // Reassign submesh_idx to the post-sort flat index.
+    for (split_ranges.items, 0..) |*sr, i| sr.submesh_idx = @intCast(i);
+
+    // Replace the original submesh_ranges with the split+sorted version.
+    submesh_ranges.clearRetainingCapacity();
+    try submesh_ranges.appendSlice(split_ranges.items);
+
+    const t_split1 = std.time.nanoTimestamp();
+    try stdout.print("  Submeshes:  {d} (post-split, 4m bins)\n", .{submesh_ranges.items.len});
+    try stdout.print("  Split time: {d}ms\n", .{@divTrunc(t_split1 - t_split0, 1_000_000)});
 
     // ── Phase 2: Build world BIVH (ray tracing) ────────────────────
 
@@ -922,6 +989,103 @@ pub fn main() !void {
         defer all_probes.deinit();
         try all_probes.appendSlice(island_probes);
         try all_probes.appendSlice(gradient_probes);
+
+        // ── Grid support probes ─────────────────────────────────────────
+        // For each XZ grid point, cast a downward ray repeatedly through
+        // the geometry, recording EVERY walkable surface encountered (not
+        // just the first one). This handles multi-floor buildings: the
+        // first hit is the rooftop, then we step past it and find the
+        // ceiling of the floor below, then the floor itself, then the
+        // basement, etc. Each walkable surface gets a probe `eye_height`
+        // meters above it.
+        //
+        // No dedup against smart probes — the whole point is geometric
+        // grounding regardless of what the smart placer found.
+        var grid_added: u32 = 0;
+        if (cfg.grid_spacing > 0.0) {
+            const t_grid0 = std.time.nanoTimestamp();
+            const start_y = world_max[1] + 100.0;
+            const total_drop = (world_max[1] - world_min[1]) + 200.0;
+            var grid_columns: u32 = 0;
+            var grid_no_hit_columns: u32 = 0;
+            var grid_walls: u32 = 0;
+            const w_perm = mesh_set.perm orelse &[_]u32{};
+            const max_hits_per_column: u32 = 16;
+
+            var x = world_min[0];
+            while (x <= world_max[0]) : (x += cfg.grid_spacing) {
+                var z = world_min[2];
+                while (z <= world_max[2]) : (z += cfg.grid_spacing) {
+                    grid_columns += 1;
+
+                    var ray_y = start_y;
+                    var distance_remaining = total_drop;
+                    var any_hit_in_column = false;
+                    var hits_in_column: u32 = 0;
+
+                    while (hits_in_column < max_hits_per_column and distance_remaining > 0.1) {
+                        const origin = Vec3{ x, ray_y, z };
+                        const dir = Vec3{ 0, -1, 0 };
+                        const result = traceWorld(@ptrCast(&trace_ctx), origin, dir, distance_remaining);
+
+                        if (!result.hit or result.primitive < 0) break;
+                        any_hit_in_column = true;
+                        hits_in_column += 1;
+
+                        // Look up the hit triangle to get its surface normal.
+                        const sorted_idx: u32 = @intCast(result.primitive);
+                        if (sorted_idx >= w_perm.len) break;
+                        const orig_idx = w_perm[sorted_idx];
+                        const tri_base = @as(usize, orig_idx) * 3;
+                        if (tri_base + 2 >= mesh_set.indices.len) break;
+                        const v0 = mesh_set.positions[mesh_set.indices[tri_base]];
+                        const v1 = mesh_set.positions[mesh_set.indices[tri_base + 1]];
+                        const v2 = mesh_set.positions[mesh_set.indices[tri_base + 2]];
+                        const e1x = v1[0] - v0[0];
+                        const e1y = v1[1] - v0[1];
+                        const e1z = v1[2] - v0[2];
+                        const e2x = v2[0] - v0[0];
+                        const e2y = v2[1] - v0[1];
+                        const e2z = v2[2] - v0[2];
+                        const ny_raw = e1z * e2x - e1x * e2z;
+                        const nx_raw = e1y * e2z - e1z * e2y;
+                        const nz_raw = e1x * e2y - e1y * e2x;
+                        const len_sq = nx_raw * nx_raw + ny_raw * ny_raw + nz_raw * nz_raw;
+                        const hit_y = ray_y - result.distance;
+
+                        if (len_sq >= 1e-12) {
+                            const norm_y = ny_raw / @sqrt(len_sq);
+                            // Walkable: surface roughly horizontal. Use abs
+                            // because triangle winding can flip the normal.
+                            if (@abs(norm_y) >= cfg.grid_min_normal_y) {
+                                try all_probes.append(.{
+                                    .position = .{ x, hit_y + cfg.grid_eye_height, z },
+                                    .island_id = std.math.maxInt(u32),
+                                    .is_boundary = false,
+                                });
+                                grid_added += 1;
+                            } else {
+                                grid_walls += 1;
+                            }
+                        }
+
+                        // Step past this hit and keep walking down the column.
+                        const new_y = hit_y - 0.05; // 5cm below the hit point
+                        distance_remaining -= (ray_y - new_y);
+                        ray_y = new_y;
+                    }
+
+                    if (!any_hit_in_column) grid_no_hit_columns += 1;
+                }
+            }
+
+            const t_grid1 = std.time.nanoTimestamp();
+            try stdout.print("  Grid probes: {d} added ({d} columns, {d} empty, {d} walls) [{d}ms]\n", .{
+                grid_added, grid_columns, grid_no_hit_columns, grid_walls,
+                @divTrunc(t_grid1 - t_grid0, 1_000_000),
+            });
+        }
+
         const probes = all_probes.items;
 
         var boundary_count: u32 = 0;
@@ -929,8 +1093,9 @@ pub fn main() !void {
         for (probes) |p| {
             if (p.is_boundary) boundary_count += 1 else interior_count += 1;
         }
-        try stdout.print("  Island probes:    {d} (interior)\n", .{interior_count});
+        try stdout.print("  Island probes:    {d} (interior)\n", .{interior_count - grid_added});
         try stdout.print("  Gradient probes:  {d} (transitions)\n", .{boundary_count});
+        if (grid_added > 0) try stdout.print("  Grid probes:      {d} (raycast)\n", .{grid_added});
         try stdout.print("  Total probes:     {d}\n", .{probes.len});
 
         // Visualize islands + probes
@@ -1325,12 +1490,23 @@ pub fn main() !void {
             }
 
             // Propagate through transport graph: each cell's visible set is
-            // the union of its own + all cells reachable via a transport edge.
+            // the union of its own + all cells reachable via a transport edge,
+            // iterated `cell_pvs_hops` times. After N iterations each cell's
+            // bitset includes everything reachable in ≤ N hops.
+            //
+            // Single-hop (N=1) is the strict "I have a direct ray-cast edge
+            // to that cell" set. It under-includes when the BFS Walker missed
+            // a direct edge that should exist (long-corridor failure even
+            // after refinement). N=2 catches "my neighbor's neighbor" which
+            // recovers most undersampled topology — a small over-conservatism
+            // bonus on top.
             const cell_vis_bs = try allocator.alloc([]u8, final_num_cells);
             defer {
                 for (cell_vis_bs) |bs| allocator.free(bs);
                 allocator.free(cell_vis_bs);
             }
+
+            // Initialize cur to single-hop result
             for (0..final_num_cells) |ci| {
                 const bs = try allocator.alloc(u8, sub_stride);
                 @memcpy(bs, cell_own_bs[ci]);
@@ -1344,6 +1520,100 @@ pub fn main() !void {
                     }
                 }
                 cell_vis_bs[ci] = bs;
+            }
+
+            // ── Adaptive multi-hop expansion ──
+            // After 1-hop, measure each cell's visibility set size (popcount).
+            // Compute the median. Cells whose popcount falls below
+            // `target_fraction × median` are "weak" — they're in tunnels,
+            // courtyards, or other low-connectivity pockets where the BFS
+            // graph is hanging by a thread and 1-hop misses too much. We
+            // expand only those cells, one hop at a time, until they reach
+            // the target or hit the max-hops cap.
+            //
+            // This is content-aware: well-connected open cells stay at 1
+            // hop (no over-conservatism), while bottleneck cells get the
+            // graph-traversal help they need.
+            if (cfg.cell_pvs_target_fraction > 0.0 and cfg.cell_pvs_max_hops > 0) {
+                const popcounts = try allocator.alloc(u32, final_num_cells);
+                defer allocator.free(popcounts);
+                for (0..final_num_cells) |ci| {
+                    var c: u32 = 0;
+                    for (cell_vis_bs[ci]) |b| c += @popCount(b);
+                    popcounts[ci] = c;
+                }
+
+                // Median via partial sort (full sort is fine — N is small)
+                const sorted = try allocator.alloc(u32, final_num_cells);
+                defer allocator.free(sorted);
+                @memcpy(sorted, popcounts);
+                std.mem.sort(u32, sorted, {}, std.sort.asc(u32));
+                const median_pop: u32 = sorted[final_num_cells / 2];
+                const target_pop: u32 = @intFromFloat(@as(f32, @floatFromInt(median_pop)) * cfg.cell_pvs_target_fraction);
+
+                // Mark cells needing expansion
+                const needs_expand = try allocator.alloc(bool, final_num_cells);
+                defer allocator.free(needs_expand);
+                var weak_count: u32 = 0;
+                for (0..final_num_cells) |ci| {
+                    needs_expand[ci] = popcounts[ci] < target_pop;
+                    if (needs_expand[ci]) weak_count += 1;
+                }
+
+                try stdout.print("  Adaptive: median popcount={d}, target={d}, weak cells={d}/{d}\n", .{
+                    median_pop, target_pop, weak_count, final_num_cells,
+                });
+
+                if (weak_count > 0) {
+                    // Double-buffered iteration. Only weak cells get updated;
+                    // other cells' bitsets are read-only sources.
+                    const next_buf = try allocator.alloc([]u8, final_num_cells);
+                    defer {
+                        for (next_buf) |bs| allocator.free(bs);
+                        allocator.free(next_buf);
+                    }
+                    for (0..final_num_cells) |ci| {
+                        next_buf[ci] = try allocator.alloc(u8, sub_stride);
+                        @memcpy(next_buf[ci], cell_vis_bs[ci]);
+                    }
+
+                    var hop: u32 = 0;
+                    var still_weak: u32 = weak_count;
+                    while (hop < cfg.cell_pvs_max_hops and still_weak > 0) : (hop += 1) {
+                        // Expand each weak cell from cell_vis_bs (current state)
+                        for (0..final_num_cells) |ci| {
+                            if (!needs_expand[ci]) continue;
+                            @memcpy(next_buf[ci], cell_vis_bs[ci]);
+                            for (0..final_num_cells) |cj| {
+                                if (ci == cj) continue;
+                                const edge = pt.getEdge(@intCast(ci), @intCast(cj));
+                                if (edge.hits.load(.monotonic) > 0) {
+                                    for (0..sub_stride) |bi| {
+                                        next_buf[ci][bi] |= cell_vis_bs[cj][bi];
+                                    }
+                                }
+                            }
+                        }
+                        // Swap: copy next_buf back into cell_vis_bs and
+                        // recompute popcounts for the cells we touched.
+                        // Cells that have reached the target stop expanding.
+                        var new_still_weak: u32 = 0;
+                        for (0..final_num_cells) |ci| {
+                            if (!needs_expand[ci]) continue;
+                            @memcpy(cell_vis_bs[ci], next_buf[ci]);
+                            var c: u32 = 0;
+                            for (cell_vis_bs[ci]) |b| c += @popCount(b);
+                            popcounts[ci] = c;
+                            if (c >= target_pop) {
+                                needs_expand[ci] = false;
+                            } else {
+                                new_still_weak += 1;
+                            }
+                        }
+                        try stdout.print("    Hop {d}: still weak {d}\n", .{ hop + 2, new_still_weak });
+                        still_weak = new_still_weak;
+                    }
+                }
             }
 
             // Stats
@@ -1527,6 +1797,52 @@ pub fn main() !void {
                 try stdout.print("  → {s} (training cache)\n", .{train_path});
             }
 
+            // ── Grid-probe forced exemplars ──
+            // Sample at every grid probe position (the ones tagged with
+            // island_id = max_u32 during the grid drop). Each grid position
+            // gets a dedicated omni sphere of rays → one bitset → one
+            // forced exemplar that bypasses the surprise selector.
+            var grid_positions = std.ArrayList(Vec3).init(allocator);
+            defer grid_positions.deinit();
+            for (probes) |p| {
+                if (p.island_id == std.math.maxInt(u32)) {
+                    try grid_positions.append(p.position);
+                }
+            }
+
+            var forced_seeds = std.ArrayList(pvs_exemplar.ForcedSeed).init(allocator);
+            defer forced_seeds.deinit();
+            var grid_bitsets: ?[][]u8 = null;
+            defer if (grid_bitsets) |bs| {
+                for (bs) |b| if (b.len > 0) allocator.free(b);
+                allocator.free(bs);
+            };
+
+            if (grid_positions.items.len > 0) {
+                grid_bitsets = try pvs_neural.sampleAtPositions(
+                    allocator,
+                    &world_bivh,
+                    &mesh_set,
+                    world_perm,
+                    data_tri_to_unit,
+                    data_num_units,
+                    grid_positions.items,
+                    .{
+                        .num_samples = 0,
+                        .rays_per_sample = cfg.rays_per_sample,
+                        .max_ray_dist = 2000.0,
+                    },
+                    stdout,
+                );
+                for (grid_positions.items, grid_bitsets.?) |pos, bitset| {
+                    if (bitset.len == 0) continue;
+                    try forced_seeds.append(.{
+                        .position = pos,
+                        .visibility = bitset,
+                    });
+                }
+            }
+
             // ── Exemplar selection ──
             stderr.print("[Exemplar] Building exemplar model...\n", .{}) catch {};
             const t_exemplar0 = std.time.nanoTimestamp();
@@ -1541,6 +1857,7 @@ pub fn main() !void {
                     .surprise_threshold = 0.05,
                     .seed_count = 200,
                 },
+                forced_seeds.items,
                 stdout,
             );
             defer epvs.deinit();
@@ -1621,12 +1938,7 @@ fn walkerProgress(cells_done: u32, total_cells: u32, connections: u64) void {
 /// triangle array back to its source (model name + submesh index inside that
 /// model). Used for sub-mesh-granularity PVS so aggregate world geometry
 /// doesn't all share one PVS bit.
-pub const SubmeshRange = struct {
-    tri_start: u32,
-    tri_end: u32,
-    model_name: []const u8, // borrowed (lives as long as the caller's name buffer)
-    submesh_idx: u32,
-};
+pub const SubmeshRange = baker_types.SubmeshRange;
 
 fn extractModelGeometry(
     allocator: Allocator,
