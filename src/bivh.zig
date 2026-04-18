@@ -479,6 +479,124 @@ pub const Bivh = struct {
         try prims.bake(self.allocator);
     }
 
+    const SAH_BINS: usize = 12;
+
+    const SahSplit = struct {
+        axis: Axis,
+        threshold: f32,
+    };
+
+    inline fn surfaceArea(bmin: [3]f32, bmax: [3]f32) f32 {
+        const dx = @max(bmax[0] - bmin[0], 0.0);
+        const dy = @max(bmax[1] - bmin[1], 0.0);
+        const dz = @max(bmax[2] - bmin[2], 0.0);
+        return dx * dy + dy * dz + dz * dx;
+    }
+
+    /// Binned SAH over [start..=end]. Infos are indexed inclusively; the
+    /// range matches the partition convention elsewhere in this file.
+    fn pickSahSplit(infos: []const BuildInfo, start: u32, end: u32, bmin: [3]f32, bmax: [3]f32) SahSplit {
+        // Centroid bounds — tighter than the triangle-AABB bounds and
+        // avoids wasting bins on empty tails.
+        var cmin = [3]f32{ std.math.floatMax(f32), std.math.floatMax(f32), std.math.floatMax(f32) };
+        var cmax = [3]f32{ -std.math.floatMax(f32), -std.math.floatMax(f32), -std.math.floatMax(f32) };
+        for (start..end + 1) |i| {
+            for (0..3) |a| {
+                cmin[a] = @min(cmin[a], infos[i].center[a]);
+                cmax[a] = @max(cmax[a], infos[i].center[a]);
+            }
+        }
+
+        const n: u32 = end - start + 1;
+        const leaf_cost: f32 = @floatFromInt(n);
+        var best: SahSplit = .{ .axis = .x, .threshold = std.math.floatMax(f32) };
+        var best_cost: f32 = leaf_cost;
+
+        var bin_count: [SAH_BINS]u32 = undefined;
+        var bin_min: [SAH_BINS][3]f32 = undefined;
+        var bin_max: [SAH_BINS][3]f32 = undefined;
+
+        for (0..3) |axis| {
+            const span = cmax[axis] - cmin[axis];
+            if (span <= 0) continue;
+
+            for (0..SAH_BINS) |b| {
+                bin_count[b] = 0;
+                bin_min[b] = .{ std.math.floatMax(f32), std.math.floatMax(f32), std.math.floatMax(f32) };
+                bin_max[b] = .{ -std.math.floatMax(f32), -std.math.floatMax(f32), -std.math.floatMax(f32) };
+            }
+
+            const scale = @as(f32, @floatFromInt(SAH_BINS)) / span;
+            for (start..end + 1) |i| {
+                var bi = @as(usize, @intFromFloat((infos[i].center[axis] - cmin[axis]) * scale));
+                if (bi >= SAH_BINS) bi = SAH_BINS - 1;
+                bin_count[bi] += 1;
+                for (0..3) |a| {
+                    bin_min[bi][a] = @min(bin_min[bi][a], infos[i].min[a]);
+                    bin_max[bi][a] = @max(bin_max[bi][a], infos[i].max[a]);
+                }
+            }
+
+            var left_count: [SAH_BINS - 1]u32 = undefined;
+            var left_area: [SAH_BINS - 1]f32 = undefined;
+            var acc_count: u32 = 0;
+            var acc_min = [3]f32{ std.math.floatMax(f32), std.math.floatMax(f32), std.math.floatMax(f32) };
+            var acc_max = [3]f32{ -std.math.floatMax(f32), -std.math.floatMax(f32), -std.math.floatMax(f32) };
+            for (0..SAH_BINS - 1) |b| {
+                acc_count += bin_count[b];
+                for (0..3) |a| {
+                    acc_min[a] = @min(acc_min[a], bin_min[b][a]);
+                    acc_max[a] = @max(acc_max[a], bin_max[b][a]);
+                }
+                left_count[b] = acc_count;
+                left_area[b] = surfaceArea(acc_min, acc_max);
+            }
+
+            const parent_sa = @max(surfaceArea(bmin, bmax), 1e-6);
+            acc_count = 0;
+            acc_min = .{ std.math.floatMax(f32), std.math.floatMax(f32), std.math.floatMax(f32) };
+            acc_max = .{ -std.math.floatMax(f32), -std.math.floatMax(f32), -std.math.floatMax(f32) };
+            var b: isize = SAH_BINS - 1;
+            while (b >= 1) : (b -= 1) {
+                const bi: usize = @intCast(b);
+                acc_count += bin_count[bi];
+                for (0..3) |a| {
+                    acc_min[a] = @min(acc_min[a], bin_min[bi][a]);
+                    acc_max[a] = @max(acc_max[a], bin_max[bi][a]);
+                }
+                const lc = left_count[bi - 1];
+                if (lc == 0 or lc == n) continue;
+                const right_sa = surfaceArea(acc_min, acc_max);
+                const cost = (left_area[bi - 1] * @as(f32, @floatFromInt(lc)) +
+                    right_sa * @as(f32, @floatFromInt(acc_count))) / parent_sa;
+                if (cost < best_cost) {
+                    best_cost = cost;
+                    best.axis = @enumFromInt(@as(u8, @intCast(axis)));
+                    best.threshold = cmin[axis] + @as(f32, @floatFromInt(bi)) / scale;
+                }
+            }
+        }
+
+        // Fall back to midpoint-of-longest-axis if SAH found no split. The
+        // partition loop in buildTree already guards against all-on-one-side
+        // results, so this only has to pick *some* axis + threshold.
+        if (best.threshold == std.math.floatMax(f32)) {
+            var longest: usize = 0;
+            var longest_ext: f32 = -1;
+            for (0..3) |a| {
+                const ext = bmax[a] - bmin[a];
+                if (ext > longest_ext) {
+                    longest_ext = ext;
+                    longest = a;
+                }
+            }
+            best.axis = @enumFromInt(@as(u8, @intCast(longest)));
+            best.threshold = (bmin[longest] + bmax[longest]) * 0.5;
+        }
+
+        return best;
+    }
+
     fn buildTree(
         self: *Bivh,
         prims: *TriangleMeshSet,
@@ -529,17 +647,14 @@ pub const Bivh = struct {
                 }
             }
 
-            // Pick longest axis
-            const dx = box_max[0] - box_min[0];
-            const dy = box_max[1] - box_min[1];
-            const dz = box_max[2] - box_min[2];
-            const split_axis: Axis = if (dx > dy)
-                (if (dx > dz) .x else .z)
-            else
-                (if (dy > dz) .y else .z);
-
+            // Binned SAH: evaluate all three axes with 12 bins each, pick
+            // the split with the minimum surface-area cost. Falls back to
+            // midpoint-of-longest-axis if every candidate split degenerates
+            // (all centroids coincide along that axis).
+            const sah = pickSahSplit(infos, @as(u32, @intCast(cur_start)), @as(u32, @intCast(cur_end)), box_min, box_max);
+            const split_axis = sah.axis;
             const axis_idx = @intFromEnum(split_axis);
-            const split_point = (cur_min[axis_idx] + cur_max[axis_idx]) * 0.5;
+            const split_point = sah.threshold;
 
             // Partition primitives around split point
             var pivot: u32 = s;
