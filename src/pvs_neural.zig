@@ -181,7 +181,163 @@ pub const TrainingData = struct {
     }
 };
 
-// ── Sampler ─────────────────────────────────────────────────────────
+// ── Deterministic per-position sampler ──────────────────────────────
+//
+// For each position in `positions`, fire `rays_per_sample` rays uniformly
+// over the unit sphere and record which PVS units the rays hit. Returns
+// one bitset per input position. Unlike generateTrainingData (which picks
+// random probes from a pool with jitter), this samples EXACTLY at the
+// given positions. Used by the grid-probe path to guarantee an exemplar
+// at every floor-grounded grid location regardless of random selection.
+//
+// Caller owns the returned bitsets (one per position, length = bitset_stride).
+pub fn sampleAtPositions(
+    allocator: Allocator,
+    bivh: *const bivh_mod.Bivh,
+    mesh_set: *const bivh_mod.TriangleMeshSet,
+    world_perm: []const u32,
+    tri_to_unit: []const u32,
+    num_units: u32,
+    positions: []const Vec3,
+    config: TrainingConfig,
+    stdout: anytype,
+) ![][]u8 {
+    const bitset_stride: u32 = (num_units + 7) / 8;
+    const out = try allocator.alloc([]u8, positions.len);
+    errdefer {
+        for (out) |b| if (b.len > 0) allocator.free(b);
+        allocator.free(out);
+    }
+    for (out) |*b| b.* = &.{};
+
+    const num_threads = @max(1, std.Thread.getCpuCount() catch 4);
+    const t0 = std.time.nanoTimestamp();
+
+    const Worker = struct {
+        fn run(
+            thread_id: u32,
+            n_threads: u32,
+            ti_bivh: *const bivh_mod.Bivh,
+            ti_mesh_set: *const bivh_mod.TriangleMeshSet,
+            ti_world_perm: []const u32,
+            ti_tri_to_unit: []const u32,
+            ti_num_units: u32,
+            ti_positions: []const Vec3,
+            ti_config: TrainingConfig,
+            ti_stride: u32,
+            ti_out: [][]u8,
+            ti_alloc: Allocator,
+        ) void {
+            var i: usize = thread_id;
+            while (i < ti_positions.len) : (i += n_threads) {
+                const pos = ti_positions[i];
+                const bitset = ti_alloc.alloc(u8, ti_stride) catch continue;
+                @memset(bitset, 0);
+                samplePositionInto(
+                    ti_bivh, ti_mesh_set, ti_world_perm, ti_tri_to_unit,
+                    ti_num_units, pos, ti_config, bitset,
+                );
+                ti_out[i] = bitset;
+            }
+        }
+    };
+
+    const threads = try allocator.alloc(std.Thread, num_threads);
+    defer allocator.free(threads);
+    for (threads, 0..) |*t, i| {
+        t.* = try std.Thread.spawn(.{}, Worker.run, .{
+            @as(u32, @intCast(i)),
+            @as(u32, @intCast(num_threads)),
+            bivh, mesh_set, world_perm, tri_to_unit, num_units,
+            positions, config, bitset_stride, out, allocator,
+        });
+    }
+    for (threads) |t| t.join();
+
+    const t1 = std.time.nanoTimestamp();
+    try stdout.print("  Grid sampling: {d} positions × {d} rays in {d}ms ({d} threads)\n", .{
+        positions.len, config.rays_per_sample, @divTrunc(t1 - t0, 1_000_000), num_threads,
+    });
+    return out;
+}
+
+/// Fire one omni sphere of rays from `pos`, OR-merge results into `bitset`.
+/// Same logic as generateOneSample but with no probe selection / jitter / append.
+fn samplePositionInto(
+    bivh: *const bivh_mod.Bivh,
+    mesh_set: *const bivh_mod.TriangleMeshSet,
+    world_perm: []const u32,
+    tri_to_unit: []const u32,
+    num_units: u32,
+    pos: Vec3,
+    config: TrainingConfig,
+    bitset: []u8,
+) void {
+    const rng = std.crypto.random;
+
+    for (0..config.rays_per_sample) |_| {
+        const dir = randomOnSphere(rng);
+        var ray = bivh_mod.TraceRay.make(pos[0], pos[1], pos[2], dir[0], dir[1], dir[2], config.max_ray_dist);
+        const hit = bivh.trace(mesh_set, &ray, 0.0001, config.max_ray_dist);
+
+        if (hit and ray.hit_primitive >= 0) {
+            const sorted_idx: u32 = @intCast(ray.hit_primitive);
+            if (sorted_idx >= world_perm.len) continue;
+            const orig_idx = world_perm[sorted_idx];
+            if (orig_idx >= tri_to_unit.len) continue;
+            const unit_id = tri_to_unit[orig_idx];
+
+            if (unit_id != std.math.maxInt(u32) and unit_id < num_units) {
+                const was_new = !bitsetGet(bitset, unit_id);
+                bitsetSet(bitset, unit_id);
+
+                // Bundle refinement on first hit (same as generateOneSample).
+                if (was_new) {
+                    const tri_base = @as(usize, sorted_idx) * 3;
+                    if (tri_base + 2 >= mesh_set.indices.len) continue;
+                    const v0 = mesh_set.positions[mesh_set.indices[tri_base]];
+                    const v1 = mesh_set.positions[mesh_set.indices[tri_base + 1]];
+                    const v2 = mesh_set.positions[mesh_set.indices[tri_base + 2]];
+
+                    const probes_arr = [6]Vec3{
+                        v0,              v1,              v2,
+                        midpoint(v0, v1), midpoint(v0, v2), midpoint(v1, v2),
+                    };
+
+                    for (probes_arr) |probe| {
+                        const to_cam = sub3(pos, probe);
+                        const dist = length3(to_cam);
+                        if (dist < 0.01) continue;
+                        const dir_to_cam = scale3(to_cam, 1.0 / dist);
+                        const offset_probe = add3(probe, scale3(dir_to_cam, config.bundle_offset));
+
+                        var bundle_ray = bivh_mod.TraceRay.make(
+                            offset_probe[0], offset_probe[1], offset_probe[2],
+                            dir_to_cam[0],   dir_to_cam[1],   dir_to_cam[2],
+                            dist,
+                        );
+                        const bundle_hit = bivh.trace(mesh_set, &bundle_ray, 0.0001, dist);
+
+                        if (bundle_hit and bundle_ray.hit_primitive >= 0) {
+                            const b_sorted: u32 = @intCast(bundle_ray.hit_primitive);
+                            if (b_sorted < world_perm.len) {
+                                const b_orig = world_perm[b_sorted];
+                                if (b_orig < tri_to_unit.len) {
+                                    const b_unit = tri_to_unit[b_orig];
+                                    if (b_unit != std.math.maxInt(u32) and b_unit < num_units) {
+                                        bitsetSet(bitset, b_unit);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ── Random-probe sampler (used by generateTrainingData) ─────────────
 
 const ThreadResult = struct {
     positions: std.ArrayList(Vec3),

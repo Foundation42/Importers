@@ -179,12 +179,22 @@ pub const SelectionConfig = struct {
 ///   4. This naturally hunts the visibility manifold for surprises —
 ///      open spaces with uniform visibility get covered quickly,
 ///      while boundaries and occluder edges accumulate exemplars.
+/// Optional forced-seed exemplars: positions in world space + matching
+/// bitsets that are guaranteed to land in the final EPVS regardless of
+/// surprise selection. Used by the grid-probe path to lock in coverage
+/// at known floor positions.
+pub const ForcedSeed = struct {
+    position: [3]f32,
+    visibility: []const u8, // packed bitset, length = bitset_stride
+};
+
 pub fn selectExemplars(
     allocator: Allocator,
     data: anytype, // TrainingData
     pos_min: [3]f32,
     pos_max: [3]f32,
     config: SelectionConfig,
+    forced_seeds: []const ForcedSeed,
     stdout: anytype,
 ) !ExemplarPVS {
     const num_models = data.num_models;
@@ -277,6 +287,27 @@ pub fn selectExemplars(
         }
     };
 
+    // Phase 0: Forced seeds (e.g., from the grid-probe drop). These get
+    // added to the exemplar list unconditionally — they participate in
+    // the surprise calculation (so the greedy selector won't add nearby
+    // duplicates) but they themselves never get evicted.
+    for (forced_seeds) |fs| {
+        const vis_copy = try a.alloc(u8, bitset_stride);
+        @memcpy(vis_copy, fs.visibility);
+        const fs_input = [INPUT_SIZE]f32{
+            (fs.position[0] - pos_min[0]) * pos_scale[0],
+            (fs.position[1] - pos_min[1]) * pos_scale[1],
+            (fs.position[2] - pos_min[2]) * pos_scale[2],
+        };
+        try exemplars.append(.{
+            .input = fs_input,
+            .visibility = vis_copy,
+        });
+    }
+    if (forced_seeds.len > 0) {
+        try stdout.print("[Exemplar] Forced {d} grid-probe exemplars\n", .{forced_seeds.len});
+    }
+
     // Phase 1: Seed with random exemplars for initial coverage
     var rng = std.Random.DefaultPrng.init(42);
     const random = rng.random();
@@ -302,7 +333,7 @@ pub fn selectExemplars(
         selected[idx] = true;
     }
 
-    try stdout.print("[Exemplar] Seeded {d} exemplars, computing initial errors...\n", .{seed_count});
+    try stdout.print("[Exemplar] Seeded {d} random + {d} forced exemplars, computing initial errors...\n", .{ seed_count, forced_seeds.len });
 
     // Compute initial error for all samples (full O(N*K) sweep, only done once)
     for (0..num_samples) |si| {
