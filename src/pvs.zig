@@ -1179,17 +1179,74 @@ pub const WalkerSolver = struct {
         }
     }
 
-    /// Shoot a few rays between two cells. Returns true if ANY ray connects.
-    /// `rays_per_pair` is the budget; the scout pass uses `config.scout_rays_per_pair`,
-    /// the refine pass tops up to `config.refine_target_casts`.
+    /// Shoot rays between two cells. Returns true if ANY ray connects.
+    ///
+    /// Dispatch to a comptime-specialized inner loop for the common
+    /// `scout_rays_per_pair` values so LLVM can fully unroll the body.
+    /// Per Christian's tuning notes: a constant inner-loop count is
+    /// significantly faster than a runtime-loaded count because the
+    /// unrolled version avoids the per-iteration loop overhead and lets
+    /// the optimizer inline + reorder the ray casts more aggressively.
     fn testConnectivity(self: *WalkerSolver, cell_a: u32, cell_b: u32, rng: std.Random) bool {
+        return switch (self.config.scout_rays_per_pair) {
+            4 => self.testConnectivityN(4, cell_a, cell_b, rng),
+            8 => self.testConnectivityN(8, cell_a, cell_b, rng),
+            16 => self.testConnectivityN(16, cell_a, cell_b, rng),
+            32 => self.testConnectivityN(32, cell_a, cell_b, rng),
+            64 => self.testConnectivityN(64, cell_a, cell_b, rng),
+            else => self.testConnectivityRuntime(self.config.scout_rays_per_pair, cell_a, cell_b, rng),
+        };
+    }
+
+    fn testConnectivityN(self: *WalkerSolver, comptime N: u32, cell_a: u32, cell_b: u32, rng: std.Random) bool {
         const range_a = self.cell_ranges[cell_a];
         const range_b = self.cell_ranges[cell_b];
         if (range_a.start_tri >= range_a.end_tri) return false;
         if (range_b.start_tri >= range_b.end_tri) return false;
 
-        const rays_per_pair: u32 = self.config.scout_rays_per_pair;
-        for (0..rays_per_pair) |_| {
+        // Regular `for` with a comptime trip count — LLVM unrolls the body
+        // because N is statically known, but unlike `inline for` we can use
+        // runtime `continue` / `return` from the body.
+        for (0..N) |_| {
+            const tri_a = rng.intRangeLessThan(u32, range_a.start_tri, range_a.end_tri);
+            const tri_b = rng.intRangeLessThan(u32, range_b.start_tri, range_b.end_tri);
+
+            const p1 = randomPointOnTriangle(self.positions, self.indices, tri_a, rng);
+            const p2 = randomPointOnTriangle(self.positions, self.indices, tri_b, rng);
+
+            const dir = vec3Sub(p2, p1);
+            const dist = vec3Length(dir);
+            if (dist < 1e-6 or dist > self.config.max_ray_distance) continue;
+
+            const norm_dir = vec3Scale(dir, 1.0 / dist);
+
+            self.transport.recordCast(cell_a, cell_b);
+
+            const result = self.trace_fn(self.trace_ctx, p1, norm_dir, dist + 0.01);
+
+            const reached = !result.hit or
+                result.primitive == @as(i32, @intCast(tri_b)) or
+                result.distance >= dist - 0.01;
+
+            if (reached) {
+                self.transport.recordHit(cell_a, cell_b);
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// Generic fallback for non-power-of-two scout values. Slower than the
+    /// specialized variants because the inner loop count is runtime.
+    fn testConnectivityRuntime(self: *WalkerSolver, n: u32, cell_a: u32, cell_b: u32, rng: std.Random) bool {
+        const range_a = self.cell_ranges[cell_a];
+        const range_b = self.cell_ranges[cell_b];
+        if (range_a.start_tri >= range_a.end_tri) return false;
+        if (range_b.start_tri >= range_b.end_tri) return false;
+
+        var i: u32 = 0;
+        while (i < n) : (i += 1) {
             const tri_a = rng.intRangeLessThan(u32, range_a.start_tri, range_a.end_tri);
             const tri_b = rng.intRangeLessThan(u32, range_b.start_tri, range_b.end_tri);
 
