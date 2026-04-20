@@ -79,6 +79,10 @@ pub const buildLightmapAtlas = q3bsp.buildLightmapAtlas;
 pub const remapLightmapUVs = q3bsp.remapLightmapUVs;
 pub const Frustum = q3bsp.Frustum;
 pub const VisibleSet = q3bsp.VisibleSet;
+pub const Entity = q3bsp.Entity;
+pub const LightEntity = q3bsp.LightEntity;
+pub const parseEntities = q3bsp.parseEntities;
+pub const findLightEntities = q3bsp.findLightEntities;
 
 // Quake 3 PK3 archives and shader scripts
 pub const pk3 = @import("pk3.zig");

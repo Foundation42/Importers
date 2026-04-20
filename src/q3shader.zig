@@ -75,6 +75,14 @@ pub const Shader = struct {
     is_transparent: bool = false,
     sort_key: ?f32 = null,
     surface_parms: std.StringArrayHashMap(void),
+    /// Emissive intensity from `q3map_surfacelight N` (0 = not a surface light).
+    /// In Q3's radiosity units; calibrated to radiance downstream.
+    surface_light: f32 = 0,
+    /// Emissive colour from `q3map_lightrgb r g b` (RGB multiplier, default white).
+    light_rgb: [3]f32 = .{ 1, 1, 1 },
+    /// Optional texture reference from `q3map_lightimage path` (for colour extraction).
+    /// Owned by the Shader when non-null.
+    light_image: ?[]const u8 = null,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *Shader) void {
@@ -86,6 +94,12 @@ pub const Shader = struct {
         self.allocator.free(self.stages);
         for (self.surface_parms.keys()) |k| self.allocator.free(k);
         self.surface_parms.deinit();
+        if (self.light_image) |img| self.allocator.free(img);
+    }
+
+    /// True if this shader is a surface light (`q3map_surfacelight > 0`).
+    pub fn isEmissive(self: *const Shader) bool {
+        return self.surface_light > 0;
     }
 
     /// Get the primary diffuse texture path.
@@ -256,6 +270,10 @@ pub const ShaderDb = struct {
             for (surface_parms.keys()) |k| allocator.free(k);
             surface_parms.deinit();
         }
+        var surface_light: f32 = 0;
+        var light_rgb: [3]f32 = .{ 1, 1, 1 };
+        var light_image: ?[]const u8 = null;
+        errdefer if (light_image) |img| allocator.free(img);
 
         var depth: u32 = 1; // already inside outer '{'
         while (pos.* < source.len and depth > 0) {
@@ -321,6 +339,22 @@ pub const ShaderDb = struct {
                     if (std.ascii.eqlIgnoreCase(val, "nearest")) break :blk @as(f32, 16);
                     break :blk null;
                 };
+            } else if (std.ascii.eqlIgnoreCase(token, "q3map_surfacelight") or
+                std.ascii.eqlIgnoreCase(token, "q3map_surfacelight2"))
+            {
+                const val = readToken(source, pos);
+                surface_light = std.fmt.parseFloat(f32, val) catch 0;
+            } else if (std.ascii.eqlIgnoreCase(token, "q3map_lightrgb")) {
+                const r = std.fmt.parseFloat(f32, readToken(source, pos)) catch 1;
+                const g = std.fmt.parseFloat(f32, readToken(source, pos)) catch 1;
+                const b = std.fmt.parseFloat(f32, readToken(source, pos)) catch 1;
+                light_rgb = .{ r, g, b };
+            } else if (std.ascii.eqlIgnoreCase(token, "q3map_lightimage")) {
+                const val = readToken(source, pos);
+                if (val.len > 0) {
+                    if (light_image) |existing| allocator.free(existing);
+                    light_image = try allocator.dupe(u8, val);
+                }
             } else {
                 // Unknown directive — skip rest of line
                 skipLine(source, pos);
@@ -337,6 +371,9 @@ pub const ShaderDb = struct {
             .is_transparent = is_transparent,
             .sort_key = sort_key,
             .surface_parms = surface_parms,
+            .surface_light = surface_light,
+            .light_rgb = light_rgb,
+            .light_image = light_image,
             .allocator = allocator,
         };
     }
@@ -612,6 +649,66 @@ test "parse shader with surfaceparms and sort" {
     try std.testing.expect(shader.hasSurfaceParm("nonsolid"));
     try std.testing.expectApproxEqAbs(@as(f32, 8.0), shader.sort_key.?, 0.001);
     try std.testing.expectEqual(CullMode.back, shader.cull);
+}
+
+test "parse emissive directives (q3map_surfacelight / lightrgb / lightimage)" {
+    const source =
+        \\textures/sfx/teleporter_light
+        \\{
+        \\    qer_editorimage textures/sfx/teleporter.tga
+        \\    surfaceparm nolightmap
+        \\    q3map_surfacelight 800
+        \\    q3map_lightrgb 0.4 0.6 1.0
+        \\    q3map_lightimage textures/sfx/teleporter_glow.tga
+        \\    {
+        \\        map textures/sfx/teleporter.tga
+        \\        blendFunc add
+        \\    }
+        \\}
+        \\textures/base_wall/concrete
+        \\{
+        \\    {
+        \\        map textures/base_wall/concrete.tga
+        \\    }
+        \\    {
+        \\        map $lightmap
+        \\        blendFunc filter
+        \\    }
+        \\}
+    ;
+
+    var db = ShaderDb.init(std.testing.allocator);
+    defer db.deinit();
+
+    try db.loadShaderScript(source);
+
+    const emissive = db.find("textures/sfx/teleporter_light").?;
+    try std.testing.expect(emissive.isEmissive());
+    try std.testing.expectApproxEqAbs(@as(f32, 800), emissive.surface_light, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.4), emissive.light_rgb[0], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.6), emissive.light_rgb[1], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), emissive.light_rgb[2], 0.001);
+    try std.testing.expectEqualStrings("textures/sfx/teleporter_glow.tga", emissive.light_image.?);
+
+    const non_emissive = db.find("textures/base_wall/concrete").?;
+    try std.testing.expect(!non_emissive.isEmissive());
+    try std.testing.expectEqual(@as(f32, 0), non_emissive.surface_light);
+    try std.testing.expect(non_emissive.light_image == null);
+}
+
+test "q3map_surfacelight2 treated the same" {
+    const source =
+        \\textures/lava/fire
+        \\{
+        \\    q3map_surfacelight2 1500
+        \\}
+    ;
+    var db = ShaderDb.init(std.testing.allocator);
+    defer db.deinit();
+    try db.loadShaderScript(source);
+    const s = db.find("textures/lava/fire").?;
+    try std.testing.expect(s.isEmissive());
+    try std.testing.expectApproxEqAbs(@as(f32, 1500), s.surface_light, 0.001);
 }
 
 test "parse multiple shaders" {

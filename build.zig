@@ -86,6 +86,25 @@ pub fn build(b: *std.Build) void {
     const q3bsp_step = b.step("q3bsp", "Run the Q3 BSP loader example");
     q3bsp_step.dependOn(&run_q3bsp.step);
 
+    // Example: dump_q3_emissives (Phase 1 validation for emissive NEE)
+    const q3_emissives = b.addExecutable(.{
+        .name = "dump-q3-emissives",
+        .root_source_file = b.path("examples/dump_q3_emissives.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    q3_emissives.root_module.addImport("valve-resource-format", vrf_mod);
+    b.installArtifact(q3_emissives);
+
+    const run_q3_emissives = b.addRunArtifact(q3_emissives);
+    run_q3_emissives.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        run_q3_emissives.addArgs(args);
+    }
+
+    const q3_emissives_step = b.step("q3-emissives", "Dump emissive info for a Q3 map (phase-1 validation)");
+    q3_emissives_step.dependOn(&run_q3_emissives.step);
+
     // Example: test_tga
     const tga_example = b.addExecutable(.{
         .name = "test-tga",

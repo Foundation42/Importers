@@ -256,6 +256,68 @@ fn parseVec3(s: []const u8) ?[3]f32 {
     return result;
 }
 
+/// Point-light entity extracted from the BSP entity lump.
+/// Origin in raw Q3 units (inches); caller converts to engine units.
+/// Colour is normalised 0..1 (values > 1.5 in source are treated as 0..255 and rescaled).
+pub const LightEntity = struct {
+    origin: [3]f32,
+    color: [3]f32 = .{ 1, 1, 1 },
+    /// Q3 radiosity intensity. Default 300 per q3map2 convention.
+    intensity: f32 = 300,
+    /// Non-null when this light targets another entity (spotlight).
+    /// Borrowed slice, lives as long as the source Entity.
+    target: ?[]const u8 = null,
+    /// Explicit radius if the map author set one (`radius` key).
+    radius: ?f32 = null,
+    /// True for `lightJunior` (bake-time-only helper). Runtime NEE
+    /// callers can skip these if the lightmap already covers them.
+    is_junior: bool = false,
+};
+
+/// Filter an already-parsed entity slice down to point-light entities
+/// (`classname == "light"` or `"lightJunior"`). Returns an owned slice.
+pub fn findLightEntities(allocator: std.mem.Allocator, entities: []const Entity) ![]LightEntity {
+    var lights = std.ArrayList(LightEntity).init(allocator);
+    errdefer lights.deinit();
+
+    for (entities) |*e| {
+        const cls = e.getClassname() orelse continue;
+        const is_light = std.mem.eql(u8, cls, "light");
+        const is_junior = std.mem.eql(u8, cls, "lightJunior");
+        if (!is_light and !is_junior) continue;
+
+        const origin = e.getOrigin() orelse continue;
+
+        var light = LightEntity{ .origin = origin, .is_junior = is_junior };
+
+        if (e.get("_color")) |cs| {
+            if (parseVec3(cs)) |rgb| {
+                // If any component is clearly > 1, author used 0..255 scale.
+                const max = @max(rgb[0], @max(rgb[1], rgb[2]));
+                const scale: f32 = if (max > 1.5) 1.0 / 255.0 else 1.0;
+                light.color = .{ rgb[0] * scale, rgb[1] * scale, rgb[2] * scale };
+            }
+        }
+
+        // `light` is the newer key, `_light` older; accept either.
+        if (e.get("light")) |v| {
+            light.intensity = std.fmt.parseFloat(f32, v) catch 300;
+        } else if (e.get("_light")) |v| {
+            light.intensity = std.fmt.parseFloat(f32, v) catch 300;
+        }
+
+        if (e.get("target")) |t| light.target = t;
+
+        if (e.get("radius")) |r| {
+            light.radius = std.fmt.parseFloat(f32, r) catch null;
+        }
+
+        try lights.append(light);
+    }
+
+    return lights.toOwnedSlice();
+}
+
 /// Parse the entity lump string into a list of entities.
 pub fn parseEntities(allocator: std.mem.Allocator, raw: []const u8) ![]Entity {
     var entities = std.ArrayList(Entity).init(allocator);
@@ -1620,6 +1682,69 @@ test "entity parser" {
     try std.testing.expectApproxEqAbs(@as(f32, 128.0), origin[0], 0.001);
     try std.testing.expectApproxEqAbs(@as(f32, -256.0), origin[1], 0.001);
     try std.testing.expectApproxEqAbs(@as(f32, 64.0), origin[2], 0.001);
+}
+
+test "findLightEntities extracts light + lightJunior with colour/intensity/target" {
+    const raw =
+        \\{
+        \\"classname" "worldspawn"
+        \\}
+        \\{
+        \\"classname" "light"
+        \\"origin" "100 200 300"
+        \\"_color" "1.0 0.5 0.2"
+        \\"light" "500"
+        \\}
+        \\{
+        \\"classname" "light"
+        \\"origin" "0 0 0"
+        \\"_color" "255 128 64"
+        \\}
+        \\{
+        \\"classname" "lightJunior"
+        \\"origin" "1 2 3"
+        \\"_light" "120"
+        \\"target" "t1"
+        \\"radius" "250"
+        \\}
+        \\{
+        \\"classname" "info_player_deathmatch"
+        \\"origin" "0 0 0"
+        \\}
+    ;
+
+    const entities = try parseEntities(std.testing.allocator, raw);
+    defer {
+        for (entities) |*e| {
+            var entity = Entity{ .properties = e.properties };
+            entity.deinit(std.testing.allocator);
+        }
+        std.testing.allocator.free(entities);
+    }
+
+    const lights = try findLightEntities(std.testing.allocator, entities);
+    defer std.testing.allocator.free(lights);
+
+    try std.testing.expectEqual(@as(usize, 3), lights.len);
+
+    // Light 0: normalised colour, explicit `light` key
+    try std.testing.expectApproxEqAbs(@as(f32, 100), lights[0].origin[0], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), lights[0].color[0], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), lights[0].color[1], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 500), lights[0].intensity, 0.001);
+    try std.testing.expect(!lights[0].is_junior);
+    try std.testing.expect(lights[0].target == null);
+
+    // Light 1: 0..255 colour rescaled to 0..1; default intensity
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), lights[1].color[0], 0.005);
+    try std.testing.expectApproxEqAbs(@as(f32, 128.0 / 255.0), lights[1].color[1], 0.005);
+    try std.testing.expectApproxEqAbs(@as(f32, 300), lights[1].intensity, 0.001);
+
+    // Light 2: lightJunior with `_light`, target, radius
+    try std.testing.expect(lights[2].is_junior);
+    try std.testing.expectApproxEqAbs(@as(f32, 120), lights[2].intensity, 0.001);
+    try std.testing.expectEqualStrings("t1", lights[2].target.?);
+    try std.testing.expectApproxEqAbs(@as(f32, 250), lights[2].radius.?, 0.001);
 }
 
 test "vis data visibility check" {
