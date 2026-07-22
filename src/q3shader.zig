@@ -72,6 +72,9 @@ pub const Shader = struct {
     stages: []Stage,
     cull: CullMode = .front,
     sky_parms: bool = false,
+    /// `polygonOffset` directive — the shader is a decal meant to render
+    /// with a depth bias over the coplanar surface beneath it.
+    polygon_offset: bool = false,
     is_transparent: bool = false,
     sort_key: ?f32 = null,
     surface_parms: std.StringArrayHashMap(void),
@@ -262,6 +265,7 @@ pub const ShaderDb = struct {
         }
 
         var cull: CullMode = .front;
+        var polygon_offset = false;
         var sky_parms = false;
         var is_transparent = false;
         var sort_key: ?f32 = null;
@@ -326,6 +330,8 @@ pub const ShaderDb = struct {
             } else if (std.ascii.eqlIgnoreCase(token, "skyparms")) {
                 sky_parms = true;
                 skipLine(source, pos);
+            } else if (std.ascii.eqlIgnoreCase(token, "polygonOffset")) {
+                polygon_offset = true;
             } else if (std.ascii.eqlIgnoreCase(token, "sort")) {
                 const val = readToken(source, pos);
                 sort_key = std.fmt.parseFloat(f32, val) catch blk: {
@@ -368,6 +374,7 @@ pub const ShaderDb = struct {
             .stages = try stages.toOwnedSlice(),
             .cull = cull,
             .sky_parms = sky_parms,
+            .polygon_offset = polygon_offset,
             .is_transparent = is_transparent,
             .sort_key = sort_key,
             .surface_parms = surface_parms,
@@ -528,9 +535,11 @@ fn skipWhitespaceAndComments(source: []const u8, start: usize) usize {
             i += 1;
             continue;
         }
-        // Skip // comments
+        // Skip // comments. '\r' terminates too — bare-CR line separators
+        // appear in the wild (see skipLine) and a comment must not eat
+        // directives packed after the CR on the same physical line.
         if (i + 1 < source.len and source[i] == '/' and source[i + 1] == '/') {
-            while (i < source.len and source[i] != '\n') : (i += 1) {}
+            while (i < source.len and source[i] != '\n' and source[i] != '\r') : (i += 1) {}
             continue;
         }
         // Skip /* */ comments
@@ -557,7 +566,13 @@ fn skipInlineWhitespace(source: []const u8, start: usize) usize {
 }
 
 fn skipLine(source: []const u8, pos: *usize) void {
-    while (pos.* < source.len and source[pos.*] != '\n') : (pos.* += 1) {}
+    // Stop at '\r' too: shader scripts in the wild use bare carriage
+    // returns as line separators (old Mac-style / mixed endings), often
+    // packing several directives — and even a stage's closing brace —
+    // into one '\n'-terminated physical line. Skipping to '\n' alone
+    // blows past those braces and desyncs the block parser (see the
+    // dm17_jpad shader in OpenArena's cosmoflash.shader).
+    while (pos.* < source.len and source[pos.*] != '\n' and source[pos.*] != '\r') : (pos.* += 1) {}
 }
 
 fn readToken(source: []const u8, pos: *usize) []const u8 {
@@ -735,4 +750,36 @@ test "parse multiple shaders" {
 
     try std.testing.expect(db.find("textures/base/floor1") != null);
     try std.testing.expect(db.find("textures/base/wall2") != null);
+}
+
+test "bare-CR line separators don't desync block parsing" {
+    // Mirrors OpenArena's cosmoflash.shader: bare '\r' (no '\n') separates
+    // directives, and a stage's closing brace can share one '\n'-terminated
+    // physical line with unknown directives. skipLine must stop at '\r' or
+    // the brace is swallowed and the next shader definitions get parsed as
+    // part of this shader's body.
+    const source = "textures/test/jpad\n" ++
+        "{\n" ++
+        "    surfaceparm nomarks\r    q3map_surfacelight 100\n" ++
+        "\t{\r\t\tmap a.tga\r\t\ttcMod stretch sin 1.2 .8 0 1.5\r\t}\r    {\n" ++
+        "        map b.tga\r\t\trgbGen identity\r\t}\r}\n" ++
+        "textures/test/decal{\tqer_editorimage d.tga\n" ++
+        "    polygonOffset\n" ++
+        "    {\n" ++
+        "        map d.tga\n" ++
+        "        blendFunc blend\r\t\trgbGen identity\r\t}\n" ++
+        "}\n";
+
+    var db = ShaderDb.init(std.testing.allocator);
+    defer db.deinit();
+
+    try db.loadShaderScript(source);
+
+    const jpad = db.find("textures/test/jpad") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 2), jpad.stages.len);
+    try std.testing.expect(!jpad.polygon_offset);
+
+    const decal = db.find("textures/test/decal") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(decal.polygon_offset);
+    try std.testing.expectEqual(@as(usize, 1), decal.stages.len);
 }
