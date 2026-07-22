@@ -105,18 +105,46 @@ pub const Shader = struct {
         return self.surface_light > 0;
     }
 
-    /// Get the primary diffuse texture path.
-    /// Searches stages in priority order: first non-lightmap, non-special map.
-    /// For animMap shaders, returns the first frame.
-    pub fn getDiffuseMap(self: *const Shader) ?[]const u8 {
-        // First pass: look for a stage with a real texture map
-        for (self.stages) |s| {
+    /// Get the stage carrying the primary diffuse texture.
+    ///
+    /// Pass 1 skips effect stages — clampMap'd maps (animated rings /
+    /// flares, e.g. the jump-pad jc2 pulse) and additive (GL_ONE GL_ONE)
+    /// glow layers — so multi-stage shaders whose real artwork lives in a
+    /// later alpha-blended stage (dm17_jpad's spawn-pad art over its
+    /// pulse ring) resolve to the artwork, not the effect. Pass 2 falls
+    /// back to the historical "first real map" behaviour so effect-only
+    /// shaders still resolve to something drawable.
+    ///
+    /// Surface lights (q3map_surfacelight) always take pass 2: their
+    /// diffuse doubles as the emissive preview albedo downstream, and
+    /// swapping a dark effect texture for bright artwork re-lights the
+    /// scene (wrackdm17's central launcher went white-hot when its
+    /// jump-pad shader started resolving to the pale plate art).
+    pub fn getDiffuseStage(self: *const Shader) ?*const Stage {
+        if (!self.isEmissive()) {
+            for (self.stages) |*s| {
+                if (s.is_lightmap) continue;
+                if (s.map.len == 0) continue;
+                if (isSpecialMap(s.map)) continue;
+                if (s.clamp) continue;
+                if (s.blend_src == .gl_one and s.blend_dst == .gl_one) continue;
+                return s;
+            }
+        }
+        for (self.stages) |*s| {
             if (s.is_lightmap) continue;
             if (s.map.len == 0) continue;
             if (isSpecialMap(s.map)) continue;
-            return s.map;
+            return s;
         }
         return null;
+    }
+
+    /// Get the primary diffuse texture path (see getDiffuseStage).
+    /// For animMap shaders, returns the first frame.
+    pub fn getDiffuseMap(self: *const Shader) ?[]const u8 {
+        const stage = self.getDiffuseStage() orelse return null;
+        return stage.map;
     }
 
     /// Get all unique texture paths referenced by this shader (all stages).
