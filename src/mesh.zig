@@ -184,6 +184,29 @@ pub const BufferData = struct {
         return .{ 1, 1, 1, 1 };
     }
 
+    /// Get Source 2 blend paint for vertex i (TEXCOORD semantic index 4,
+    /// byte-per-channel). Two-layer world materials store the layer-2 blend
+    /// factor in R (G = layer-3 factor, A = softness paint). Returns null
+    /// when the stream is absent.
+    pub fn getBlendPaint(self: *const BufferData, i: u32) ?[4]f32 {
+        for (self.input_layout) |*field| {
+            if (field.semantic_index == 4 and
+                (field.format == .r8g8b8a8_unorm or field.format == .r8g8b8a8_uint) and
+                std.ascii.eqlIgnoreCase(field.semantic_name, "TEXCOORD"))
+            {
+                const o = self.vertexOffset(i, field.offset);
+                if (o + 4 > self.data.len) return null;
+                return .{
+                    @as(f32, @floatFromInt(self.data[o])) / 255.0,
+                    @as(f32, @floatFromInt(self.data[o + 1])) / 255.0,
+                    @as(f32, @floatFromInt(self.data[o + 2])) / 255.0,
+                    @as(f32, @floatFromInt(self.data[o + 3])) / 255.0,
+                };
+            }
+        }
+        return null;
+    }
+
     /// Get index value at position i from an index buffer.
     pub fn getIndex(self: *const BufferData, i: u32) u32 {
         if (self.element_size_in_bytes == 2) {

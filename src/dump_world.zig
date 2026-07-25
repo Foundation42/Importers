@@ -38,6 +38,24 @@ pub fn main() !void {
         return;
     }
 
+    if (resource_path != null and std.mem.eql(u8, resource_path.?, "texavg")) {
+        if (args.len < 4) {
+            try std.io.getStdErr().writer().writeAll("Usage: dump-world <content.vpk> texavg <vtex-path>\n");
+            std.process.exit(1);
+        }
+        try texAvg(allocator, vpk_path, args[3], stdout);
+        return;
+    }
+
+    if (resource_path != null and std.mem.eql(u8, resource_path.?, "vbuf")) {
+        if (args.len < 4) {
+            try std.io.getStdErr().writer().writeAll("Usage: dump-world <map.vpk> vbuf <model-path>\n");
+            std.process.exit(1);
+        }
+        try vbufDump(allocator, vpk_path, args[3], stdout);
+        return;
+    }
+
     if (resource_path != null and std.mem.eql(u8, resource_path.?, "list")) {
         var pkg2 = vrf.vpk.Package.init(allocator);
         defer pkg2.deinit();
@@ -639,6 +657,158 @@ fn countSubMeshes(allocator: std.mem.Allocator, data: []const u8) !u32 {
 
     if (dc_count == 0) return 1; // fallback: one whole-buffer draw call
     return dc_count;
+}
+
+/// Decode a vtex_c and print its dimensions, format, and average RGBA.
+fn texAvg(allocator: std.mem.Allocator, vpk_path: []const u8, tex_path: []const u8, stdout: anytype) !void {
+    var pkg = vrf.vpk.Package.init(allocator);
+    defer pkg.deinit();
+    try pkg.readFile(vpk_path);
+
+    const entry = pkg.findEntry(tex_path) orelse {
+        try stdout.print("Entry not found: {s}\n", .{tex_path});
+        std.process.exit(1);
+    };
+    const tex_data = try pkg.readEntry(entry);
+    defer pkg.allocator.free(tex_data);
+
+    var resource = vrf.Resource.init(allocator);
+    defer resource.deinit();
+    resource.resource_type = .texture;
+    try resource.read(tex_data);
+
+    const tex_block = resource.dataBlock() orelse return error.NoTexture;
+    const header = tex_data[tex_block.offset..][0..tex_block.size];
+    const pixel_start = tex_block.offset + tex_block.size;
+
+    var tex = vrf.Texture.init(allocator);
+    defer tex.deinit();
+    try tex.readHeader(header);
+    tex.data = if (pixel_start < tex_data.len) tex_data[pixel_start..] else null;
+
+    const rgba = try tex.decodeRGBA();
+    defer allocator.free(rgba);
+
+    var sums = [4]u64{ 0, 0, 0, 0 };
+    const px_count = @as(u64, tex.width) * tex.height;
+    var i: usize = 0;
+    while (i + 4 <= rgba.len) : (i += 4) {
+        for (0..4) |c| sums[c] += rgba[i + c];
+    }
+    try stdout.print("{s}\n  {d}x{d} fmt={s}\n  avg RGBA = ({d:.1}, {d:.1}, {d:.1}, {d:.1})\n", .{
+        tex_path,                                                     tex.width, tex.height, @tagName(tex.format),
+        @as(f64, @floatFromInt(sums[0])) / @as(f64, @floatFromInt(px_count)),
+        @as(f64, @floatFromInt(sums[1])) / @as(f64, @floatFromInt(px_count)),
+        @as(f64, @floatFromInt(sums[2])) / @as(f64, @floatFromInt(px_count)),
+        @as(f64, @floatFromInt(sums[3])) / @as(f64, @floatFromInt(px_count)),
+    });
+}
+
+/// Dump vertex buffer layouts and per-attribute value stats for one vmdl_c.
+/// Shows which buffer/attribute carries blend-paint data for 2-layer materials.
+fn vbufDump(allocator: std.mem.Allocator, vpk_path: []const u8, model_path: []const u8, stdout: anytype) !void {
+    var pkg = vrf.vpk.Package.init(allocator);
+    defer pkg.deinit();
+    try pkg.readFile(vpk_path);
+
+    const entry = pkg.findEntry(model_path) orelse {
+        try stdout.print("Entry not found: {s}\n", .{model_path});
+        std.process.exit(1);
+    };
+    const data = try pkg.readEntry(entry);
+    defer pkg.allocator.free(data);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var resource = vrf.Resource.init(arena);
+    defer resource.deinit();
+    resource.resource_type = .model;
+    try resource.read(data);
+
+    // Get VBIB: legacy block or CS2 embedded mesh
+    var vbib: vrf.VBIB = blk: {
+        for (resource.blocks.items) |b| {
+            if ((b.block_type == .vbib or b.block_type == .mbuf) and b.size > 0) {
+                break :blk try vrf.VBIB.readFromBinaryBlock(arena, data[b.offset..][0..b.size]);
+            }
+        }
+        const ctrl_block = resource.getBlockByType(.ctrl) orelse return error.NoMeshData;
+        const ctrl_raw = switch (ctrl_block.data) {
+            .kv3_block => |kb| kb.raw_data orelse return error.NoMeshData,
+            else => return error.NoMeshData,
+        };
+        var ctrl_doc = try vrf.binary_kv3.decode(arena, ctrl_raw);
+        const ctrl_root = ctrl_doc.root.asObject() orelse return error.NoMeshData;
+        const em_arr = ctrl_root.getArray("embedded_meshes") orelse return error.NoMeshData;
+        if (em_arr.count() == 0) return error.NoMeshData;
+        const em_obj = em_arr.items.items[0].asObject() orelse return error.NoMeshData;
+        break :blk try vrf.VBIB.readFromEmbeddedMesh(arena, em_obj, &resource);
+    };
+    defer vbib.deinit();
+
+    try stdout.print("{s}\n{d} vertex buffer(s), {d} index buffer(s)\n\n", .{ model_path, vbib.vertex_buffers.len, vbib.index_buffers.len });
+
+    for (vbib.vertex_buffers, 0..) |*vb, bi| {
+        try stdout.print("VB[{d}]: {d} elements x {d} bytes ({d} KB)\n", .{ bi, vb.element_count, vb.element_size_in_bytes, vb.data.len / 1024 });
+        for (vb.input_layout) |*f| {
+            try stdout.print("  {s}[{d}] fmt={s} offset={d} slot={d}\n", .{ f.semantic_name, f.semantic_index, @tagName(f.format), f.offset, f.slot });
+        }
+        // Per-attribute value stats
+        for (vb.input_layout) |*f| {
+            const fsize = f.format.byteSize();
+            if (fsize == 0 or vb.element_count == 0) continue;
+            try stdout.print("  --- {s}[{d}] samples:", .{ f.semantic_name, f.semantic_index });
+            var vi: u32 = 0;
+            while (vi < @min(vb.element_count, 6)) : (vi += 1) {
+                const o = @as(usize, vi) * vb.element_size_in_bytes + f.offset;
+                if (o + fsize > vb.data.len) break;
+                try stdout.writeAll(" [");
+                for (vb.data[o .. o + fsize], 0..) |byte, k| {
+                    if (k > 0) try stdout.writeAll(" ");
+                    try stdout.print("{x:0>2}", .{byte});
+                }
+                try stdout.writeAll("]");
+            }
+            try stdout.writeAll("\n");
+            // Channel stats for byte-per-channel formats
+            if (f.format == .r8g8b8a8_unorm or f.format == .r8g8b8a8_uint) {
+                var mins = [4]u8{ 255, 255, 255, 255 };
+                var maxs = [4]u8{ 0, 0, 0, 0 };
+                var sums = [4]u64{ 0, 0, 0, 0 };
+                var nonzero: u32 = 0;
+                var count: u32 = 0;
+                vi = 0;
+                while (vi < vb.element_count) : (vi += 1) {
+                    const o = @as(usize, vi) * vb.element_size_in_bytes + f.offset;
+                    if (o + 4 > vb.data.len) break;
+                    var any = false;
+                    for (0..4) |c| {
+                        const b = vb.data[o + c];
+                        mins[c] = @min(mins[c], b);
+                        maxs[c] = @max(maxs[c], b);
+                        sums[c] += b;
+                        if (b != 0) any = true;
+                    }
+                    if (any) nonzero += 1;
+                    count += 1;
+                }
+                if (count > 0) {
+                    try stdout.print("      channel min=({d},{d},{d},{d}) max=({d},{d},{d},{d}) mean=({d:.1},{d:.1},{d:.1},{d:.1}) nonzero={d}/{d}\n", .{
+                        mins[0], mins[1], mins[2], mins[3],
+                        maxs[0], maxs[1], maxs[2], maxs[3],
+                        @as(f64, @floatFromInt(sums[0])) / @as(f64, @floatFromInt(count)),
+                        @as(f64, @floatFromInt(sums[1])) / @as(f64, @floatFromInt(count)),
+                        @as(f64, @floatFromInt(sums[2])) / @as(f64, @floatFromInt(count)),
+                        @as(f64, @floatFromInt(sums[3])) / @as(f64, @floatFromInt(count)),
+                        nonzero, count,
+                    });
+                }
+            }
+        }
+        try stdout.writeAll("\n");
+    }
 }
 
 /// Extract an f64 from any numeric KV3 value.
