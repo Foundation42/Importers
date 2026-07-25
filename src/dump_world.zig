@@ -33,6 +33,27 @@ pub fn main() !void {
         return;
     }
 
+    if (resource_path != null and std.mem.eql(u8, resource_path.?, "entities")) {
+        try entityStats(allocator, vpk_path, stdout);
+        return;
+    }
+
+    if (resource_path != null and std.mem.eql(u8, resource_path.?, "list")) {
+        var pkg2 = vrf.vpk.Package.init(allocator);
+        defer pkg2.deinit();
+        pkg2.readFile(vpk_path) catch |err| {
+            try std.io.getStdErr().writer().print("Error reading VPK: {}\n", .{err});
+            std.process.exit(1);
+        };
+        var it2 = pkg2.iterateAll();
+        while (it2.next()) |entry| {
+            const p = try entry.getFullPath(allocator);
+            defer allocator.free(p);
+            try stdout.print("{s}\t{d}\n", .{ p, entry.totalLength() });
+        }
+        return;
+    }
+
     // Open VPK
     var pkg = vrf.vpk.Package.init(allocator);
     defer pkg.deinit();
@@ -413,6 +434,30 @@ pub fn main() !void {
             try stdout.print("  {s} = {s}\n", .{ key, val_str });
         }
 
+        // If this looks like a material, dump its parameter tables.
+        const param_tables = [_][]const u8{ "m_intParams", "m_floatParams", "m_vectorParams", "m_textureParams", "m_intAttributes", "m_stringAttributes" };
+        for (param_tables) |table| {
+            if (root_obj.getArray(table)) |pa| {
+                if (pa.count() == 0) continue;
+                try stdout.print("\n{s} ({d}):\n", .{ table, pa.count() });
+                for (pa.items.items) |*pv| {
+                    if (pv.asObject()) |po| {
+                        var line = std.ArrayList(u8).init(allocator);
+                        defer line.deinit();
+                        for (po.keys.items, po.values.items) |pk, *pvv| {
+                            const pvs = formatKVValue(allocator, pvv) catch "?";
+                            defer if (!std.mem.eql(u8, pvs, "?")) allocator.free(pvs);
+                            if (line.items.len > 0) line.appendSlice("  ") catch {};
+                            line.appendSlice(pk) catch {};
+                            line.append('=') catch {};
+                            line.appendSlice(pvs) catch {};
+                        }
+                        try stdout.print("  {s}\n", .{line.items});
+                    }
+                }
+            }
+        }
+
         // If this looks like a world node, dump scene objects
         if (root_obj.getArray("m_sceneObjects")) |so_arr| {
             try stdout.print("\nScene objects ({d}):\n", .{so_arr.count()});
@@ -729,6 +774,30 @@ fn transformStats(allocator: std.mem.Allocator, vpk_path: []const u8, stdout: an
                 const model = agg.getStringProperty("m_renderableModel") orelse "?";
                 const frags = agg.getArray("m_fragmentTransforms") orelse continue;
                 const mesh_count: u32 = if (agg.getArray("m_aggregateMeshes")) |am| @intCast(am.count()) else 0;
+                // Non-white per-mesh tints exist on baked aggregates too.
+                if (agg.getArray("m_aggregateMeshes")) |am_t| {
+                    for (am_t.items.items, 0..) |*mv_t, mi_t| {
+                        const mo_t = mv_t.asObject() orelse continue;
+                        const tv_t = mo_t.get("m_vTintColor") orelse continue;
+                        const tarr = switch (tv_t.*) {
+                            .array => |a| a,
+                            else => continue,
+                        };
+                        if (tarr.items.items.len < 3) continue;
+                        var tc: [3]f64 = undefined;
+                        var ok = true;
+                        for (0..3) |ci| {
+                            tc[ci] = kvFloat(&tarr.items.items[ci]) orelse {
+                                ok = false;
+                                break;
+                            };
+                        }
+                        if (!ok) continue;
+                        if (@abs(tc[0] - 1.0) > 0.01 or @abs(tc[1] - 1.0) > 0.01 or @abs(tc[2] - 1.0) > 0.01) {
+                            try stdout.print("  TINT mesh[{d}] = ({d:.3},{d:.3},{d:.3}) dc={d} {s}\n", .{ mi_t, tc[0], tc[1], tc[2], mo_t.getU32Property("m_nDrawCallIndex") orelse 999, model });
+                        }
+                    }
+                }
                 if (frags.count() == 0) {
                     n_no_frags += 1;
                     continue;
@@ -805,6 +874,107 @@ fn transformStats(allocator: std.mem.Allocator, vpk_path: []const u8, stdout: an
                 }
             }
             try stdout.print("  aggregates: {d} total, {d} baked (no frags), {d} instanced ({d} frags, {d} MIRRORED)\n", .{ agg_arr.count(), n_no_frags, n_with_frags, total_frags, total_mirrored });
+        }
+    }
+}
+
+/// Decode every entity lump (vents_c) in a map VPK and dump each
+/// entity's key-values — first few in full, then a classname tally.
+fn entityStats(allocator: std.mem.Allocator, vpk_path: []const u8, stdout: anytype) !void {
+    var pkg = vrf.vpk.Package.init(allocator);
+    defer pkg.deinit();
+    pkg.readFile(vpk_path) catch |err| {
+        try std.io.getStdErr().writer().print("Error reading VPK: {}\n", .{err});
+        std.process.exit(1);
+    };
+
+    var it = pkg.iterateAll();
+    while (it.next()) |entry| {
+        if (!std.mem.eql(u8, entry.type_name, "vents_c")) continue;
+        const full_path = try entry.getFullPath(allocator);
+        defer allocator.free(full_path);
+        try stdout.print("══ {s} ══\n", .{full_path});
+
+        const data = pkg.readEntry(entry) catch continue;
+        defer pkg.allocator.free(data);
+
+        var resource = vrf.Resource.init(allocator);
+        defer resource.deinit();
+        resource.read(data) catch continue;
+
+        const data_block = resource.dataBlock() orelse continue;
+        const raw = switch (data_block.data) {
+            .data_block => |db| db.raw_data orelse continue,
+            else => continue,
+        };
+        var doc = vrf.binary_kv3.decode(allocator, raw) catch |err| {
+            try stdout.print("  KV3 decode error: {}\n", .{err});
+            continue;
+        };
+        defer doc.deinit();
+        const root = doc.root.asObject() orelse continue;
+        const ekv = root.getArray("m_entityKeyValues") orelse continue;
+        try stdout.print("  {d} entities\n", .{ekv.count()});
+
+        // Tally classnames; list every entity that references a model.
+        var tally = std.StringHashMap(u32).init(allocator);
+        defer {
+            var ki = tally.keyIterator();
+            while (ki.next()) |k| allocator.free(k.*);
+            tally.deinit();
+        }
+        for (ekv.items.items) |*ev| {
+            const eo = ev.asObject() orelse continue;
+            const kv3d = eo.getSubCollection("keyValues3Data") orelse continue;
+            const values = kv3d.getSubCollection("values") orelse continue;
+            const classname = values.getStringProperty("classname") orelse "?";
+            const gop = try tally.getOrPut(classname);
+            if (!gop.found_existing) {
+                gop.key_ptr.* = try allocator.dupe(u8, classname);
+                gop.value_ptr.* = 0;
+            }
+            gop.value_ptr.* += 1;
+            if (std.mem.eql(u8, classname, "skybox_reference")) {
+                try stdout.writeAll("  ── skybox_reference ──\n");
+                try dumpObjectDeep(allocator, values, stdout, 4, 0);
+            }
+            if (values.getStringProperty("model")) |model| {
+                const origin = values.getStringProperty("origin") orelse "?";
+                const angles = values.getStringProperty("angles") orelse "?";
+                const scales = values.getStringProperty("scales") orelse "?";
+                try stdout.print("  MODEL {s} | {s} | o=({s}) a=({s}) s=({s})\n", .{ classname, model, origin, angles, scales });
+            }
+        }
+        try stdout.writeAll("\n  classname tally:\n");
+        var ti = tally.iterator();
+        while (ti.next()) |kv| {
+            try stdout.print("    {d:>4}  {s}\n", .{ kv.value_ptr.*, kv.key_ptr.* });
+        }
+    }
+}
+
+/// Recursively print an object's keys/values up to `depth` levels.
+fn dumpObjectDeep(allocator: std.mem.Allocator, obj: anytype, stdout: anytype, indent: usize, depth: usize) !void {
+    for (obj.keys.items, obj.values.items) |k, *v| {
+        for (0..indent) |_| try stdout.writeAll(" ");
+        const vs = formatKVValue(allocator, v) catch "(err)";
+        defer if (!std.mem.eql(u8, vs, "(err)")) allocator.free(vs);
+        try stdout.print("{s} = {s}\n", .{ k, vs });
+        if (depth > 0) {
+            switch (v.*) {
+                .object => |o| try dumpObjectDeep(allocator, o, stdout, indent + 2, depth - 1),
+                .array => |a| {
+                    for (a.items.items, 0..) |*av, ai| {
+                        if (ai >= 4) break;
+                        for (0..indent + 2) |_| try stdout.writeAll(" ");
+                        const avs = formatKVValue(allocator, av) catch "(err)";
+                        defer if (!std.mem.eql(u8, avs, "(err)")) allocator.free(avs);
+                        try stdout.print("[{d}] = {s}\n", .{ ai, avs });
+                        if (av.* == .object) try dumpObjectDeep(allocator, av.object, stdout, indent + 4, depth - 1);
+                    }
+                },
+                else => {},
+            }
         }
     }
 }
@@ -914,7 +1084,36 @@ fn formatKVValue(allocator: std.mem.Allocator, value: *const vrf.kv3.KVValue) ![
         .float32 => |v| try std.fmt.allocPrint(allocator, "{d:.4}", .{v}),
         .float64 => |v| try std.fmt.allocPrint(allocator, "{d:.4}", .{v}),
         .boolean => |v| try std.fmt.allocPrint(allocator, "{}", .{v}),
-        .array => |arr| try std.fmt.allocPrint(allocator, "[array: {d} items]", .{arr.count()}),
+        .array => |arr| blk: {
+            // Small all-numeric arrays (colors, vectors) print inline.
+            if (arr.count() > 0 and arr.count() <= 4) {
+                var vals: [4]f64 = undefined;
+                var all_num = true;
+                for (arr.items.items, 0..) |*item, i| {
+                    switch (item.*) {
+                        .float32 => |f| vals[i] = f,
+                        .float64 => |f| vals[i] = f,
+                        .int32 => |n| vals[i] = @floatFromInt(n),
+                        .uint32 => |n| vals[i] = @floatFromInt(n),
+                        .int64 => |n| vals[i] = @floatFromInt(n),
+                        .uint64 => |n| vals[i] = @floatFromInt(n),
+                        else => all_num = false,
+                    }
+                    if (!all_num) break;
+                }
+                if (all_num) {
+                    var buf = std.ArrayList(u8).init(allocator);
+                    try buf.appendSlice("(");
+                    for (0..arr.count()) |i| {
+                        if (i > 0) try buf.appendSlice(", ");
+                        try buf.writer().print("{d:.4}", .{vals[i]});
+                    }
+                    try buf.appendSlice(")");
+                    break :blk try buf.toOwnedSlice();
+                }
+            }
+            break :blk try std.fmt.allocPrint(allocator, "[array: {d} items]", .{arr.count()});
+        },
         .object => |obj| try std.fmt.allocPrint(allocator, "{{object: {d} keys}}", .{obj.keys.items.len}),
         .binary_blob => |b| try std.fmt.allocPrint(allocator, "[blob: {d} bytes]", .{b.len}),
         .null_value => try allocator.dupe(u8, "null"),
