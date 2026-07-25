@@ -934,6 +934,10 @@ fn entityStats(allocator: std.mem.Allocator, vpk_path: []const u8, stdout: anyty
                 gop.value_ptr.* = 0;
             }
             gop.value_ptr.* += 1;
+            if (std.mem.eql(u8, classname, "sky_camera") or std.mem.eql(u8, classname, "worldspawn") or std.mem.eql(u8, classname, "env_sky")) {
+                try stdout.print("  ── {s} ──\n", .{classname});
+                try dumpObjectDeep(allocator, values, stdout, 4, 0);
+            }
             if (std.mem.eql(u8, classname, "skybox_reference")) {
                 try stdout.writeAll("  ── skybox_reference ──\n");
                 try dumpObjectDeep(allocator, values, stdout, 4, 0);
