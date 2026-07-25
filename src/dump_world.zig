@@ -28,6 +28,11 @@ pub fn main() !void {
         return;
     }
 
+    if (resource_path != null and std.mem.eql(u8, resource_path.?, "transforms")) {
+        try transformStats(allocator, vpk_path, stdout);
+        return;
+    }
+
     // Open VPK
     var pkg = vrf.vpk.Package.init(allocator);
     defer pkg.deinit();
@@ -589,6 +594,219 @@ fn countSubMeshes(allocator: std.mem.Allocator, data: []const u8) !u32 {
 
     if (dc_count == 0) return 1; // fallback: one whole-buffer draw call
     return dc_count;
+}
+
+/// Extract an f64 from any numeric KV3 value.
+fn kvFloat(v: *const vrf.kv3.KVValue) ?f64 {
+    return switch (v.*) {
+        .float32 => |f| f,
+        .float64 => |f| f,
+        .int32 => |i| @floatFromInt(i),
+        .uint32 => |i| @floatFromInt(i),
+        .int64 => |i| @floatFromInt(i),
+        .uint64 => |i| @floatFromInt(i),
+        else => null,
+    };
+}
+
+/// Parse a KV3 3x4 row-major transform (array of 3 rows × 4 floats).
+/// Returns null if the shape doesn't match.
+fn kvTransform(v: *const vrf.kv3.KVValue) ?[3][4]f64 {
+    const arr = switch (v.*) {
+        .array => |a| a,
+        else => return null,
+    };
+    var m: [3][4]f64 = undefined;
+    // Flat row-major 12-float form (m_fragmentTransforms uses this).
+    if (arr.items.items.len == 12) {
+        for (arr.items.items, 0..) |*cell, i| {
+            m[i / 4][i % 4] = kvFloat(cell) orelse return null;
+        }
+        return m;
+    }
+    if (arr.items.items.len != 3) return null;
+    for (arr.items.items, 0..) |*row_val, r| {
+        const row = switch (row_val.*) {
+            .array => |a| a,
+            else => return null,
+        };
+        if (row.items.items.len != 4) return null;
+        for (row.items.items, 0..) |*cell, c| {
+            m[r][c] = kvFloat(cell) orelse return null;
+        }
+    }
+    return m;
+}
+
+fn det3(m: [3][4]f64) f64 {
+    return m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) -
+        m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) +
+        m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+}
+
+fn isIdentity(m: [3][4]f64) bool {
+    const eps = 1e-6;
+    for (0..3) |r| {
+        for (0..4) |c| {
+            const want: f64 = if (r == c) 1.0 else 0.0;
+            if (@abs(m[r][c] - want) > eps) return false;
+        }
+    }
+    return true;
+}
+
+/// Survey every scene object / aggregate in all world nodes of a map:
+/// which carry real transforms, and which of those are mirrored
+/// (negative determinant)?
+fn transformStats(allocator: std.mem.Allocator, vpk_path: []const u8, stdout: anytype) !void {
+    var pkg = vrf.vpk.Package.init(allocator);
+    defer pkg.deinit();
+    pkg.readFile(vpk_path) catch |err| {
+        try std.io.getStdErr().writer().print("Error reading VPK: {}\n", .{err});
+        std.process.exit(1);
+    };
+
+    var it = pkg.iterateAll();
+    while (it.next()) |entry| {
+        if (!std.mem.eql(u8, entry.type_name, "vwnod_c")) continue;
+        const full_path = try entry.getFullPath(allocator);
+        defer allocator.free(full_path);
+        try stdout.print("══ {s} ══\n", .{full_path});
+
+        const data = try pkg.readEntry(entry);
+        defer allocator.free(data);
+
+        var resource = vrf.Resource.init(allocator);
+        defer resource.deinit();
+        resource.read(data) catch |err| {
+            try stdout.print("  parse error: {}\n", .{err});
+            continue;
+        };
+
+        const data_block = resource.dataBlock() orelse continue;
+        const raw = switch (data_block.data) {
+            .data_block => |db| db.raw_data orelse continue,
+            else => continue,
+        };
+        var doc = vrf.binary_kv3.decode(allocator, raw) catch continue;
+        defer doc.deinit();
+        const root = doc.root.asObject() orelse continue;
+
+        // ── Plain scene objects: per-object m_vTransform ──
+        if (root.getArray("m_sceneObjects")) |so_arr| {
+            var n_identity: u32 = 0;
+            var n_transformed: u32 = 0;
+            var n_mirrored: u32 = 0;
+            for (so_arr.items.items, 0..) |*so_val, i| {
+                const so = so_val.asObject() orelse continue;
+                const model = so.getStringProperty("m_renderableModel") orelse "?";
+                const tv = so.get("m_vTransform") orelse continue;
+                const m = kvTransform(tv) orelse {
+                    try stdout.print("  scene[{d}] UNPARSEABLE m_vTransform ({s})\n", .{ i, model });
+                    continue;
+                };
+                if (isIdentity(m)) {
+                    n_identity += 1;
+                } else {
+                    n_transformed += 1;
+                    const d = det3(m);
+                    if (d < 0) n_mirrored += 1;
+                    try stdout.print("  scene[{d}] det={d:.3} t=({d:.1},{d:.1},{d:.1}) {s}\n", .{ i, d, m[0][3], m[1][3], m[2][3], model });
+                }
+            }
+            try stdout.print("  scene objects: {d} total, {d} identity, {d} transformed, {d} MIRRORED\n", .{ so_arr.count(), n_identity, n_transformed, n_mirrored });
+        }
+
+        // ── Aggregate scene objects: per-fragment transforms ──
+        if (root.getArray("m_aggregateSceneObjects")) |agg_arr| {
+            var n_no_frags: u32 = 0;
+            var n_with_frags: u32 = 0;
+            var total_frags: u32 = 0;
+            var total_mirrored: u32 = 0;
+            var dumped_mesh_keys = false;
+            for (agg_arr.items.items, 0..) |*agg_val, i| {
+                const agg = agg_val.asObject() orelse continue;
+                const model = agg.getStringProperty("m_renderableModel") orelse "?";
+                const frags = agg.getArray("m_fragmentTransforms") orelse continue;
+                const mesh_count: u32 = if (agg.getArray("m_aggregateMeshes")) |am| @intCast(am.count()) else 0;
+                if (frags.count() == 0) {
+                    n_no_frags += 1;
+                    continue;
+                }
+                n_with_frags += 1;
+                total_frags += @intCast(frags.count());
+                var mirrored: u32 = 0;
+                var min_det: f64 = std.math.inf(f64);
+                var max_det: f64 = -std.math.inf(f64);
+                for (frags.items.items) |*fv| {
+                    const m = kvTransform(fv) orelse {
+                        const vs = formatKVValue(allocator, fv) catch "(err)";
+                        defer if (!std.mem.eql(u8, vs, "(err)")) allocator.free(vs);
+                        try stdout.print("    frag shape: {s}\n", .{vs});
+                        if (fv.* == .array) {
+                            const inner = fv.array;
+                            if (inner.items.items.len > 0) {
+                                const ivs = formatKVValue(allocator, &inner.items.items[0]) catch "(err)";
+                                defer if (!std.mem.eql(u8, ivs, "(err)")) allocator.free(ivs);
+                                try stdout.print("    frag[0][0] shape: {s}\n", .{ivs});
+                            }
+                        }
+                        continue;
+                    };
+                    const d = det3(m);
+                    if (d < 0) mirrored += 1;
+                    min_det = @min(min_det, d);
+                    max_det = @max(max_det, d);
+                }
+                total_mirrored += mirrored;
+                try stdout.print("  agg[{d}] frags={d} meshes={d} mirrored={d} det=[{d:.3},{d:.3}] {s}\n", .{ i, frags.count(), mesh_count, mirrored, min_det, max_det, model });
+                // Per-mesh-entry draw-call index + transform flag, and the
+                // paired fragment translation (world inches if this is a
+                // real placement).
+                if (agg.getArray("m_aggregateMeshes")) |am| {
+                    for (am.items.items, 0..) |*mv, mi| {
+                        const mo = mv.asObject() orelse continue;
+                        const dci = mo.getU32Property("m_nDrawCallIndex") orelse 999;
+                        const has_t = if (mo.get("m_bHasTransform")) |ht| switch (ht.*) {
+                            .boolean => |b| b,
+                            else => false,
+                        } else false;
+                        var tx: f64 = 0;
+                        var ty: f64 = 0;
+                        var tz: f64 = 0;
+                        var rot0: f64 = 1;
+                        if (mi < frags.items.items.len) {
+                            if (kvTransform(&frags.items.items[mi])) |fm| {
+                                tx = fm[0][3];
+                                ty = fm[1][3];
+                                tz = fm[2][3];
+                                rot0 = fm[0][0];
+                            }
+                        }
+                        try stdout.print("    mesh[{d}] dc={d} hasT={} r00={d:.2} t=({d:.0},{d:.0},{d:.0})\n", .{ mi, dci, has_t, rot0, tx, ty, tz });
+                    }
+                }
+                // Dump the schema of one aggregate-mesh entry so we know
+                // which fields link draw calls to fragment transforms.
+                if (!dumped_mesh_keys) {
+                    if (agg.getArray("m_aggregateMeshes")) |am| {
+                        if (am.count() > 0) {
+                            if (am.items.items[0].asObject()) |mo| {
+                                try stdout.writeAll("    m_aggregateMeshes[0] keys:\n");
+                                for (mo.keys.items, mo.values.items) |k, *v| {
+                                    const vs = formatKVValue(allocator, v) catch "(err)";
+                                    defer if (!std.mem.eql(u8, vs, "(err)")) allocator.free(vs);
+                                    try stdout.print("      {s} = {s}\n", .{ k, vs });
+                                }
+                                dumped_mesh_keys = true;
+                            }
+                        }
+                    }
+                }
+            }
+            try stdout.print("  aggregates: {d} total, {d} baked (no frags), {d} instanced ({d} frags, {d} MIRRORED)\n", .{ agg_arr.count(), n_no_frags, n_with_frags, total_frags, total_mirrored });
+        }
+    }
 }
 
 const SubmeshTally = struct {

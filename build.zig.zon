@@ -1,6 +1,7 @@
 .{
     .name = .valve_resource_format,
     .version = "0.1.0",
+    .fingerprint = 0x99ab5c5bd472fe5e,
     .minimum_zig_version = "0.14.1",
     .paths = .{
         "build.zig",
