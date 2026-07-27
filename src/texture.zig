@@ -227,20 +227,26 @@ pub const Texture = struct {
         }
     }
 
-    /// Calculate buffer size for a specific mip level.
+    /// Number of faces stored per mip level (6 for cubemaps, else 1).
+    pub fn faceCount(self: *const Texture) u32 {
+        return if (self.flags.cube_texture) 6 else 1;
+    }
+
+    /// Calculate buffer size for a specific mip level (all faces included).
     pub fn calculateMipSize(self: *const Texture, mip_level: u32) usize {
         const mip_w = @max(1, @as(u32, self.width) >> @intCast(mip_level));
         const mip_h = @max(1, @as(u32, self.height) >> @intCast(mip_level));
         const mip_d = @max(1, @as(u32, self.depth) >> @intCast(mip_level));
+        const faces = @as(usize, self.faceCount());
 
         if (self.format.isBlockCompressed()) {
             // Align to 4-pixel blocks
             const aligned_w = (mip_w + 3) & ~@as(u32, 3);
             const aligned_h = (mip_h + 3) & ~@as(u32, 3);
             const num_blocks = (aligned_w * aligned_h) >> 4; // /16 pixels per block
-            return @as(usize, num_blocks) * @as(usize, self.format.blockSize()) * @as(usize, mip_d);
+            return @as(usize, num_blocks) * @as(usize, self.format.blockSize()) * @as(usize, mip_d) * faces;
         } else {
-            return @as(usize, mip_w) * @as(usize, mip_h) * @as(usize, mip_d) * @as(usize, self.format.blockSize());
+            return @as(usize, mip_w) * @as(usize, mip_h) * @as(usize, mip_d) * @as(usize, self.format.blockSize()) * faces;
         }
     }
 
@@ -292,6 +298,25 @@ pub const Texture = struct {
 
         if (offset + size > tex_data.len) return null;
         return tex_data[offset..][0..size];
+    }
+
+    /// Raw (still block-compressed) bytes for one mip level, LZ4-expanded
+    /// when the on-disk mip is compressed. Always returns an owned copy of
+    /// calculateMipSize(mip_level) bytes — for cubemaps that is all 6 faces
+    /// back to back (+X, -X, +Y, -Y, +Z, -Z). Caller frees.
+    pub fn getMipDataDecompressed(self: *const Texture, mip_level: u32) ![]u8 {
+        const raw_mip = self.getMipData(mip_level) orelse return error.NoTextureData;
+        const expected_size = self.calculateMipSize(mip_level);
+        const buf = try self.allocator.alloc(u8, expected_size);
+        errdefer self.allocator.free(buf);
+        if (self.is_compressed_mips and raw_mip.len < expected_size) {
+            const lz4 = @import("lz4.zig");
+            _ = lz4.decompress(raw_mip, buf) catch return error.NoTextureData;
+        } else {
+            if (raw_mip.len < expected_size) return error.NoTextureData;
+            @memcpy(buf, raw_mip[0..expected_size]);
+        }
+        return buf;
     }
 
     /// Decode the highest resolution mip level to RGBA8888.
