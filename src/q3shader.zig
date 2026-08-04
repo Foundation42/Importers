@@ -72,6 +72,11 @@ pub const Shader = struct {
     stages: []Stage,
     cull: CullMode = .front,
     sky_parms: bool = false,
+    /// Farbox base path from `skyparms <farbox> <cloudheight> <nearbox>`
+    /// (e.g. "env/space1" — the renderer appends _rt/_lf/_bk/_ft/_up/_dn
+    /// plus an image extension). null when the farbox arg is "-" or the
+    /// shader has no skyparms. Owned by the Shader when non-null.
+    sky_box: ?[]const u8 = null,
     /// `polygonOffset` directive — the shader is a decal meant to render
     /// with a depth bias over the coplanar surface beneath it.
     polygon_offset: bool = false,
@@ -98,6 +103,7 @@ pub const Shader = struct {
         for (self.surface_parms.keys()) |k| self.allocator.free(k);
         self.surface_parms.deinit();
         if (self.light_image) |img| self.allocator.free(img);
+        if (self.sky_box) |sb| self.allocator.free(sb);
     }
 
     /// True if this shader is a surface light (`q3map_surfacelight > 0`).
@@ -295,6 +301,8 @@ pub const ShaderDb = struct {
         var cull: CullMode = .front;
         var polygon_offset = false;
         var sky_parms = false;
+        var sky_box: ?[]const u8 = null;
+        errdefer if (sky_box) |sb| allocator.free(sb);
         var is_transparent = false;
         var sort_key: ?f32 = null;
         var surface_parms = std.StringArrayHashMap(void).init(allocator);
@@ -357,6 +365,13 @@ pub const ShaderDb = struct {
                 }
             } else if (std.ascii.eqlIgnoreCase(token, "skyparms")) {
                 sky_parms = true;
+                // skyparms <farbox> <cloudheight> <nearbox> — keep the
+                // farbox base path so the renderer can load the six
+                // env/<base>_{rt,lf,bk,ft,up,dn} images. "-" = none.
+                const farbox = readToken(source, pos);
+                if (farbox.len > 0 and !std.mem.eql(u8, farbox, "-") and sky_box == null) {
+                    sky_box = try allocator.dupe(u8, farbox);
+                }
                 skipLine(source, pos);
             } else if (std.ascii.eqlIgnoreCase(token, "polygonOffset")) {
                 polygon_offset = true;
@@ -402,6 +417,7 @@ pub const ShaderDb = struct {
             .stages = try stages.toOwnedSlice(),
             .cull = cull,
             .sky_parms = sky_parms,
+            .sky_box = sky_box,
             .polygon_offset = polygon_offset,
             .is_transparent = is_transparent,
             .sort_key = sort_key,

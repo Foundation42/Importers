@@ -1,0 +1,3 @@
+# Model list: 1 models
+# Format: model_id tri_start tri_end name
+0 0 262267 gltf_node_0
