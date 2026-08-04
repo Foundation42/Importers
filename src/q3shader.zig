@@ -367,9 +367,13 @@ pub const ShaderDb = struct {
                 sky_parms = true;
                 // skyparms <farbox> <cloudheight> <nearbox> — keep the
                 // farbox base path so the renderer can load the six
-                // env/<base>_{rt,lf,bk,ft,up,dn} images. "-" = none.
+                // env/<base>_{rt,lf,bk,ft,up,dn} images. "-" = none, and
+                // id's own scripts use the legacy token "full" the same
+                // way (ioq3 treats any missing basename as no farbox).
                 const farbox = readToken(source, pos);
-                if (farbox.len > 0 and !std.mem.eql(u8, farbox, "-") and sky_box == null) {
+                if (farbox.len > 0 and !std.mem.eql(u8, farbox, "-") and
+                    !std.ascii.eqlIgnoreCase(farbox, "full") and sky_box == null)
+                {
                     sky_box = try allocator.dupe(u8, farbox);
                 }
                 skipLine(source, pos);
