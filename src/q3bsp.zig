@@ -57,6 +57,33 @@ pub const LumpEntry = struct {
 };
 
 // ============================================================================
+// Surface flags
+// ============================================================================
+
+/// Quake 3 surface flags, from q_shared.h. These were previously a bare magic
+/// number in `ExtractOptions`, which is how its value and its comment came to
+/// disagree — see `skip_surface_flags`.
+pub const SURF_NODAMAGE: u32 = 0x1;
+pub const SURF_SLICK: u32 = 0x2;
+pub const SURF_SKY: u32 = 0x4;
+pub const SURF_LADDER: u32 = 0x8;
+pub const SURF_NOIMPACT: u32 = 0x10;
+pub const SURF_NOMARKS: u32 = 0x20;
+pub const SURF_FLESH: u32 = 0x40;
+pub const SURF_NODRAW: u32 = 0x80;
+pub const SURF_HINT: u32 = 0x100;
+pub const SURF_SKIP: u32 = 0x200;
+pub const SURF_NOLIGHTMAP: u32 = 0x400;
+pub const SURF_POINTLIGHT: u32 = 0x800;
+pub const SURF_METALSTEPS: u32 = 0x1000;
+pub const SURF_NOSTEPS: u32 = 0x2000;
+pub const SURF_NONSOLID: u32 = 0x4000;
+pub const SURF_LIGHTFILTER: u32 = 0x8000;
+pub const SURF_ALPHASHADOW: u32 = 0x10000;
+pub const SURF_NODLIGHT: u32 = 0x20000;
+pub const SURF_DUST: u32 = 0x40000;
+
+// ============================================================================
 // Surface types
 // ============================================================================
 
@@ -1375,7 +1402,15 @@ pub const ExtractOptions = struct {
     /// Higher = smoother curves. 6 is a good default.
     patch_lod: u32 = 6,
     /// Skip faces with these surface flags set (default: skip sky + tool textures).
-    skip_surface_flags: u32 = 0xC14, // SKY | NODRAW | HINT | SKIP
+    ///
+    /// This was `0xC14` with a comment reading "SKY | NODRAW | HINT | SKIP".
+    /// The comment named the intent; the constant did not match it. 0xC14 is
+    /// SKY | NOIMPACT | NOLIGHTMAP | POINTLIGHT, so the default kept every
+    /// nodraw, hint and skip face — caulk straight into the BVH — while
+    /// silently dropping vertex-lit surfaces, which are exactly the ones a
+    /// mapper marks `nolightmap`. Found while extracting a material corpus
+    /// for tessera; see `test "skip_surface_flags names the flags it skips"`.
+    skip_surface_flags: u32 = SURF_SKY | SURF_NODRAW | SURF_HINT | SURF_SKIP,
     /// Whether to include patch (Bezier) faces.
     include_patches: bool = true,
     /// Whether to include billboard faces.
@@ -1770,6 +1805,56 @@ test "parse vec3" {
     try std.testing.expectApproxEqAbs(@as(f32, 128.0), result[0], 0.001);
     try std.testing.expectApproxEqAbs(@as(f32, -256.5), result[1], 0.001);
     try std.testing.expectApproxEqAbs(@as(f32, 64.0), result[2], 0.001);
+}
+
+test "skip_surface_flags names the flags it skips" {
+    // Pinned against the literal so a later edit to the flag constants cannot
+    // quietly move the default. 0x384, not the 0xC14 this shipped with.
+    const opts = ExtractOptions{};
+    try std.testing.expectEqual(@as(u32, 0x384), opts.skip_surface_flags);
+
+    // The four the comment has always claimed.
+    try std.testing.expect(opts.skip_surface_flags & SURF_SKY != 0);
+    try std.testing.expect(opts.skip_surface_flags & SURF_NODRAW != 0);
+    try std.testing.expect(opts.skip_surface_flags & SURF_HINT != 0);
+    try std.testing.expect(opts.skip_surface_flags & SURF_SKIP != 0);
+
+    // The three 0xC14 skipped by accident. NOLIGHTMAP is the damaging one: a
+    // vertex-lit surface is drawable art, and dropping it removes geometry the
+    // mapper meant to be seen.
+    try std.testing.expect(opts.skip_surface_flags & SURF_NOIMPACT == 0);
+    try std.testing.expect(opts.skip_surface_flags & SURF_NOLIGHTMAP == 0);
+    try std.testing.expect(opts.skip_surface_flags & SURF_POINTLIGHT == 0);
+}
+
+test "shouldIncludeFace keeps vertex-lit art and drops compiler faces" {
+    var names: [64]u8 = undefined;
+    @memset(&names, 0);
+    const shaders = [_]Shader{
+        .{ .name = names, .surface_flags = 0, .content_flags = 0 },
+        .{ .name = names, .surface_flags = SURF_NOLIGHTMAP, .content_flags = 0 },
+        .{ .name = names, .surface_flags = SURF_NODRAW, .content_flags = 0 },
+        .{ .name = names, .surface_flags = SURF_SKY, .content_flags = 0 },
+        .{ .name = names, .surface_flags = SURF_HINT | SURF_SKIP, .content_flags = 0 },
+        .{ .name = names, .surface_flags = SURF_POINTLIGHT | SURF_NOIMPACT, .content_flags = 0 },
+    };
+    var bsp: Q3Bsp = undefined;
+    bsp.shaders = &shaders;
+
+    const opts = ExtractOptions{};
+    const cases = [_]struct { i32, bool }{
+        .{ 0, true }, // plain lightmapped wall
+        .{ 1, true }, // vertex-lit art      — 0xC14 dropped this
+        .{ 2, false }, // caulk              — 0xC14 kept this
+        .{ 3, false }, // sky
+        .{ 4, false }, // vis hint / skip    — 0xC14 kept these
+        .{ 5, true }, // pointlight art      — 0xC14 dropped this
+    };
+    for (cases) |c| {
+        var face: Face = undefined;
+        face.shader_index = c[0];
+        try std.testing.expectEqual(c[1], bsp.shouldIncludeFace(&face, opts));
+    }
 }
 
 test "shader getName" {
