@@ -346,8 +346,17 @@ fn decodeBC7Block(block: *const [16]u8, pixels: *[16][4]u8) void {
             endpoints[ep][3] = bs.readBits(info.alpha_bits);
         }
     } else {
+        // Modes 0–3 carry no alpha: the block is opaque, so the endpoint is
+        // 255 in the OUTPUT domain. It used to be seeded at the colour
+        // precision's maximum (15/31/63/127) and then skipped by every
+        // unquantise loop below (they run over 3 channels for these modes),
+        // so alpha reached the caller as 63/255 for a mode-1 block. Every
+        // BC7 texture's alpha — glTF spec-gloss glossiness, alpha-test
+        // cutouts — read low by that much. Found 5 Sep 2026 from Bistro's
+        // material buffer: two external decoders read a gloss map's alpha
+        // as 255 where the engine saw ~0.25.
         for (0..num_endpoints) |ep| {
-            endpoints[ep][3] = ((@as(u16, 1) << @intCast(info.color_bits)) - 1);
+            endpoints[ep][3] = 255;
         }
     }
 
@@ -670,4 +679,22 @@ test "BitStream reads" {
     try std.testing.expectEqual(@as(u16, 0), bs.readBit()); // bit 3
     try std.testing.expectEqual(@as(u16, 1), bs.readBit()); // bit 4
     try std.testing.expectEqual(@as(u16, 1), bs.readBit()); // bit 5
+}
+
+test "BC7 no-alpha mode decodes opaque" {
+    // Mode 1 (bits "01" LSB-first: byte 0 = 0b10), everything else zero:
+    // a valid block whose colour is whatever zero endpoints give and whose
+    // alpha must be 255 in every pixel. Before the fix it was 63.
+    var block = [_]u8{0} ** 16;
+    block[0] = 0x02;
+    var output: [64]u8 = undefined;
+    try decodeBC7(&block, 4, 4, &output);
+    for (0..16) |i| try std.testing.expectEqual(@as(u8, 255), output[i * 4 + 3]);
+    // Mode 0 (bit 0 set) and mode 3 (0b1000) likewise.
+    block[0] = 0x01;
+    try decodeBC7(&block, 4, 4, &output);
+    for (0..16) |i| try std.testing.expectEqual(@as(u8, 255), output[i * 4 + 3]);
+    block[0] = 0x08;
+    try decodeBC7(&block, 4, 4, &output);
+    for (0..16) |i| try std.testing.expectEqual(@as(u8, 255), output[i * 4 + 3]);
 }
